@@ -49,7 +49,7 @@ load_dotenv()
 @dataclass
 class BotConfig:
     # Model settings
-    model: str = "claude-opus-4-5-20250514"
+    model: str = "claude-opus-4-5-20251101"
     max_tokens: int = 4096
     
     # Context management (THE KEY TO NOT BEING MYK)
@@ -707,11 +707,15 @@ class ClaudeBot(commands.Bot):
             return
         
         # Get or create thread
-        thread = await self._ensure_thread(message)
+        thread, is_new_thread = await self._ensure_thread(message)
         
         # Generate response
         async with thread.typing():
-            response, reactions = await self._generate_response(thread, message.guild.id)
+            response, reactions = await self._generate_response(
+                thread, 
+                message.guild.id,
+                initial_message=message if is_new_thread else None
+            )
         
         # Handle reactions first
         for emoji in reactions:
@@ -729,10 +733,10 @@ class ClaudeBot(commands.Bot):
         # Save memories periodically
         self.manager.save_memories()
     
-    async def _ensure_thread(self, message: discord.Message) -> discord.Thread:
-        """Get existing thread or create new one."""
+    async def _ensure_thread(self, message: discord.Message) -> tuple[discord.Thread, bool]:
+        """Get existing thread or create new one. Returns (thread, is_new)."""
         if isinstance(message.channel, discord.Thread):
-            return message.channel
+            return message.channel, False
         
         # Create new thread
         thread = await message.create_thread(
@@ -743,16 +747,69 @@ class ClaudeBot(commands.Bot):
             f"🧵 Started new conversation!\n"
             f"Commands: `!help` for full list"
         )
-        return thread
+        return thread, True
     
-    async def _generate_response(self, channel: discord.abc.Messageable, guild_id: int) -> tuple[str, list[str]]:
+    async def _generate_response(
+        self, 
+        channel: discord.abc.Messageable, 
+        guild_id: int,
+        initial_message: discord.Message = None
+    ) -> tuple[str, list[str]]:
         """
         Generate Claude response.
         Returns (response_text, list_of_emoji_reactions)
         Also processes [note: key: value] tags for working memory.
+        
+        If initial_message is provided, it's prepended to the conversation
+        (used when a new thread is created and the starter message isn't in history).
         """
         # Fetch conversation from Discord
         messages = await self.manager.fetch_thread_history(channel)
+        
+        # If this is a new thread, the triggering message isn't in thread history
+        # We need to prepend it manually
+        if initial_message:
+            content_parts = []
+            
+            # Add text
+            if initial_message.content:
+                content_parts.append({
+                    "type": "text",
+                    "text": f"{initial_message.author.display_name}: {initial_message.content}"
+                })
+            
+            # Add images if present
+            for attachment in initial_message.attachments:
+                if any(attachment.filename.lower().endswith(ext) for ext in CONFIG.image_types):
+                    if attachment.size <= CONFIG.max_image_size_mb * 1024 * 1024:
+                        try:
+                            image_data = await self.manager._fetch_image_base64(attachment.url)
+                            if image_data:
+                                ext = attachment.filename.lower().split('.')[-1]
+                                media_type = {
+                                    'png': 'image/png',
+                                    'jpg': 'image/jpeg', 
+                                    'jpeg': 'image/jpeg',
+                                    'gif': 'image/gif',
+                                    'webp': 'image/webp'
+                                }.get(ext, 'image/png')
+                                content_parts.append({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": image_data
+                                    }
+                                })
+                        except Exception:
+                            pass
+            
+            if content_parts:
+                # Simplify if just text
+                if len(content_parts) == 1 and content_parts[0]["type"] == "text":
+                    messages.insert(0, {"role": "user", "content": content_parts[0]["text"]})
+                else:
+                    messages.insert(0, {"role": "user", "content": content_parts})
         
         if not messages:
             return "I don't see any messages to respond to!", []
