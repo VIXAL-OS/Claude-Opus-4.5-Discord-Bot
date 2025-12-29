@@ -726,6 +726,10 @@ class ClaudeBot(commands.Bot):
         if not message.guild:
             return
         
+        # Ignore system messages (pins, joins, boosts, etc)
+        if message.type != discord.MessageType.default and message.type != discord.MessageType.reply:
+            return
+        
         # Check if in allowed channel or thread of allowed channel
         channel_id = message.channel.id
         parent_id = getattr(message.channel, 'parent_id', None)
@@ -736,6 +740,10 @@ class ClaudeBot(commands.Bot):
         # Handle commands
         if message.content.startswith('!'):
             await self._handle_command(message)
+            return
+        
+        # Ignore empty messages (no text, no attachments)
+        if not message.content and not message.attachments:
             return
         
         # Get or create thread
@@ -886,7 +894,11 @@ class ClaudeBot(commands.Bot):
             self.manager.total_input_tokens += response.usage.input_tokens
             self.manager.total_output_tokens += response.usage.output_tokens
             
-            response_text = response.content[0].text
+            # Handle empty response
+            if not response.content:
+                return "I received an empty response from the API.", []
+            
+            response_text = response.content[0].text if hasattr(response.content[0], 'text') else str(response.content[0])
             
             # Extract and process working memory notes
             note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
