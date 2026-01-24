@@ -917,6 +917,15 @@ class ClaudeBot(commands.Bot):
         if memory_context:
             system_parts.append(memory_context)
         
+        # 3. Gentle nudge if working memory is sparse
+        working_note_count = len(self.manager.memories[guild_id].working.notes)
+        if working_note_count < 3:
+            system_parts.append(
+                "📝 *Reminder: Your working memory is pretty empty. "
+                "If anything noteworthy comes up in this conversation, "
+                "jot it down with [note: key: value].*"
+            )
+        
         system = "\n\n".join(system_parts)
         
         try:
