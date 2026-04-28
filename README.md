@@ -57,9 +57,12 @@ User message arrives
 | `!claude <msg>` | Force Claude to respond |
 | `!opus <msg>` | Force Claude Opus to respond |
 | `!deepseek <msg>` | Force Deepseek to respond |
+| `!think <msg>` | Use extended thinking (deeper reasoning, slower & costlier) |
 | `!models` | Show available models and usage stats |
 | `!prefer [claude\|deepseek\|auto]` | Set model preference for this channel |
 | `!calibration` | Show confidence calibration stats |
+
+Prefixes can stack in any order: `!think !claude <msg>` forces Claude with thinking on. Thinking auto-enables on `!claude`/`!opus` when prompts look hard (cues like "explain why", "step by step", multi-step problems, long questions, or LaTeX). For Deepseek, thinking is opt-in only via `!think`. Reasoning content is cached per Discord message so multi-turn thinking conversations work across both providers.
 
 React with 👍❤️🔥✅😂💖💯 (positive) or 👎❌😕 (negative) to bot responses to improve model selection over time.
 

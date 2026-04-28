@@ -27,7 +27,7 @@ $20 prepaid → 400-1000 messages depending on conversation length
 import discord
 from discord.ext import commands
 import anthropic
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -773,13 +773,14 @@ class ConversationManager:
             
             if content:
                 role = "assistant" if msg.author.bot else "user"
-                
-                # Simplify if just text
+
+                # Simplify if just text. _msg_id is internal-only metadata used
+                # by the thinking-mode reasoning cache; strip before API calls.
                 if len(content) == 1 and content[0]["type"] == "text":
-                    messages.append({"role": role, "content": content[0]["text"]})
+                    messages.append({"role": role, "content": content[0]["text"], "_msg_id": msg.id})
                 else:
-                    messages.append({"role": role, "content": content})
-        
+                    messages.append({"role": role, "content": content, "_msg_id": msg.id})
+
         # Reverse so oldest first (Discord returns newest first)
         messages.reverse()
         
@@ -992,6 +993,11 @@ class ClaudeBot(commands.Bot):
         # Per-channel model preferences
         self.channel_preferences: dict[int, str] = {}
 
+        # Reasoning cache for thinking-mode multi-turn (keyed by Discord msg.id).
+        # Deepseek requires reasoning_content to be echoed back on every prior
+        # assistant turn whenever thinking mode is enabled on the current call.
+        self.reasoning_cache: OrderedDict[int, str] = OrderedDict()
+
         # Allowed channels (load from config)
         self.allowed_channels: set[int] = set()
         self._load_config()
@@ -1000,6 +1006,98 @@ class ClaudeBot(commands.Bot):
     def multi_model_active(self) -> bool:
         """True if more than one model is enabled."""
         return sum(1 for p in self.providers if p.enabled) > 1
+
+    REASONING_CACHE_MAX = 500
+    THINK_PREFIXES = ("!think",)
+    CLAUDE_PREFIXES = ("!claude", "!opus")
+    DEEPSEEK_PREFIXES = ("!deepseek",)
+    CLAUDE_THINKING_BUDGET = 8000
+    CLAUDE_THINKING_MAX_TOKENS = 16000
+
+    def _store_reasoning(self, msg_id: int, content: str) -> None:
+        """Cache reasoning_content under a Discord message id (FIFO eviction)."""
+        if not content:
+            return
+        self.reasoning_cache[msg_id] = content
+        self.reasoning_cache.move_to_end(msg_id)
+        while len(self.reasoning_cache) > self.REASONING_CACHE_MAX:
+            self.reasoning_cache.popitem(last=False)
+
+    def _get_reasoning(self, msg_id: int) -> str:
+        """Look up cached reasoning_content for a Discord message id, or empty string."""
+        return self.reasoning_cache.get(msg_id, "")
+
+    @staticmethod
+    def _looks_hard(text: str) -> bool:
+        """Heuristic: does this prompt benefit from extended thinking?
+
+        Conservative — false positives cost real latency and tokens, so we only
+        flip to True on fairly explicit deep-dive cues.
+        """
+        if not text:
+            return False
+        text_lower = text.lower()
+        deep_phrases = (
+            "step by step", "step-by-step", "walk me through", "walk through",
+            "deep dive", "in depth", "in-depth", "from first principles",
+            "explain why", "explain how", "prove that", "derive ", "trace through",
+            "compare and contrast", "what's the difference between",
+            "debug this", "why doesn't", "why isn't", "why does this fail",
+            "carefully think", "think carefully",
+        )
+        if any(phrase in text_lower for phrase in deep_phrases):
+            return True
+        # Math/equation-ish: LaTeX commands or chained equalities
+        if re.search(r'\\[a-zA-Z]+|=.*[+\-*/].*=', text):
+            return True
+        # Long question (probably needs careful structuring)
+        if len(text) > 600 and '?' in text:
+            return True
+        # Multi-step language
+        step_markers = sum(
+            1 for w in (" first ", " then ", " next ", " finally ", " after that ")
+            if w in f" {text_lower} "
+        )
+        if step_markers >= 3:
+            return True
+        return False
+
+    def _peel_prefixes(self, content: str) -> tuple[str, set[str]]:
+        """Strip stacked !think / !claude / !opus / !deepseek prefixes in any order.
+
+        Returns (remaining_content, set_of_flags). Flags are 'think', 'claude',
+        'deepseek'. !opus collapses to 'claude'.
+        """
+        flags: set[str] = set()
+        all_prefixes = self.THINK_PREFIXES + self.CLAUDE_PREFIXES + self.DEEPSEEK_PREFIXES
+        while True:
+            stripped = content.strip()
+            lower = stripped.lower()
+            matched = False
+            for prefix in all_prefixes:
+                if lower == prefix:
+                    rest = ""
+                elif lower.startswith(prefix + " "):
+                    rest = stripped[len(prefix):].lstrip()
+                else:
+                    continue
+                if prefix in self.THINK_PREFIXES:
+                    flags.add("think")
+                elif prefix in self.CLAUDE_PREFIXES:
+                    flags.add("claude")
+                elif prefix in self.DEEPSEEK_PREFIXES:
+                    flags.add("deepseek")
+                content = rest
+                matched = True
+                break
+            if not matched:
+                break
+        return content, flags
+
+    @staticmethod
+    def _strip_internal_keys(messages: list[dict]) -> list[dict]:
+        """Drop internal-only keys (prefixed with _) before sending to provider APIs."""
+        return [{k: v for k, v in msg.items() if not k.startswith("_")} for msg in messages]
 
     def _load_config(self) -> None:
         """Load configuration from config.json."""
@@ -1068,30 +1166,32 @@ class ClaudeBot(commands.Bot):
         if channel_id not in self.allowed_channels and parent_id not in self.allowed_channels:
             return
         
-        # Check for direct model invocation (!claude / !opus / !deepseek)
+        # Peel any stacked model/thinking prefixes (!think / !claude / !opus / !deepseek)
+        original_content = message.content or ""
+        peeled_content, flags = self._peel_prefixes(original_content)
+        forced_thinking = "think" in flags
+
+        if "claude" in flags and not self.claude_provider.enabled:
+            await message.channel.send("❌ Claude is not configured (no API key).")
+            return
+        if "deepseek" in flags and not self.deepseek_provider.enabled:
+            await message.channel.send("❌ Deepseek is not configured (no API key).")
+            return
+
         forced_provider = None
         routing_reason = ""
-        content_lower = (message.content or "").lower()
-        for prefix in ("!claude", "!opus"):
-            if content_lower.startswith(prefix + " ") or content_lower == prefix:
-                if not self.claude_provider.enabled:
-                    await message.channel.send("❌ Claude is not configured (no API key).")
-                    return
-                forced_provider = self.claude_provider
-                routing_reason = f"User directly invoked Claude with {prefix} command."
-                message.content = message.content[len(prefix):].strip()
-                break
-        if forced_provider is None:
-            if content_lower.startswith("!deepseek ") or content_lower == "!deepseek":
-                if not self.deepseek_provider.enabled:
-                    await message.channel.send("❌ Deepseek is not configured (no API key).")
-                    return
-                forced_provider = self.deepseek_provider
-                routing_reason = "User directly invoked Deepseek with !deepseek command."
-                message.content = message.content[len("!deepseek"):].strip()
+        if "claude" in flags:
+            forced_provider = self.claude_provider
+            routing_reason = "User directly invoked Claude with !claude/!opus."
+        elif "deepseek" in flags:
+            forced_provider = self.deepseek_provider
+            routing_reason = "User directly invoked Deepseek with !deepseek."
 
-        # Handle commands (but not if we just consumed a model prefix)
-        if forced_provider is None and message.content.startswith('!'):
+        if flags:
+            message.content = peeled_content
+
+        # Handle commands (but not if we just consumed a model/thinking prefix)
+        if not flags and message.content.startswith('!'):
             await self._handle_command(message)
             return
 
@@ -1108,14 +1208,27 @@ class ClaudeBot(commands.Bot):
         else:
             provider, routing_reason = await self._select_model(message, message.guild.id)
 
+        # Auto-enable thinking for Claude on prompts that look hard.
+        # Skip auto-detection for Deepseek (cost/latency multiplier is bigger
+        # there relative to its baseline) and when no model was forced (we
+        # don't want to silently flip routing decisions into thinking mode).
+        if (
+            not forced_thinking
+            and forced_provider is self.claude_provider
+            and self._looks_hard(message.content or "")
+        ):
+            forced_thinking = True
+            routing_reason = (routing_reason + " Auto-enabled thinking mode (prompt looks hard).").strip()
+
         # Generate response
         async with thread.typing():
-            response, reactions = await self._generate_response(
+            response, reactions, reasoning = await self._generate_response(
                 thread,
                 message.guild.id,
                 initial_message=message if is_new_thread else None,
                 provider=provider,
                 routing_reason=routing_reason,
+                thinking=forced_thinking,
             )
 
         # Label the response with model name (only when multi-model is active)
@@ -1135,7 +1248,12 @@ class ClaudeBot(commands.Bot):
         response, files = self._extract_code_files(response)
 
         # Send response (handle Discord's 2000 char limit)
-        await self._send_response(thread, response, files)
+        sent_msg = await self._send_response(thread, response, files)
+
+        # Cache reasoning_content keyed by the sent Discord message id so the
+        # next thinking-mode turn can echo it back to Deepseek's API.
+        if reasoning and sent_msg is not None:
+            self._store_reasoning(sent_msg.id, reasoning)
 
         # Record calibration bid
         confidence = self._estimate_confidence(message.content or "", provider)
@@ -1195,17 +1313,24 @@ class ClaudeBot(commands.Bot):
         stripped = []
         for msg in messages:
             content = msg["content"]
+            msg_id = msg.get("_msg_id")
             if isinstance(content, str):
                 stripped.append(msg)
             elif isinstance(content, list):
                 text_parts = [b for b in content if b.get("type") == "text"]
                 if text_parts:
                     if len(text_parts) == 1:
-                        stripped.append({"role": msg["role"], "content": text_parts[0]["text"]})
+                        new = {"role": msg["role"], "content": text_parts[0]["text"]}
                     else:
-                        stripped.append({"role": msg["role"], "content": text_parts})
+                        new = {"role": msg["role"], "content": text_parts}
+                    if msg_id is not None:
+                        new["_msg_id"] = msg_id
+                    stripped.append(new)
                 elif any(b.get("type") == "image" for b in content):
-                    stripped.append({"role": msg["role"], "content": "[An image was shared]"})
+                    new = {"role": msg["role"], "content": "[An image was shared]"}
+                    if msg_id is not None:
+                        new["_msg_id"] = msg_id
+                    stripped.append(new)
             else:
                 stripped.append(msg)
         return stripped
@@ -1215,8 +1340,12 @@ class ClaudeBot(commands.Bot):
         converted = []
         for msg in messages:
             content = msg["content"]
+            msg_id = msg.get("_msg_id")
             if isinstance(content, str):
-                converted.append({"role": msg["role"], "content": content})
+                new = {"role": msg["role"], "content": content}
+                if msg_id is not None:
+                    new["_msg_id"] = msg_id
+                converted.append(new)
             elif isinstance(content, list):
                 parts = []
                 for block in content:
@@ -1231,7 +1360,10 @@ class ClaudeBot(commands.Bot):
                             "image_url": {"url": f"data:{media_type};base64,{data}"}
                         })
                 if parts:
-                    converted.append({"role": msg["role"], "content": parts})
+                    new = {"role": msg["role"], "content": parts}
+                    if msg_id is not None:
+                        new["_msg_id"] = msg_id
+                    converted.append(new)
             else:
                 converted.append(msg)
         return converted
@@ -1450,11 +1582,25 @@ class ClaudeBot(commands.Bot):
         guild_id: int,
         messages: list[dict],
         system: str,
-    ) -> tuple[str, list[str]]:
-        """Generate response using Deepseek with optional tool calling. Returns (text, reactions)."""
+        thinking: bool = False,
+    ) -> tuple[str, list[str], str]:
+        """Generate response using Deepseek with optional tool calling.
+
+        Returns (text, reactions, reasoning_content). reasoning_content is empty
+        unless thinking mode was enabled and Deepseek returned a reasoning block.
+        """
         # Convert to OpenAI format and strip images
         openai_messages = self._strip_images_from_messages(messages)
         openai_messages = self._convert_messages_to_openai_format(openai_messages)
+
+        # When thinking mode is on, Deepseek requires reasoning_content on every
+        # prior assistant turn (empty string is fine for ones we don't have).
+        if thinking:
+            for msg in openai_messages:
+                if msg.get("role") == "assistant":
+                    msg_id = msg.get("_msg_id")
+                    cached = self._get_reasoning(msg_id) if msg_id is not None else ""
+                    msg["reasoning_content"] = cached
 
         # Prepend system message (OpenAI uses it as first message)
         openai_messages.insert(0, {"role": "system", "content": system})
@@ -1466,13 +1612,14 @@ class ClaudeBot(commands.Bot):
             api_kwargs = {
                 "model": self.deepseek_provider.model_id,
                 "max_tokens": self.deepseek_provider.max_tokens,
-                "messages": openai_messages,
+                "messages": self._strip_internal_keys(openai_messages),
+            }
+            if not thinking:
                 # Deepseek V4 enables thinking mode by default and requires
                 # reasoning_content to be echoed on every prior assistant turn.
                 # We reconstruct history from plain Discord text, so we can't
                 # preserve reasoning blocks — disable thinking instead.
-                "extra_body": {"thinking": {"type": "disabled"}},
-            }
+                api_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             if tools:
                 api_kwargs["tools"] = tools
 
@@ -1493,7 +1640,7 @@ class ClaudeBot(commands.Bot):
                 assistant_msg = response.choices[0].message
 
                 # Add assistant message with tool calls to conversation
-                openai_messages.append({
+                tool_assistant: dict = {
                     "role": "assistant",
                     "content": assistant_msg.content or "",
                     "tool_calls": [
@@ -1504,7 +1651,12 @@ class ClaudeBot(commands.Bot):
                         }
                         for tc in assistant_msg.tool_calls
                     ]
-                })
+                }
+                if thinking:
+                    tool_assistant["reasoning_content"] = (
+                        getattr(assistant_msg, "reasoning_content", None) or ""
+                    )
+                openai_messages.append(tool_assistant)
 
                 # Execute each tool call
                 for tool_call in assistant_msg.tool_calls:
@@ -1519,7 +1671,9 @@ class ClaudeBot(commands.Bot):
                             "content": search_results,
                         })
 
-                # Continue conversation with tool results
+                # Continue conversation with tool results — refresh messages
+                # since api_kwargs holds a stripped copy.
+                api_kwargs["messages"] = self._strip_internal_keys(openai_messages)
                 response = await asyncio.to_thread(
                     self.deepseek_client.chat.completions.create,
                     **api_kwargs,
@@ -1530,6 +1684,9 @@ class ClaudeBot(commands.Bot):
                 self.deepseek_provider.total_output_tokens += response.usage.completion_tokens
 
             response_text = response.choices[0].message.content or ""
+            reasoning = (
+                getattr(response.choices[0].message, "reasoning_content", None) or ""
+            ) if thinking else ""
 
             # Process notes and reactions (same patterns as Claude)
             note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
@@ -1550,10 +1707,10 @@ class ClaudeBot(commands.Bot):
             response_text = re.sub(r'\n\n+(\*\*[^*]+\*\*:)', r'\n\1', response_text)  # Extra newlines before bold labels
             response_text = re.sub(r'  +', ' ', response_text)
 
-            return response_text, reactions
+            return response_text, reactions, reasoning
 
         except Exception as e:
-            return f"Deepseek Error: {e}", []
+            return f"Deepseek Error: {e}", [], ""
 
     async def _generate_response(
         self,
@@ -1562,10 +1719,13 @@ class ClaudeBot(commands.Bot):
         initial_message: discord.Message = None,
         provider: ModelProvider = None,
         routing_reason: str = "",
-    ) -> tuple[str, list[str]]:
+        thinking: bool = False,
+    ) -> tuple[str, list[str], str]:
         """
         Generate response from the selected model provider.
-        Returns (response_text, list_of_emoji_reactions)
+        Returns (response_text, list_of_emoji_reactions, reasoning_content).
+        reasoning_content is empty unless thinking mode was used and the
+        provider returned a reasoning trace worth caching for next turn.
         Also processes [note: key: value] tags for working memory.
         """
         if provider is None:
@@ -1623,12 +1783,12 @@ class ClaudeBot(commands.Bot):
 
             if content_parts:
                 if len(content_parts) == 1 and content_parts[0]["type"] == "text":
-                    messages.insert(0, {"role": "user", "content": content_parts[0]["text"]})
+                    messages.insert(0, {"role": "user", "content": content_parts[0]["text"], "_msg_id": initial_message.id})
                 else:
-                    messages.insert(0, {"role": "user", "content": content_parts})
+                    messages.insert(0, {"role": "user", "content": content_parts, "_msg_id": initial_message.id})
 
         if not messages:
-            return "I don't see any messages to respond to!", []
+            return "I don't see any messages to respond to!", [], ""
 
         # Build system prompt with all context sources
         system_parts = [self._build_system_prompt(provider, routing_reason)]
@@ -1656,7 +1816,7 @@ class ClaudeBot(commands.Bot):
 
         # Dispatch to the appropriate model
         if provider.name == "Deepseek":
-            return await self._generate_deepseek_response(guild_id, messages, system)
+            return await self._generate_deepseek_response(guild_id, messages, system, thinking=thinking)
 
         # Claude path (default) — with organic web search capability
         try:
@@ -1666,13 +1826,26 @@ class ClaudeBot(commands.Bot):
                 "name": "web_search"
             }]
 
+            claude_kwargs = {
+                "model": self.claude_provider.model_id,
+                "max_tokens": self.claude_provider.max_tokens,
+                "system": system,
+                "tools": claude_tools,
+            }
+            if thinking:
+                # Extended thinking: budget_tokens must be < max_tokens, and
+                # thinking tokens count toward the output budget.
+                claude_kwargs["max_tokens"] = self.CLAUDE_THINKING_MAX_TOKENS
+                claude_kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": self.CLAUDE_THINKING_BUDGET,
+                }
+
+            api_messages = self._strip_internal_keys(messages)
             response = await asyncio.to_thread(
                 self.claude_client.messages.create,
-                model=self.claude_provider.model_id,
-                max_tokens=self.claude_provider.max_tokens,
-                system=system,
-                messages=messages,
-                tools=claude_tools
+                messages=api_messages,
+                **claude_kwargs,
             )
 
             # Track usage
@@ -1680,7 +1853,9 @@ class ClaudeBot(commands.Bot):
             self.claude_provider.total_output_tokens += response.usage.output_tokens
             self.claude_provider.total_requests += 1
 
-            # Handle tool use loop — Claude may decide to search the web
+            # Handle tool use loop — Claude may decide to search the web.
+            # When thinking is on, response.content includes thinking blocks
+            # that must be passed back unchanged in the next turn.
             search_rounds = 0
             while response.stop_reason == "tool_use" and search_rounds < 3:
                 tool_use_block = None
@@ -1691,8 +1866,8 @@ class ClaudeBot(commands.Bot):
                 if not tool_use_block:
                     break
 
-                messages.append({"role": "assistant", "content": response.content})
-                messages.append({
+                api_messages.append({"role": "assistant", "content": response.content})
+                api_messages.append({
                     "role": "user",
                     "content": [{
                         "type": "tool_result",
@@ -1703,11 +1878,8 @@ class ClaudeBot(commands.Bot):
 
                 response = await asyncio.to_thread(
                     self.claude_client.messages.create,
-                    model=self.claude_provider.model_id,
-                    max_tokens=self.claude_provider.max_tokens,
-                    system=system,
-                    messages=messages,
-                    tools=claude_tools
+                    messages=api_messages,
+                    **claude_kwargs,
                 )
 
                 self.claude_provider.total_input_tokens += response.usage.input_tokens
@@ -1715,11 +1887,16 @@ class ClaudeBot(commands.Bot):
                 search_rounds += 1
 
             if not response.content:
-                return "I received an empty response from the API.", []
+                return "I received an empty response from the API.", [], ""
 
-            # Extract text from all content blocks (may include search result blocks)
+            # Extract text from all content blocks (may include search result
+            # and thinking blocks). We discard thinking blocks from the visible
+            # output — Claude doesn't require them for the next turn since we
+            # always start fresh from Discord history.
             response_text = ""
             for block in response.content:
+                if getattr(block, "type", None) == "thinking":
+                    continue
                 if hasattr(block, 'text'):
                     response_text += block.text
 
@@ -1742,10 +1919,10 @@ class ClaudeBot(commands.Bot):
             response_text = re.sub(r'\n\s*\n\s*\n', '\n\n', response_text)
             response_text = re.sub(r'  +', ' ', response_text)
 
-            return response_text, reactions
+            return response_text, reactions, ""
 
         except anthropic.APIError as e:
-            return f"Claude Error: {e}", []
+            return f"Claude Error: {e}", [], ""
     
     async def _web_search(
         self, 
@@ -1891,20 +2068,21 @@ class ClaudeBot(commands.Bot):
         return cleaned, files
     
     async def _send_response(
-        self, 
-        channel: discord.abc.Messageable, 
-        content: str, 
+        self,
+        channel: discord.abc.Messageable,
+        content: str,
         files: list[discord.File] = None
-    ) -> None:
-        """Send message, chunking if over Discord's limit."""
+    ) -> Optional[discord.Message]:
+        """Send message, chunking if over Discord's limit. Returns the first
+        sent Message (or None if nothing was sent) so callers can key per-message
+        state like the reasoning cache."""
         if not content and not files:
-            return
-        
+            return None
+
         # If content fits in one message
         if len(content) <= 1990:
-            await channel.send(content, files=files)
-            return
-        
+            return await channel.send(content, files=files)
+
         # Chunk the message
         chunks = []
         remaining = content
@@ -1912,23 +2090,25 @@ class ClaudeBot(commands.Bot):
             if len(remaining) <= 1990:
                 chunks.append(remaining)
                 break
-            
+
             # Find a good break point
             break_point = remaining.rfind('\n', 0, 1990)
             if break_point == -1:
                 break_point = remaining.rfind(' ', 0, 1990)
             if break_point == -1:
                 break_point = 1990
-            
+
             chunks.append(remaining[:break_point])
             remaining = remaining[break_point:].lstrip()
-        
+
         # Send chunks (files only on first message)
+        first_msg = None
         for i, chunk in enumerate(chunks):
             if i == 0:
-                await channel.send(chunk, files=files)
+                first_msg = await channel.send(chunk, files=files)
             else:
                 await channel.send(chunk)
+        return first_msg
     
     async def _handle_command(self, message: discord.Message) -> None:
         """Handle bot commands."""
@@ -2068,7 +2248,7 @@ class ClaudeBot(commands.Bot):
                         search_results = await self._tavily_search(query)
                         # Ask Deepseek to synthesize the results
                         search_messages = [{"role": "user", "content": f"Based on these web search results, answer the query: {query}\n\nSearch results:\n{search_results}"}]
-                        response_text, _ = await self._generate_deepseek_response(
+                        response_text, _, _ = await self._generate_deepseek_response(
                             guild_id, search_messages,
                             "You are a helpful assistant. Summarize the search results clearly and cite your sources with URLs."
                         )
@@ -2242,10 +2422,14 @@ class ClaudeBot(commands.Bot):
 **Multi-model (Hydra):**
 `!claude <message>` / `!opus <message>` - Force Claude to respond
 `!deepseek <message>` - Force Deepseek to respond
+`!think <message>` - Use extended thinking (deeper reasoning, slower & costlier)
 `!models` - Show available models and their usage stats
 `!prefer [claude|deepseek|auto]` - Set model preference for this channel
 `!calibration` - Show model confidence calibration stats
 React with 👍/👎 to bot responses to improve model selection
+Stack prefixes to combine: `!think !claude <message>` forces Claude with thinking on.
+Thinking auto-enables on `!claude`/`!opus` when prompts look hard (e.g. "explain why",
+"step by step", multi-step problems).
 
 **Long-term memory (permanent):**
 `!remember <key> <value>` - Store a permanent memory
