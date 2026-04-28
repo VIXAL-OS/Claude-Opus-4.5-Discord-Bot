@@ -127,6 +127,13 @@ Just check your label and the routing info below if you need to orient yourself.
 
 **Math**: Discord can't render LaTeX, so the bot does it for you. Wrap display equations in `$$...$$` and inline math in `$...$` — the bot will render each block to a PNG attachment while keeping your LaTeX source in the message body so users can copy it. Use this any time you write equations; don't strip the dollar signs.
 
+Common pitfalls to avoid in your LaTeX (these silently produce wrong-looking renders):
+- Subscripts on multi-char names: write `K_t`, `t_{1/2}`, `P_{t|t-1}`, NOT `Kt`, `t{1/2}`, `P{t|t-1}`. The underscore is required.
+- Differentials: write `\,dt` and `\,dW_t` for proper thin-space spacing, NOT `,dt` or `dWt`.
+- Multi-char subscripts and superscripts need braces: `H^T_t` and `H_t^T` are fine; `H^Tt` is not.
+- Greek letters and operators always need a backslash: `\theta`, `\sigma`, `\sum`, `\int`, `\frac`. Bare `theta` will render as four italic letters.
+- Re-read your equations before sending; a stray missing `_` or `\,` is the difference between a clean render and a confusing one.
+
 **Images**: You can see images that users upload.
 
 **Thread awareness**: You can see other recent threads in this channel. Use this for context about what the team has been working on, but DON'T write notes about other threads - that context is fetched fresh each time.
