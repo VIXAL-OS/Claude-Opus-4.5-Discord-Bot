@@ -48,6 +48,7 @@ from dotenv import load_dotenv
 import matplotlib
 matplotlib.use('Agg')
 from matplotlib import mathtext as _mpl_mathtext
+from PIL import Image as _PILImage
 
 load_dotenv()
 
@@ -2235,21 +2236,57 @@ class ClaudeBot(commands.Bot):
                 return blocks
         return blocks
 
+    @staticmethod
+    def _composite_latex_pngs(pngs: list[bytes], pad: int = 24) -> bytes:
+        """Stack rendered equation PNGs vertically into one image with white
+        background and centered alignment. Discord shows multiple attachments
+        in a squished horizontal grid; a single tall image renders full-width
+        inline and reads top-to-bottom in equation order.
+        """
+        images = [_PILImage.open(io.BytesIO(p)).convert("RGBA") for p in pngs]
+        max_w = max(im.width for im in images)
+        total_w = max_w + 2 * pad
+        total_h = sum(im.height for im in images) + pad * (len(images) + 1)
+        canvas = _PILImage.new("RGBA", (total_w, total_h), (255, 255, 255, 255))
+        y = pad
+        for im in images:
+            x = pad + (max_w - im.width) // 2
+            canvas.paste(im, (x, y), im)
+            y += im.height + pad
+        out = io.BytesIO()
+        canvas.convert("RGB").save(out, format="PNG", optimize=True)
+        out.seek(0)
+        return out.getvalue()
+
     def _render_latex_attachments(self, response_text: str, max_files: int) -> list[discord.File]:
         """Detect LaTeX in the response and produce PNG attachments. The source
-        text is left untouched in the message body so users can copy it."""
+        text is left untouched in the message body so users can copy it.
+
+        With multiple equations we composite them into a single tall PNG —
+        Discord otherwise lays multiple attachments out in a horizontal grid
+        which squishes wide math renders into illegibility.
+        """
         if max_files <= 0:
             return []
-        files: list[discord.File] = []
-        for i, src in enumerate(self._extract_latex_blocks(response_text), 1):
-            if len(files) >= max_files:
-                break
+        pngs: list[bytes] = []
+        for src in self._extract_latex_blocks(response_text):
             png = self._render_latex(src)
-            if png is None:
-                continue
-            buf = io.BytesIO(png)
-            files.append(discord.File(buf, filename=f"eq{i}.png"))
-        return files
+            if png is not None:
+                pngs.append(png)
+        if not pngs:
+            return []
+        if len(pngs) == 1:
+            return [discord.File(io.BytesIO(pngs[0]), filename="eq.png")]
+        try:
+            composite = self._composite_latex_pngs(pngs)
+            return [discord.File(io.BytesIO(composite), filename="equations.png")]
+        except Exception:
+            # Composite failed for some reason — fall back to individual files,
+            # capped at max_files. At least the math gets through.
+            return [
+                discord.File(io.BytesIO(p), filename=f"eq{i}.png")
+                for i, p in enumerate(pngs[:max_files], 1)
+            ]
     
     async def _send_response(
         self,
