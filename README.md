@@ -147,7 +147,7 @@ The bot gracefully degrades — runs Claude-only, Deepseek-only, or both dependi
 | Model | Input | Output | Typical message |
 |-------|-------|--------|-----------------|
 | Claude Opus 4.6 | $15/M tokens | $75/M tokens | ~$0.02-0.05 |
-| Deepseek V3 | $0.28/M tokens | $0.42/M tokens | ~$0.0003-0.001 |
+| Deepseek V4 Pro | $0.435/M tokens | $0.87/M tokens | ~$0.0005-0.002 |
 
 Deepseek handles routine chat at ~50-100x less cost. Claude handles complex tasks that justify the premium. Use `!cost` to see real-time breakdown.
 

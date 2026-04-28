@@ -204,9 +204,9 @@ CLAUDE_PROVIDER = ModelProvider(
 
 DEEPSEEK_PROVIDER = ModelProvider(
     name="Deepseek",
-    model_id="deepseek-chat",
-    input_cost_per_million=0.28,
-    output_cost_per_million=0.42,
+    model_id="deepseek-v4-pro",
+    input_cost_per_million=0.435,
+    output_cost_per_million=0.87,
     supports_vision=False,
     supports_web_search=False,
 )
