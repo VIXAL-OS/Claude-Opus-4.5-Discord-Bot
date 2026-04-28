@@ -1467,6 +1467,11 @@ class ClaudeBot(commands.Bot):
                 "model": self.deepseek_provider.model_id,
                 "max_tokens": self.deepseek_provider.max_tokens,
                 "messages": openai_messages,
+                # Deepseek V4 enables thinking mode by default and requires
+                # reasoning_content to be echoed on every prior assistant turn.
+                # We reconstruct history from plain Discord text, so we can't
+                # preserve reasoning blocks — disable thinking instead.
+                "extra_body": {"thinking": {"type": "disabled"}},
             }
             if tools:
                 api_kwargs["tools"] = tools
