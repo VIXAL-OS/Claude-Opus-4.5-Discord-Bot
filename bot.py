@@ -84,7 +84,7 @@ class BotConfig:
     text_file_types: tuple = ('.md', '.txt', '.py', '.js', '.ts', '.json', '.csv', '.html', '.css', '.yaml', '.yml', '.toml', '.xml', '.sql', '.sh', '.bash', '.r', '.rs', '.go', '.java', '.c', '.cpp', '.h', '.hpp')
     
     # Bot behavior
-    system_prompt: str = """You are {model_identity}, chatting in a Discord server.
+    system_prompt: str = r"""You are {model_identity}, chatting in a Discord server.
 
 You're helpful, harmless, and honest. You have a warm, curious personality. You can be playful but you're also genuinely knowledgeable and thoughtful.
 
