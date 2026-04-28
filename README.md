@@ -1,6 +1,6 @@
 # Hydra Discord Bot
 
-A multi-model Discord bot powered by Claude Opus 4.6 and Deepseek, with smart routing, shared memory, and web search.
+A multi-model Discord bot powered by Claude Opus 4.7 and Deepseek, with smart routing, shared memory, and web search.
 
 ## Features
 
@@ -146,7 +146,7 @@ The bot gracefully degrades — runs Claude-only, Deepseek-only, or both dependi
 
 | Model | Input | Output | Typical message |
 |-------|-------|--------|-----------------|
-| Claude Opus 4.6 | $15/M tokens | $75/M tokens | ~$0.02-0.05 |
+| Claude Opus 4.7 | $15/M tokens | $75/M tokens | ~$0.02-0.05 |
 | Deepseek V4 Pro | $0.435/M tokens | $0.87/M tokens | ~$0.0005-0.002 |
 
 Deepseek handles routine chat at ~50-100x less cost. Claude handles complex tasks that justify the premium. Use `!cost` to see real-time breakdown.

@@ -1,5 +1,5 @@
 """
-Claude Opus 4.6 Discord Bot
+Claude Opus 4.7 Discord Bot
 ===========================
 A cost-effective Discord bot with smart context management.
 
@@ -20,7 +20,7 @@ Setup:
 3. Create config.json with allowed_channels list
 4. python bot.py
 
-Cost estimate: ~$0.02-0.05 per message with Opus 4.6
+Cost estimate: ~$0.02-0.05 per message with Opus 4.7
 $20 prepaid → 400-1000 messages depending on conversation length
 """
 
@@ -195,7 +195,7 @@ class ModelProvider:
 
 CLAUDE_PROVIDER = ModelProvider(
     name="Claude",
-    model_id="claude-opus-4-6",
+    model_id="claude-opus-4-7",
     input_cost_per_million=15.0,
     output_cost_per_million=75.0,
     supports_vision=True,
