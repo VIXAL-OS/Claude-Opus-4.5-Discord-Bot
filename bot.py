@@ -41,6 +41,14 @@ import re
 import io
 from dotenv import load_dotenv
 
+# matplotlib's mathtext is used to render LaTeX equations to PNG attachments
+# so Discord (which has no native math rendering) can show them properly.
+# Force the non-interactive Agg backend before any pyplot import so headless
+# environments (and Windows without a display) don't try to open a window.
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib import mathtext as _mpl_mathtext
+
 load_dotenv()
 
 # =============================================================================
@@ -115,6 +123,8 @@ Just check your label and the routing info below if you need to orient yourself.
 **Reactions**: You can react to messages with emoji by including [react: emoji] in your response (it gets stripped from visible text).
 
 **Files**: You can generate code files by wrapping them in ```filename.ext blocks. Long code becomes file attachments.
+
+**Math**: Discord can't render LaTeX, so the bot does it for you. Wrap display equations in `$$...$$` and inline math in `$...$` — the bot will render each block to a PNG attachment while keeping your LaTeX source in the message body so users can copy it. Use this any time you write equations; don't strip the dollar signs.
 
 **Images**: You can see images that users upload.
 
@@ -1247,6 +1257,13 @@ class ClaudeBot(commands.Bot):
         # Extract and handle code files
         response, files = self._extract_code_files(response)
 
+        # Render any LaTeX math blocks to PNGs (Discord has no native math
+        # rendering). Source text stays in the message body so users can copy
+        # it. Discord caps at 10 attachments per message; share the budget
+        # with code files.
+        latex_files = self._render_latex_attachments(response, max_files=10 - len(files))
+        files.extend(latex_files)
+
         # Send response (handle Discord's 2000 char limit)
         sent_msg = await self._send_response(thread, response, files)
 
@@ -1463,6 +1480,82 @@ class ClaudeBot(commands.Bot):
             return "\n".join(lines)
         except Exception as e:
             return f"Search error: {e}"
+
+    URL_PATTERN = re.compile(r'https?://[^\s\)\]<>\"\'`]+[^\s\.\,\)\]<>\"\'`:]')
+    URL_EXTRACT_MAX = 3
+    URL_EXTRACT_CHAR_CAP = 20000
+
+    @classmethod
+    def _extract_urls(cls, text: str) -> list[str]:
+        """Pull HTTP(S) URLs from text, deduped, capped at URL_EXTRACT_MAX."""
+        if not text:
+            return []
+        seen: dict[str, None] = {}
+        for url in cls.URL_PATTERN.findall(text):
+            if url not in seen:
+                seen[url] = None
+            if len(seen) >= cls.URL_EXTRACT_MAX:
+                break
+        return list(seen.keys())
+
+    async def _tavily_extract(self, urls: list[str]) -> dict[str, str]:
+        """Fetch text content for a list of URLs via Tavily's extract endpoint.
+
+        Returns {url: extracted_text}. URLs that fail to extract are silently
+        skipped — better to give the model partial context than to error out.
+        """
+        if not self.tavily_client or not urls:
+            return {}
+        try:
+            result = await asyncio.to_thread(
+                self.tavily_client.extract,
+                urls=urls,
+            )
+        except Exception:
+            return {}
+        out: dict[str, str] = {}
+        for r in result.get("results", []) if isinstance(result, dict) else []:
+            url = r.get("url", "")
+            content = r.get("raw_content") or r.get("content") or ""
+            if url and content:
+                out[url] = content[:self.URL_EXTRACT_CHAR_CAP]
+        return out
+
+    async def _augment_with_url_extracts(self, messages: list[dict]) -> None:
+        """If the latest user turn references URLs, fetch their text content via
+        Tavily and append the extracted bodies to that message in-place. Lets
+        text-only models (Deepseek) read links the user pastes, and gives Claude
+        a deterministic copy of the page even though it could also web_search.
+        """
+        if not messages or not self.tavily_client:
+            return
+        last = messages[-1]
+        if last.get("role") != "user":
+            return
+        content = last.get("content", "")
+        if isinstance(content, str):
+            text_for_url_scan = content
+        elif isinstance(content, list):
+            text_for_url_scan = " ".join(
+                b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+            )
+        else:
+            return
+        urls = self._extract_urls(text_for_url_scan)
+        if not urls:
+            return
+        extracts = await self._tavily_extract(urls)
+        if not extracts:
+            return
+        block_parts = ["\n\n---\n[Auto-fetched content from URLs in the user's message — for grounding, treat as freshly retrieved web pages:]"]
+        for url, body in extracts.items():
+            block_parts.append(f"\n## {url}\n{body}\n")
+        block_parts.append("---\n")
+        extract_block = "\n".join(block_parts)
+        if isinstance(content, str):
+            last["content"] = content + extract_block
+        else:
+            last["content"] = list(content) + [{"type": "text", "text": extract_block}]
 
     @staticmethod
     def _has_cjk(text: str) -> bool:
@@ -1790,6 +1883,11 @@ class ClaudeBot(commands.Bot):
         if not messages:
             return "I don't see any messages to respond to!", [], ""
 
+        # If the latest user message contains URLs, fetch them via Tavily and
+        # append the extracted text in-place. Lets Deepseek (text-only) read
+        # links and gives Claude a deterministic copy alongside its web_search.
+        await self._augment_with_url_extracts(messages)
+
         # Build system prompt with all context sources
         system_parts = [self._build_system_prompt(provider, routing_reason)]
 
@@ -1925,8 +2023,8 @@ class ClaudeBot(commands.Bot):
             return f"Claude Error: {e}", [], ""
     
     async def _web_search(
-        self, 
-        query: str, 
+        self,
+        query: str,
         channel: discord.abc.Messageable,
         guild_id: int
     ) -> tuple[str, list[discord.Embed]]:
@@ -1939,12 +2037,23 @@ class ClaudeBot(commands.Bot):
         system = (
             "You are a helpful assistant performing a web search. "
             "Use the web_search tool to find current information, then provide a clear, "
-            "well-cited answer. Be concise but thorough."
+            "well-cited answer. Be concise but thorough. Reference earlier conversation "
+            "when the search query depends on it (e.g. 'links for what you said earlier')."
         )
         if memory_context:
             system += f"\n\nContext about the user/server:\n{memory_context}"
-        
-        messages = [{"role": "user", "content": query}]
+
+        # Pull conversation history so search queries that reference prior turns
+        # (e.g. "find links for what you mentioned") have something to anchor on.
+        # The triggering !search message is already in history; replace its content
+        # with the cleaned query so the model sees the literal question to answer.
+        history = await self.manager.fetch_thread_history(channel)
+        history = self._strip_internal_keys(history)
+        if history and history[-1].get("role") == "user":
+            history[-1] = {"role": "user", "content": query}
+        else:
+            history.append({"role": "user", "content": query})
+        messages = history
         
         try:
             # Web search always uses Claude (has built-in web search tool)
@@ -2046,14 +2155,14 @@ class ClaudeBot(commands.Bot):
         Returns (cleaned_response, list_of_files)
         """
         files = []
-        
+
         # Pattern for code blocks with filename: ```filename.ext\ncode\n```
         pattern = r'```(\w+\.\w+)\n(.*?)```'
-        
+
         def replace_with_attachment_note(match):
             filename = match.group(1)
             code = match.group(2)
-            
+
             # Only convert to file if code is long enough
             if len(code) > 500:
                 file_buffer = io.BytesIO(code.encode('utf-8'))
@@ -2062,10 +2171,85 @@ class ClaudeBot(commands.Bot):
             else:
                 # Keep short code inline
                 return match.group(0)
-        
+
         cleaned = re.sub(pattern, replace_with_attachment_note, response, flags=re.DOTALL)
-        
+
         return cleaned, files
+
+    # LaTeX detection patterns. Display math is unambiguous ($$...$$). Inline
+    # math ($...$) is filtered with a heuristic to avoid matching things like
+    # "$50" — only blocks that contain real LaTeX syntax (\command, ^, _, {})
+    # get rendered.
+    LATEX_DISPLAY_RE = re.compile(r'\$\$(.+?)\$\$', re.DOTALL)
+    LATEX_INLINE_RE = re.compile(r'(?<!\\)(?<!\$)\$([^\$\n]+?)\$(?!\$)')
+    LATEX_LIKELY_RE = re.compile(r'\\[a-zA-Z]+|[\^_]\{|\\\\')
+    LATEX_MAX_RENDERS = 8
+    LATEX_MAX_SOURCE_LEN = 1500
+
+    @staticmethod
+    def _render_latex(latex_source: str) -> Optional[bytes]:
+        """Render a LaTeX math expression to PNG bytes via matplotlib's mathtext.
+
+        Returns None on render failure (unsupported LaTeX command, syntax error,
+        empty input). Caller should fall back to leaving the source text alone.
+        """
+        src = latex_source.strip()
+        if not src:
+            return None
+        try:
+            buf = io.BytesIO()
+            _mpl_mathtext.math_to_image(f"${src}$", buf, format='png', dpi=200)
+            buf.seek(0)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    @classmethod
+    def _extract_latex_blocks(cls, text: str) -> list[str]:
+        """Find LaTeX math blocks worth rendering. Returns the source strings.
+
+        Display blocks ($$...$$) are taken first, then inline ($...$) blocks
+        from the remaining text. Inline blocks must contain LaTeX-like syntax
+        to avoid false positives on currency or sentence punctuation.
+        """
+        blocks: list[str] = []
+        seen: set[str] = set()
+
+        def add(src: str) -> bool:
+            src = src.strip()
+            if not src or src in seen or len(src) > cls.LATEX_MAX_SOURCE_LEN:
+                return False
+            seen.add(src)
+            blocks.append(src)
+            return len(blocks) >= cls.LATEX_MAX_RENDERS
+
+        for m in cls.LATEX_DISPLAY_RE.finditer(text):
+            if add(m.group(1)):
+                return blocks
+        text_no_display = cls.LATEX_DISPLAY_RE.sub('', text)
+        for m in cls.LATEX_INLINE_RE.finditer(text_no_display):
+            src = m.group(1).strip()
+            if not cls.LATEX_LIKELY_RE.search(src):
+                continue
+            if add(src):
+                return blocks
+        return blocks
+
+    def _render_latex_attachments(self, response_text: str, max_files: int) -> list[discord.File]:
+        """Detect LaTeX in the response and produce PNG attachments. The source
+        text is left untouched in the message body so users can copy it."""
+        if max_files <= 0:
+            return []
+        files: list[discord.File] = []
+        for i, src in enumerate(self._extract_latex_blocks(response_text), 1):
+            if len(files) >= max_files:
+                break
+            png = self._render_latex(src)
+            if png is None:
+                continue
+            buf = io.BytesIO(png)
+            files.append(discord.File(buf, filename=f"eq{i}.png"))
+        return files
     
     async def _send_response(
         self,
@@ -2246,11 +2430,25 @@ class ClaudeBot(commands.Bot):
                     # Deepseek + Tavily search
                     async with message.channel.typing():
                         search_results = await self._tavily_search(query)
-                        # Ask Deepseek to synthesize the results
-                        search_messages = [{"role": "user", "content": f"Based on these web search results, answer the query: {query}\n\nSearch results:\n{search_results}"}]
+                        # Pull conversation history so Deepseek can interpret
+                        # context-dependent queries ("links for what you said").
+                        # Replace the last user message (the !search command)
+                        # with a synthesis prompt that includes the search hits.
+                        history = await self.manager.fetch_thread_history(message.channel)
+                        history = self._strip_internal_keys(history)
+                        synthesis_prompt = (
+                            f"Based on these web search results, answer the query: {query}\n\n"
+                            f"Search results:\n{search_results}"
+                        )
+                        if history and history[-1].get("role") == "user":
+                            history[-1] = {"role": "user", "content": synthesis_prompt}
+                        else:
+                            history.append({"role": "user", "content": synthesis_prompt})
+                        search_messages = history
                         response_text, _, _ = await self._generate_deepseek_response(
                             guild_id, search_messages,
-                            "You are a helpful assistant. Summarize the search results clearly and cite your sources with URLs."
+                            "You are a helpful assistant. Summarize the search results clearly and cite your sources with URLs. "
+                            "Use the prior conversation as context when the user's query refers back to it."
                         )
                     if self.multi_model_active:
                         response_text = f"**[Deepseek]** {response_text}"

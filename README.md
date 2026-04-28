@@ -7,7 +7,9 @@ A multi-model Discord bot powered by Claude Opus 4.7 and Deepseek, with smart ro
 - 🐉 **Multi-model (Hydra)** - Claude + Deepseek with automatic routing
 - 🧵 **Thread-based conversations** - keeps channels clean
 - 📷 **Image understanding** - upload images and Claude can see them
-- 🔍 **Web search** - Claude searches natively, Deepseek searches via Tavily
+- 🔗 **URL reading** - paste a link and the bot fetches the page contents (via Tavily extract)
+- 🔍 **Web search** - Claude searches natively, Deepseek searches via Tavily; both use prior chat as context
+- 🧮 **LaTeX rendering** - `$$...$$` and `$...$` blocks render to PNG attachments (source kept inline)
 - 🧠 **Two-tier memory** - working notes (auto-decay) + long-term (permanent)
 - 😀 **Emoji reactions** - the bot can react to your messages
 - 📎 **File attachments** - long code becomes downloadable files
