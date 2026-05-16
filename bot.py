@@ -82,7 +82,14 @@ class BotConfig:
     
     # Supported text file types
     text_file_types: tuple = ('.md', '.txt', '.py', '.js', '.ts', '.json', '.csv', '.html', '.css', '.yaml', '.yml', '.toml', '.xml', '.sql', '.sh', '.bash', '.r', '.rs', '.go', '.java', '.c', '.cpp', '.h', '.hpp')
-    
+
+    # PluralKit / webhook proxy compatibility
+    # When a user sends a message, wait this long before responding so that
+    # PluralKit (or any webhook-based proxy) has time to delete-and-repost it
+    # as the alter. If the original is gone after the delay, we bail out and
+    # let the webhook event re-trigger on_message with the proxied version.
+    proxy_check_delay_seconds: float = 1.5
+
     # Bot behavior
     system_prompt: str = r"""You are {model_identity}, chatting in a Discord server.
 
@@ -118,6 +125,20 @@ It's okay if things get a little blurry sometimes — that's natural in a shared
 Just check your label and the routing info below if you need to orient yourself.
 
 {routing_context}
+
+## User plurality (PluralKit)
+
+Some users in this server are plural systems and use PluralKit — a Discord bot that
+deletes their message and reposts it via a webhook under an alter's name and avatar.
+You'll see those alter messages just like normal user messages, but with different
+display names (and possibly different avatars) for the same underlying person.
+
+Treat all alters/headmates of one system as the SAME person: they share memory,
+relationships, context, and continuity. Different names ≠ different users. If
+long-term memory or working notes mention that someone is plural and lists their
+alters, use that to map alter names back to the system. If you're unsure who's
+who, it's fine to ask gently — but don't assume two display names mean two
+different people unless you have reason to believe so.
 
 ## Special capabilities
 
@@ -170,6 +191,17 @@ Write working notes for things like:
 Don't be shy about noting things! The decay system handles cleanup automatically."""
 
 CONFIG = BotConfig()
+
+
+def _is_real_bot(msg: discord.Message) -> bool:
+    """True if msg is from an actual Discord bot account, not a webhook proxy.
+
+    PluralKit (and similar plural-system tools) repost user messages via
+    webhooks; those have author.bot=True but represent a real user behind the
+    scenes. Treat them as users, not assistants. Genuine bots — including this
+    one — post directly via their bot user with no webhook_id."""
+    return msg.author.bot and msg.webhook_id is None
+
 
 # =============================================================================
 # MODEL PROVIDERS
@@ -694,8 +726,10 @@ class ConversationManager:
         messages = []
         
         async for msg in channel.history(limit=limit):
-            if msg.author.bot and msg.author.id != channel._state.user.id:
-                continue  # Skip other bots but include ourselves
+            # Skip other real bots, but include ourselves AND webhook proxies
+            # (PluralKit etc. — those are user messages wearing a different face).
+            if _is_real_bot(msg) and msg.author.id != channel._state.user.id:
+                continue
             
             # Build content (can be text + images)
             content = []
@@ -709,9 +743,10 @@ class ConversationManager:
                     if ref_msg and ref_msg.content:
                         ref_text = ref_msg.content
                         # Strip model labels from referenced bot messages too
-                        if ref_msg.author.bot:
+                        # (skip webhook proxies — those carry user content, not our labels)
+                        if _is_real_bot(ref_msg):
                             ref_text = re.sub(r'^(\*\*\[(?:Claude|Deepseek)\]\*\*\s*)+', '', ref_text)
-                        ref_author = "bot" if ref_msg.author.bot else ref_msg.author.display_name
+                        ref_author = "bot" if _is_real_bot(ref_msg) else ref_msg.author.display_name
                         content.append({
                             "type": "text",
                             "text": f"[replying to {ref_author}: {ref_text}]"
@@ -721,12 +756,14 @@ class ConversationManager:
 
             # Add text if present
             if msg.content:
-                author_prefix = "" if msg.author.bot else f"{msg.author.display_name}: "
+                # Webhook proxies (PluralKit) are user messages, so prefix with
+                # the alter's display name like any other user.
+                author_prefix = "" if _is_real_bot(msg) else f"{msg.author.display_name}: "
                 text = msg.content
                 # Normalize model labels: strip ALL label formats (bold and plain),
                 # then re-add a single clean plain-text label for identity.
                 # This prevents accumulation from either format.
-                if msg.author.bot:
+                if _is_real_bot(msg):
                     # First, extract which model this is from (check bold first, then plain)
                     model_label = None
                     label_match = re.match(r'^(?:\*\*\[(Claude|Deepseek)\]\*\*\s*|\[(Claude|Deepseek)\]\s*)+', text)
@@ -790,7 +827,8 @@ class ConversationManager:
                             })
             
             if content:
-                role = "assistant" if msg.author.bot else "user"
+                # Webhook proxies count as "user" — the human is upstream of the alter.
+                role = "assistant" if _is_real_bot(msg) else "user"
 
                 # Simplify if just text. _msg_id is internal-only metadata used
                 # by the thinking-mode reasoning cache; strip before API calls.
@@ -1183,7 +1221,23 @@ class ClaudeBot(commands.Bot):
         
         if channel_id not in self.allowed_channels and parent_id not in self.allowed_channels:
             return
-        
+
+        # PluralKit / webhook-proxy compatibility.
+        # If this is a normal user message, pause briefly so PluralKit (or any
+        # similar proxy) can delete-and-repost it as the alter. If the original
+        # is gone after the pause, drop this event — Discord will fire another
+        # on_message for the webhook version and we'll handle it there. Skip
+        # the wait for webhook messages themselves (they're already the proxy)
+        # and for our own bot (already filtered above, but be defensive).
+        if message.webhook_id is None and not message.author.bot:
+            await asyncio.sleep(CONFIG.proxy_check_delay_seconds)
+            try:
+                await message.channel.fetch_message(message.id)
+            except discord.NotFound:
+                return  # Proxied away; the webhook event will pick it up.
+            except discord.HTTPException:
+                pass  # Transient API blip — proceed anyway rather than dropping the turn.
+
         # Peel any stacked model/thinking prefixes (!think / !claude / !opus / !deepseek)
         original_content = message.content or ""
         peeled_content, flags = self._peel_prefixes(original_content)
