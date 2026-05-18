@@ -1385,11 +1385,22 @@ class ClaudeBot(commands.Bot):
                 effort=chosen_effort,
             )
 
-        # Label the response with model name (only when multi-model is active)
+        # Label the response with model name (only when multi-model is active).
+        # When thinking was used on Claude, also tag the chosen effort level so
+        # users can see what depth the response was generated at without having
+        # to set it explicitly per turn.
         if self.multi_model_active:
-            # Strip any label the model echoed in its own response before adding the real one
-            response = re.sub(r'^(?:\*\*\[(Claude|Deepseek)\]\*\*\s*|\[(Claude|Deepseek)\]\s*)+', '', response)
-            response = f"**[{provider.name}]** {response}"
+            # Strip any label the model echoed (handles old [Name] and the new
+            # [Name · effort] format Claude may have started echoing).
+            response = re.sub(
+                r'^(?:\*\*\[(?:Claude|Deepseek)(?:\s·\s\w+)?\]\*\*\s*|\[(?:Claude|Deepseek)(?:\s·\s\w+)?\]\s*)+',
+                '',
+                response,
+            )
+            label = provider.name
+            if forced_thinking and provider is self.claude_provider:
+                label = f"{label} · {chosen_effort or self.CLAUDE_THINKING_EFFORT}"
+            response = f"**[{label}]** {response}"
 
         # Handle reactions
         for emoji in reactions:
@@ -2080,13 +2091,16 @@ class ClaudeBot(commands.Bot):
                 # controls overall thinking/acting budget. effort=None falls
                 # back to the class default ("high"). xhigh/max need ≥64K
                 # max_tokens or they truncate mid-thought.
+                # `output_config` is a newer field that some installed anthropic
+                # SDK versions reject as an unknown kwarg; pass it via extra_body
+                # so the field reaches the API regardless of SDK version.
                 chosen_effort = effort or self.CLAUDE_THINKING_EFFORT
                 claude_kwargs["max_tokens"] = (
                     64000 if chosen_effort in ("xhigh", "max")
                     else self.CLAUDE_THINKING_MAX_TOKENS
                 )
                 claude_kwargs["thinking"] = {"type": "adaptive"}
-                claude_kwargs["output_config"] = {"effort": chosen_effort}
+                claude_kwargs["extra_body"] = {"output_config": {"effort": chosen_effort}}
 
             api_messages = self._strip_internal_keys(messages)
             response = await asyncio.to_thread(
