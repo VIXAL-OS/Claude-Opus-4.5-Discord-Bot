@@ -60,11 +60,12 @@ User message arrives
 | `!opus <msg>` | Force Claude Opus to respond |
 | `!deepseek <msg>` | Force Deepseek to respond |
 | `!think <msg>` | Use extended thinking (deeper reasoning, slower & costlier) |
+| `!think:<level> <msg>` | Force a specific Opus effort level (`low`/`medium`/`high`/`xhigh`/`max`) |
 | `!models` | Show available models and usage stats |
 | `!prefer [claude\|deepseek\|auto]` | Set model preference for this channel |
 | `!calibration` | Show confidence calibration stats |
 
-Prefixes can stack in any order: `!think !claude <msg>` forces Claude with thinking on. Thinking auto-enables on `!claude`/`!opus` when prompts look hard (cues like "explain why", "step by step", multi-step problems, long questions, or LaTeX). For Deepseek, thinking is opt-in only via `!think`. Reasoning content is cached per Discord message so multi-turn thinking conversations work across both providers.
+Prefixes can stack in any order: `!think !claude <msg>` forces Claude with thinking on. Thinking auto-enables on `!claude`/`!opus` when prompts look hard (cues like "derive", "why does X", "step by step", LaTeX, large code blocks, or stack traces) and picks an Opus effort level (`high`/`xhigh`/`max`) from the same signals. Casual register and first-person emotional framing soften the score but don't veto it — a hard question dressed in `"lol"` or `"i'm overwhelmed"` can still route to thinking if the textual cues are strong enough. For Deepseek, thinking is opt-in only via `!think`. Reasoning content is cached per Discord message so multi-turn thinking conversations work across both providers.
 
 React with 👍❤️🔥✅😂💖💯 (positive) or 👎❌😕 (negative) to bot responses to improve model selection over time.
 

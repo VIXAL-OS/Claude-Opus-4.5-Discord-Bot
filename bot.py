@@ -1067,7 +1067,7 @@ class ClaudeBot(commands.Bot):
     THINK_PREFIXES = ("!think",)
     CLAUDE_PREFIXES = ("!claude", "!opus")
     DEEPSEEK_PREFIXES = ("!deepseek",)
-    CLAUDE_THINKING_BUDGET = 8000
+    CLAUDE_THINKING_EFFORT = "high"  # low | medium | high | xhigh | max
     CLAUDE_THINKING_MAX_TOKENS = 16000
 
     def _store_reasoning(self, msg_id: int, content: str) -> None:
@@ -1083,53 +1083,130 @@ class ClaudeBot(commands.Bot):
         """Look up cached reasoning_content for a Discord message id, or empty string."""
         return self.reasoning_cache.get(msg_id, "")
 
-    @staticmethod
-    def _looks_hard(text: str) -> bool:
-        """Heuristic: does this prompt benefit from extended thinking?
+    async def _prev_bot_used_thinking(self, channel: discord.abc.Messageable) -> bool:
+        """Did our most recent message in this channel use extended thinking?
 
-        Conservative — false positives cost real latency and tokens, so we only
-        flip to True on fairly explicit deep-dive cues.
+        Behavioral-momentum signal for `_pick_effort`: conversations that
+        had depth in the previous turn usually warrant depth in the next.
+        Walks up to ~10 messages back, finds the most recent message
+        authored by this bot, and checks if its reasoning was cached.
         """
-        if not text:
+        if self.user is None:
             return False
-        text_lower = text.lower()
-        deep_phrases = (
-            "step by step", "step-by-step", "walk me through", "walk through",
-            "deep dive", "in depth", "in-depth", "from first principles",
-            "explain why", "explain how", "prove that", "derive ", "trace through",
-            "compare and contrast", "what's the difference between",
-            "debug this", "why doesn't", "why isn't", "why does this fail",
-            "carefully think", "think carefully",
-        )
-        if any(phrase in text_lower for phrase in deep_phrases):
-            return True
-        # Math/equation-ish: LaTeX commands or chained equalities
-        if re.search(r'\\[a-zA-Z]+|=.*[+\-*/].*=', text):
-            return True
-        # Long question (probably needs careful structuring)
-        if len(text) > 600 and '?' in text:
-            return True
-        # Multi-step language
-        step_markers = sum(
-            1 for w in (" first ", " then ", " next ", " finally ", " after that ")
-            if w in f" {text_lower} "
-        )
-        if step_markers >= 3:
-            return True
+        try:
+            async for msg in channel.history(limit=10):
+                if _is_real_bot(msg) and msg.author.id == self.user.id:
+                    return bool(self.reasoning_cache.get(msg.id))
+        except (discord.HTTPException, AttributeError):
+            return False
         return False
 
-    def _peel_prefixes(self, content: str) -> tuple[str, set[str]]:
+    @staticmethod
+    def _pick_effort(text: str, prev_used_thinking: bool = False) -> Optional[str]:
+        """Classify a prompt into an Opus 4.7 thinking-effort level.
+
+        Returns None | "high" | "xhigh" | "max". None means thinking off
+        (cheap chat path). Casual register and first-person emotional
+        framing are anti-signals (not hard skips) — a hard question dressed
+        in casual or emotional language can still pull the score above
+        threshold with strong textual cues.
+        """
+        if not text:
+            return None
+        text_lower = text.lower()
+        score = 0
+
+        # --- Anti-signals (penalty, not veto) ---
+        # Conversational opener. "lol so why does X" can still route to
+        # thinking if the question itself has strong signals.
+        if re.match(r"^\s*(lol|lmao|lmfao|wait what|huh|wtf|same|nice|cool|ok(ay)?|right)\b", text_lower):
+            score -= 2
+        # First-person emotional framing. A meaty question wrapped in feelings
+        # (Lauren-style "my world used to not be full of depressed people...")
+        # should still get analytical depth if the strong signals are there.
+        if re.search(r"\b(i feel|i'?m feeling|i'?m (sad|depressed|anxious|scared|worried|tired|stressed|lonely))\b", text_lower):
+            score -= 2
+
+        # --- Strong signals (depth almost always rewarded) ---
+        # Construction/derivation verbs, including inflections. "prov(e|es|
+        # ed|ing|en)" is enumerated to avoid matching "provide"/"province".
+        if re.search(r"\b(deriv\w*|prov(e|es|ed|ing|en)|design\w*|architect\w*|refactor\w*|debug\w*)\b", text_lower):
+            score += 3
+        # Large code blocks: model has to actually read them.
+        code_blocks = re.findall(r"```[\s\S]*?```", text)
+        if code_blocks and max(b.count("\n") for b in code_blocks) >= 50:
+            score += 3
+        # Stack traces (Python / JVM-style).
+        if re.search(r"Traceback \(most recent call last\)|\sat [\w.$]+\(.*:\d+\)", text):
+            score += 3
+        # Compound questions: multiple "?" or explicit chaining.
+        if text.count("?") >= 2 or re.search(r"\b(and also|but (what )?about|also,?\s+what about)\b", text_lower):
+            score += 2
+        # Math/LaTeX. {2,} avoids matching \n, \t inside pasted code.
+        if re.search(r"\\[a-zA-Z]{2,}\b|=.*[+\-*/].*=", text):
+            score += 2
+        # Comparative / trade-off framing.
+        if re.search(r"\btrade.?offs?\b|\b(when would you|what'?s the difference between|compare and contrast)\b|\bvs\.?\s+\w+", text_lower):
+            score += 2
+
+        # --- Medium signals ---
+        if re.search(r"\b(why does|why is|why doesn.?t|why isn.?t|explain (why|how)|analy[sz]e)\b|\bhow does .{0,40}work\b", text_lower):
+            score += 1
+        if re.search(r"\b(step.by.step|walk me through|carefully|thoroughly|in.depth|from\s+(scratch|first\s+principles))\b", text_lower):
+            score += 2
+        if len(text) > 2000:
+            score += 2
+
+        # Behavioral momentum: prior turn used thinking → conversation has depth.
+        if prev_used_thinking:
+            score += 1
+
+        if score >= 6:
+            return "max"
+        if score >= 3:
+            return "xhigh"
+        if score >= 1:
+            return "high"
+        return None
+
+    VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+    def _peel_prefixes(self, content: str) -> tuple[str, set[str], Optional[str]]:
         """Strip stacked !think / !claude / !opus / !deepseek prefixes in any order.
 
-        Returns (remaining_content, set_of_flags). Flags are 'think', 'claude',
-        'deepseek'. !opus collapses to 'claude'.
+        Returns (remaining_content, set_of_flags, forced_effort).
+        - flags: subset of {'think', 'claude', 'deepseek'}. !opus collapses to 'claude'.
+        - forced_effort: set when user used `!think:<level>` syntax (low | medium |
+          high | xhigh | max). Implies the 'think' flag.
         """
         flags: set[str] = set()
+        forced_effort: Optional[str] = None
         all_prefixes = self.THINK_PREFIXES + self.CLAUDE_PREFIXES + self.DEEPSEEK_PREFIXES
         while True:
             stripped = content.strip()
             lower = stripped.lower()
             matched = False
+
+            # Try `!think:<level>` first so it wins over the bare `!think` match.
+            for think_prefix in self.THINK_PREFIXES:
+                for level in self.VALID_EFFORTS:
+                    tok = f"{think_prefix}:{level}"
+                    if lower == tok:
+                        rest = ""
+                    elif lower.startswith(tok + " "):
+                        rest = stripped[len(tok):].lstrip()
+                    else:
+                        continue
+                    flags.add("think")
+                    forced_effort = level
+                    content = rest
+                    matched = True
+                    break
+                if matched:
+                    break
+            if matched:
+                continue
+
             for prefix in all_prefixes:
                 if lower == prefix:
                     rest = ""
@@ -1148,7 +1225,7 @@ class ClaudeBot(commands.Bot):
                 break
             if not matched:
                 break
-        return content, flags
+        return content, flags, forced_effort
 
     @staticmethod
     def _strip_internal_keys(messages: list[dict]) -> list[dict]:
@@ -1238,9 +1315,10 @@ class ClaudeBot(commands.Bot):
             except discord.HTTPException:
                 pass  # Transient API blip — proceed anyway rather than dropping the turn.
 
-        # Peel any stacked model/thinking prefixes (!think / !claude / !opus / !deepseek)
+        # Peel any stacked model/thinking prefixes (!think / !think:<level> /
+        # !claude / !opus / !deepseek)
         original_content = message.content or ""
-        peeled_content, flags = self._peel_prefixes(original_content)
+        peeled_content, flags, forced_effort = self._peel_prefixes(original_content)
         forced_thinking = "think" in flags
 
         if "claude" in flags and not self.claude_provider.enabled:
@@ -1280,17 +1358,20 @@ class ClaudeBot(commands.Bot):
         else:
             provider, routing_reason = await self._select_model(message, message.guild.id)
 
-        # Auto-enable thinking for Claude on prompts that look hard.
-        # Skip auto-detection for Deepseek (cost/latency multiplier is bigger
-        # there relative to its baseline) and when no model was forced (we
-        # don't want to silently flip routing decisions into thinking mode).
-        if (
-            not forced_thinking
-            and forced_provider is self.claude_provider
-            and self._looks_hard(message.content or "")
-        ):
-            forced_thinking = True
-            routing_reason = (routing_reason + " Auto-enabled thinking mode (prompt looks hard).").strip()
+        # Decide effort level. Priority: manual !think:<level> > auto-classify
+        # > class default. Auto-classify only when user explicitly chose Claude
+        # (forced_provider) — we don't want to silently flip auto-routed turns
+        # into thinking mode.
+        chosen_effort: Optional[str] = forced_effort
+        if forced_effort:
+            routing_reason = (routing_reason + f" User-set effort={forced_effort}.").strip()
+        elif not forced_thinking and forced_provider is self.claude_provider:
+            prev_thinking = await self._prev_bot_used_thinking(message.channel)
+            auto_effort = self._pick_effort(message.content or "", prev_used_thinking=prev_thinking)
+            if auto_effort:
+                forced_thinking = True
+                chosen_effort = auto_effort
+                routing_reason = (routing_reason + f" Auto-enabled thinking (effort={auto_effort}).").strip()
 
         # Generate response
         async with thread.typing():
@@ -1301,6 +1382,7 @@ class ClaudeBot(commands.Bot):
                 provider=provider,
                 routing_reason=routing_reason,
                 thinking=forced_thinking,
+                effort=chosen_effort,
             )
 
         # Label the response with model name (only when multi-model is active)
@@ -1875,6 +1957,7 @@ class ClaudeBot(commands.Bot):
         provider: ModelProvider = None,
         routing_reason: str = "",
         thinking: bool = False,
+        effort: Optional[str] = None,
     ) -> tuple[str, list[str], str]:
         """
         Generate response from the selected model provider.
@@ -1993,13 +2076,17 @@ class ClaudeBot(commands.Bot):
                 "tools": claude_tools,
             }
             if thinking:
-                # Extended thinking: budget_tokens must be < max_tokens, and
-                # thinking tokens count toward the output budget.
-                claude_kwargs["max_tokens"] = self.CLAUDE_THINKING_MAX_TOKENS
-                claude_kwargs["thinking"] = {
-                    "type": "enabled",
-                    "budget_tokens": self.CLAUDE_THINKING_BUDGET,
-                }
+                # Adaptive thinking on Opus 4.7: model decides depth; effort
+                # controls overall thinking/acting budget. effort=None falls
+                # back to the class default ("high"). xhigh/max need ≥64K
+                # max_tokens or they truncate mid-thought.
+                chosen_effort = effort or self.CLAUDE_THINKING_EFFORT
+                claude_kwargs["max_tokens"] = (
+                    64000 if chosen_effort in ("xhigh", "max")
+                    else self.CLAUDE_THINKING_MAX_TOKENS
+                )
+                claude_kwargs["thinking"] = {"type": "adaptive"}
+                claude_kwargs["output_config"] = {"effort": chosen_effort}
 
             api_messages = self._strip_internal_keys(messages)
             response = await asyncio.to_thread(
@@ -2719,13 +2806,15 @@ class ClaudeBot(commands.Bot):
 `!claude <message>` / `!opus <message>` - Force Claude to respond
 `!deepseek <message>` - Force Deepseek to respond
 `!think <message>` - Use extended thinking (deeper reasoning, slower & costlier)
+`!think:<level> <message>` - Force a specific effort level (low|medium|high|xhigh|max)
 `!models` - Show available models and their usage stats
 `!prefer [claude|deepseek|auto]` - Set model preference for this channel
 `!calibration` - Show model confidence calibration stats
 React with 👍/👎 to bot responses to improve model selection
 Stack prefixes to combine: `!think !claude <message>` forces Claude with thinking on.
-Thinking auto-enables on `!claude`/`!opus` when prompts look hard (e.g. "explain why",
-"step by step", multi-step problems).
+Thinking auto-enables on `!claude`/`!opus` when prompts look hard (cues like "derive",
+"why does X", "step by step", LaTeX, large code blocks, stack traces). The chosen
+effort level is shown in the response routing.
 
 **Long-term memory (permanent):**
 `!remember <key> <value>` - Store a permanent memory
