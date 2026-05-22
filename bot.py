@@ -256,6 +256,17 @@ class ModelProvider:
     input_cost_per_million_above_tier: Optional[float] = None
     output_cost_per_million_above_tier: Optional[float] = None
 
+    # Cached-input pricing: tokens served from the provider's prompt cache
+    # bill at this (much lower) rate. Set on providers that support caching
+    # AND where we extract the cache-hit count from the usage response.
+    # Claude: cache_read_input_tokens (~10% of input rate).
+    # Deepseek: prompt_cache_hit_tokens (~99% off via auto-server-cache).
+    # Gemini native: usageMetadata.cachedContentTokenCount (~25% of input
+    # rate). The OpenAI shim doesn't expose Gemini's cache info, so cache
+    # accounting only kicks in for the native chat path.
+    cached_input_cost_per_million: Optional[float] = None
+    cached_input_cost_per_million_above_tier: Optional[float] = None
+
     # Provider quirks for the OpenAI-compatible generator
     # ---------------------------------------------------
     # requires_reasoning_echo: When thinking mode is on, the provider's API
@@ -276,51 +287,90 @@ class ModelProvider:
     search_backend: Optional[str] = None
 
     # Runtime stats — bottom-tier (or all, if untiered)
-    total_input_tokens: int = 0
+    total_input_tokens: int = 0          # uncached input only
     total_output_tokens: int = 0
+    total_cached_input_tokens: int = 0   # served from prompt cache
     total_requests: int = 0
 
     # Runtime stats — above-tier (only used if context_tier_threshold set)
     total_input_tokens_above_tier: int = 0
     total_output_tokens_above_tier: int = 0
+    total_cached_input_tokens_above_tier: int = 0
 
-    def record_usage(self, input_tokens: int, output_tokens: int) -> None:
-        """Record one request's usage, routing into the right tier bucket."""
+    def record_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cached_input_tokens: int = 0,
+    ) -> None:
+        """Record one request's usage, routing into the right tier bucket.
+
+        `input_tokens` is interpreted as the UNCACHED portion (Claude reports
+        this directly as `input_tokens`; for Gemini/Deepseek the caller must
+        subtract the cached count themselves before passing). Cache hits go
+        into the separate cached counter and bill at the cache rate in
+        get_cost().
+
+        The total request size used for tier routing is uncached + cached,
+        since the API still has to process that much context (and tier
+        breakpoints are based on context size, not billing).
+        """
+        request_size = input_tokens + cached_input_tokens
         if (
             self.context_tier_threshold is not None
-            and input_tokens > self.context_tier_threshold
+            and request_size > self.context_tier_threshold
         ):
             self.total_input_tokens_above_tier += input_tokens
             self.total_output_tokens_above_tier += output_tokens
+            self.total_cached_input_tokens_above_tier += cached_input_tokens
         else:
             self.total_input_tokens += input_tokens
             self.total_output_tokens += output_tokens
+            self.total_cached_input_tokens += cached_input_tokens
 
     def get_cost(self) -> float:
-        """Get total cost for this provider across both pricing tiers."""
+        """Get total cost for this provider across all pricing tiers and cache states."""
         input_cost = (self.total_input_tokens / 1_000_000) * self.input_cost_per_million
         output_cost = (self.total_output_tokens / 1_000_000) * self.output_cost_per_million
+        # Cached input bills at its own (much lower) rate. If no cache rate is
+        # configured but cached tokens exist (shouldn't happen normally), fall
+        # back to the input rate so we don't silently zero out the cost.
+        cache_rate = self.cached_input_cost_per_million
+        if cache_rate is None and self.total_cached_input_tokens > 0:
+            cache_rate = self.input_cost_per_million
+        cached_cost = (self.total_cached_input_tokens / 1_000_000) * (cache_rate or 0.0)
         if self.context_tier_threshold is not None:
             above_in_rate = self.input_cost_per_million_above_tier or self.input_cost_per_million
             above_out_rate = self.output_cost_per_million_above_tier or self.output_cost_per_million
+            above_cache_rate = (
+                self.cached_input_cost_per_million_above_tier
+                or self.cached_input_cost_per_million
+                or self.input_cost_per_million_above_tier
+                or self.input_cost_per_million
+            )
             input_cost += (self.total_input_tokens_above_tier / 1_000_000) * above_in_rate
             output_cost += (self.total_output_tokens_above_tier / 1_000_000) * above_out_rate
-        return input_cost + output_cost
+            cached_cost += (self.total_cached_input_tokens_above_tier / 1_000_000) * above_cache_rate
+        return input_cost + output_cost + cached_cost
 
     def to_stats_dict(self) -> dict:
         return {
             "input_tokens": self.total_input_tokens,
             "output_tokens": self.total_output_tokens,
+            "cached_input_tokens": self.total_cached_input_tokens,
             "input_tokens_above_tier": self.total_input_tokens_above_tier,
             "output_tokens_above_tier": self.total_output_tokens_above_tier,
+            "cached_input_tokens_above_tier": self.total_cached_input_tokens_above_tier,
             "requests": self.total_requests,
         }
 
     def load_stats(self, data: dict) -> None:
         self.total_input_tokens = data.get("input_tokens", 0)
         self.total_output_tokens = data.get("output_tokens", 0)
+        self.total_cached_input_tokens = data.get("cached_input_tokens", 0)
         self.total_input_tokens_above_tier = data.get("input_tokens_above_tier", 0)
         self.total_output_tokens_above_tier = data.get("output_tokens_above_tier", 0)
+        self.total_cached_input_tokens_above_tier = data.get("cached_input_tokens_above_tier", 0)
         self.total_requests = data.get("requests", 0)
 
 
@@ -354,6 +404,10 @@ CLAUDE_PROVIDER = ModelProvider(
     model_id="claude-opus-4-7",
     input_cost_per_million=15.0,
     output_cost_per_million=75.0,
+    # cache_read_input_tokens bill at 10% of standard input rate. (Cache
+    # writes on the first turn are billed at 1.25x; we lump those into the
+    # regular input counter — a small under-bill once per session.)
+    cached_input_cost_per_million=1.5,
     max_context_tokens=1_000_000,  # 1M GA'd for Opus 4.6+ in March 2026
     supports_vision=True,
     supports_web_search=True,
@@ -364,9 +418,11 @@ DEEPSEEK_PROVIDER = ModelProvider(
     model_id="deepseek-v4-pro",
     input_cost_per_million=0.435,
     output_cost_per_million=0.87,
+    # Auto server-side prefix caching; cached input bills at ~99% off.
+    # (Both rates are current through the May 31 2026 promo discount.)
+    cached_input_cost_per_million=0.003625,
     # 1M context per DeepSeek V4-Pro docs (max output 384k). Server-side
-    # context caching is automatic; cached input is ~99% off ($0.003625/M
-    # vs $0.435/M) — no client flags required.
+    # context caching is automatic — no client flags required.
     max_context_tokens=1_000_000,
     supports_vision=False,
     supports_web_search=False,
@@ -390,6 +446,10 @@ GEMINI_PROVIDER = ModelProvider(
     context_tier_threshold=200_000,
     input_cost_per_million_above_tier=4.0,
     output_cost_per_million_above_tier=18.0,
+    # Implicit-cache reads bill at ~25% of standard input rate (75% discount).
+    # Verify exact numbers on the pricing page — these are best-known estimates.
+    cached_input_cost_per_million=0.5,
+    cached_input_cost_per_million_above_tier=1.0,
     # 1M context standard for Gemini Pro line. Bookclub-mode chat (when a
     # reading material is loaded) routes through _generate_gemini_native_response
     # instead of the OpenAI shim, so we can reference cachedContent — Google's
@@ -1137,7 +1197,7 @@ class ConversationManager:
         )
     
     def get_cost_summary(self, providers: list[ModelProvider]) -> str:
-        """Get total cost summary across all models."""
+        """Get total cost summary across all models, including cache hit rate."""
         lines = ["💰 **Cost Summary**"]
         grand_total = 0.0
 
@@ -1146,9 +1206,22 @@ class ConversationManager:
                 continue
             cost = p.get_cost()
             grand_total += cost
+
+            # Sum uncached + cached across both pricing tiers
+            uncached_in = p.total_input_tokens + p.total_input_tokens_above_tier
+            cached_in = p.total_cached_input_tokens + p.total_cached_input_tokens_above_tier
+            out_tokens = p.total_output_tokens + p.total_output_tokens_above_tier
+            total_in = uncached_in + cached_in
+
+            # Hit rate on input tokens (% served from cache)
+            hit_rate = (cached_in / total_in * 100) if total_in > 0 else 0.0
+            cache_note = ""
+            if cached_in > 0:
+                cache_note = f", 🟢 {cached_in:,} cached ({hit_rate:.0f}% hit rate)"
+
             lines.append(
                 f"  **{p.name}**: {p.total_requests} requests, "
-                f"{p.total_input_tokens:,} in + {p.total_output_tokens:,} out = "
+                f"{uncached_in:,} in + {out_tokens:,} out{cache_note} = "
                 f"${cost:.4f}"
             )
 
@@ -1363,6 +1436,32 @@ class ClaudeBot(commands.Bot):
     def _get_reasoning(self, msg_id: int) -> str:
         """Look up cached reasoning_content for a Discord message id, or empty string."""
         return self.reasoning_cache.get(msg_id, "")
+
+    def _record_claude_usage(self, usage, count_request: bool = True) -> None:
+        """Extract Claude usage counters into the provider, including cache info.
+
+        Anthropic's response.usage carries input_tokens (uncached only),
+        output_tokens, and two optional cache counters:
+        cache_read_input_tokens (10% of input rate) and
+        cache_creation_input_tokens (~125% — small surcharge that funds
+        cheap reads). We bucket reads into the cached counter and lump
+        creation into regular input (a small one-time under-bill).
+
+        count_request controls whether to bump total_requests — set False
+        for the tool-use loop continuation rounds so a single user turn
+        counts as one request.
+        """
+        input_tokens = getattr(usage, "input_tokens", 0) or 0
+        output_tokens = getattr(usage, "output_tokens", 0) or 0
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        self.claude_provider.record_usage(
+            input_tokens + cache_creation,
+            output_tokens,
+            cached_input_tokens=cache_read,
+        )
+        if count_request:
+            self.claude_provider.total_requests += 1
 
     async def _prev_bot_used_thinking(self, channel: discord.abc.Messageable) -> bool:
         """Did our most recent message in this channel use extended thinking?
@@ -2066,8 +2165,14 @@ class ClaudeBot(commands.Bot):
         usage = data.get("usageMetadata", {})
         prompt_tokens = usage.get("promptTokenCount", 0)
         output_tokens = usage.get("candidatesTokenCount", 0)
+        cached_tokens = usage.get("cachedContentTokenCount", 0)
         if prompt_tokens or output_tokens:
-            self.gemini_provider.record_usage(prompt_tokens, output_tokens)
+            uncached_input = max(0, prompt_tokens - cached_tokens)
+            self.gemini_provider.record_usage(
+                uncached_input,
+                output_tokens,
+                cached_input_tokens=cached_tokens,
+            )
             self.gemini_provider.total_requests += 1
 
         # Extract structured citations from groundingMetadata.groundingChunks
@@ -2701,10 +2806,15 @@ class ClaudeBot(commands.Bot):
                 **api_kwargs,
             )
 
-            # Track usage (tiered if provider has context_tier_threshold set)
+            # Track usage. DeepSeek exposes prompt_cache_hit_tokens for
+            # server-side auto-cached input; subtract from prompt_tokens to
+            # get the uncached portion. Other providers / no cache → 0.
+            cached_hit = getattr(response.usage, "prompt_cache_hit_tokens", 0) or 0
+            uncached_input = max(0, response.usage.prompt_tokens - cached_hit)
             provider.record_usage(
-                response.usage.prompt_tokens,
+                uncached_input,
                 response.usage.completion_tokens,
+                cached_input_tokens=cached_hit,
             )
             provider.total_requests += 1
 
@@ -2756,10 +2866,13 @@ class ClaudeBot(commands.Bot):
                     **api_kwargs,
                 )
 
-                # Track additional usage
+                # Track additional usage (cache-aware, see above)
+                cached_hit = getattr(response.usage, "prompt_cache_hit_tokens", 0) or 0
+                uncached_input = max(0, response.usage.prompt_tokens - cached_hit)
                 provider.record_usage(
-                    response.usage.prompt_tokens,
+                    uncached_input,
                     response.usage.completion_tokens,
+                    cached_input_tokens=cached_hit,
                 )
 
             response_text = response.choices[0].message.content or ""
@@ -2897,15 +3010,19 @@ class ClaudeBot(commands.Bot):
             finish_reason = candidate.get("finishReason", "UNKNOWN")
             return f"Gemini Error: empty response (finishReason={finish_reason})", [], ""
 
-        # Track usage. Native API reports cachedContentTokenCount separately —
-        # those are billed at ~25% of normal input rate. Our ModelProvider
-        # doesn't model that yet, so we record total prompt tokens at the
-        # normal rate (slight over-estimate when cache is hot).
+        # Track usage. promptTokenCount is the total (including any cached);
+        # cachedContentTokenCount is the cached portion. Subtract to get the
+        # uncached input billed at the regular rate.
         usage = data.get("usageMetadata", {})
         prompt_tokens = usage.get("promptTokenCount", 0)
         output_tokens = usage.get("candidatesTokenCount", 0)
         cached_tokens = usage.get("cachedContentTokenCount", 0)
-        self.gemini_provider.record_usage(prompt_tokens, output_tokens)
+        uncached_input = max(0, prompt_tokens - cached_tokens)
+        self.gemini_provider.record_usage(
+            uncached_input,
+            output_tokens,
+            cached_input_tokens=cached_tokens,
+        )
         self.gemini_provider.total_requests += 1
         if cached_tokens:
             # Light-touch logging so it's visible the cache is actually doing work.
@@ -3136,10 +3253,13 @@ class ClaudeBot(commands.Bot):
                 **claude_kwargs,
             )
 
-            # Track usage
-            self.claude_provider.total_input_tokens += response.usage.input_tokens
-            self.claude_provider.total_output_tokens += response.usage.output_tokens
-            self.claude_provider.total_requests += 1
+            # Track usage. Claude's response.usage exposes cache info as
+            # separate counters: cache_read_input_tokens (10% of input rate)
+            # and cache_creation_input_tokens (125% of input rate — billed at
+            # a small surcharge to fund the cheap reads). We bucket
+            # cache_read into the cached counter and lump cache_creation into
+            # regular input (a small one-time under-bill per cache lifetime).
+            self._record_claude_usage(response.usage)
 
             # Handle tool use loop — Claude may decide to search the web.
             # When thinking is on, response.content includes thinking blocks
@@ -3170,8 +3290,7 @@ class ClaudeBot(commands.Bot):
                     **claude_kwargs,
                 )
 
-                self.claude_provider.total_input_tokens += response.usage.input_tokens
-                self.claude_provider.total_output_tokens += response.usage.output_tokens
+                self._record_claude_usage(response.usage, count_request=False)
                 search_rounds += 1
 
             if not response.content:
@@ -3259,10 +3378,8 @@ class ClaudeBot(commands.Bot):
                 }]
             )
 
-            # Track usage
-            self.claude_provider.total_input_tokens += response.usage.input_tokens
-            self.claude_provider.total_output_tokens += response.usage.output_tokens
-            self.claude_provider.total_requests += 1
+            # Track usage (includes cache info via helper)
+            self._record_claude_usage(response.usage)
 
             # Collect all sources for embeds
             sources = []
@@ -3301,9 +3418,8 @@ class ClaudeBot(commands.Bot):
                     }]
                 )
 
-                self.claude_provider.total_input_tokens += response.usage.input_tokens
-                self.claude_provider.total_output_tokens += response.usage.output_tokens
-            
+                self._record_claude_usage(response.usage, count_request=False)
+
             # Extract final text response
             for block in response.content:
                 if hasattr(block, 'text'):
@@ -3794,10 +3910,8 @@ class ClaudeBot(commands.Bot):
                         )
                         summary = summary_response.content[0].text.strip()
 
-                        # Track usage
-                        self.claude_provider.total_input_tokens += summary_response.usage.input_tokens
-                        self.claude_provider.total_output_tokens += summary_response.usage.output_tokens
-                        self.claude_provider.total_requests += 1
+                        # Track usage (cache info goes through the helper too)
+                        self._record_claude_usage(summary_response.usage)
                         
                         if memory.longterm.add(f"thread_{key}", summary):
                             self.manager.save_memories(providers=self.providers)
