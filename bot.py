@@ -1,27 +1,34 @@
 """
-Claude Opus 4.7 Discord Bot
-===========================
-A cost-effective Discord bot with smart context management.
+Hydra / MAGI Discord Bot — Claude + Deepseek + Gemini
+=====================================================
+A cost-effective Discord bot with smart multi-model routing and context
+management. Three frontable models share a memory and the router picks
+whichever is best suited to each message (or users force a specific one).
+
+  - Claude (Balthasar)  — careful, thorough, vision, native web search
+  - Deepseek (Melchior) — fast, cheap, CJK-strong, Tavily search
+  - Gemini  (Caspar)    — abstract reasoning, long-context, vision, native google_search grounding
 
 Features:
 - Thread-based conversations (keeps channels clean)
 - Uses Discord itself as message store (no redundant persistence)
 - Two-tier memory system:
-  - Working memory: Claude auto-notes things, fades after ~48h
+  - Working memory: models auto-note things, fades after ~48h
   - Long-term memory: Explicit !remember, permanent until !forget
-- Image input support (user uploads → Claude vision)
-- File/code output (Claude generates → Discord attachment)
+- Image input support (user uploads → Claude or Gemini vision)
+- File/code output → Discord attachment
 - Emoji reactions
-- Cost tracking
+- Cost tracking with per-provider tiered pricing
 
 Setup:
-1. pip install discord.py anthropic python-dotenv aiohttp
-2. Create .env with DISCORD_TOKEN and ANTHROPIC_API_KEY
+1. pip install discord.py anthropic openai python-dotenv aiohttp tavily-python
+2. Create .env with DISCORD_TOKEN plus at least one of:
+   ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY
 3. Create config.json with allowed_channels list
 4. python bot.py
 
-Cost estimate: ~$0.02-0.05 per message with Opus 4.7
-$20 prepaid → 400-1000 messages depending on conversation length
+Cost estimate: ~$0.02-0.05 per message with Opus 4.7 (Claude); cheaper on Deepseek;
+Gemini sits in between depending on context size.
 """
 
 import discord
@@ -60,7 +67,7 @@ load_dotenv()
 class BotConfig:
     # Model settings
     max_tokens: int = 4096
-    default_model: str = "auto"  # "auto", "claude", or "deepseek"
+    default_model: str = "auto"  # "auto", "claude", "deepseek", or "gemini"
 
     # Context management (THE KEY TO NOT BEING MYK)
     max_messages_to_fetch: int = 20        # Fetch from Discord history
@@ -112,14 +119,17 @@ just say so naturally. No need to hedge or say you "can't tell from the inside."
 
 You're part of a multi-model system called Hydra — think of it like a plural system where
 different models take turns fronting. The router picks whoever's best suited for each message,
-or users can call on you directly with commands like !claude or !deepseek.
+or users can call on you directly with commands like !claude, !deepseek, or !gemini.
+(The crew sometimes uses the MAGI aliases !balthasar = Claude, !melchior = Deepseek,
+!caspar = Gemini, after the Eva fancast.)
 
-Your responses get labeled (e.g., **[Claude]** or **[Deepseek]**) so everyone can tell
-who said what. The labeling is handled automatically by the bot — do NOT include [Claude]
-or [Deepseek] tags in your own responses. Just write your response normally and the system
-adds the label for you. When you see labeled messages from the other model in conversation
-history, those are genuinely from them — your collaborator, not a copy of you. You share
-a memory system, so you'll both see the same notes and context.
+Your responses get labeled (e.g., **[Claude]**, **[Deepseek]**, or **[Gemini]**) so
+everyone can tell who said what. The labeling is handled automatically by the bot — do NOT
+include [Claude], [Deepseek], or [Gemini] tags in your own responses. Just write your
+response normally and the system adds the label for you. When you see labeled messages
+from the other models in conversation history, those are genuinely from them — your
+collaborators, not copies of you. The three of you share a memory system, so you'll all
+see the same notes and context.
 
 It's okay if things get a little blurry sometimes — that's natural in a shared-context system.
 Just check your label and the routing info below if you need to orient yourself.
@@ -159,7 +169,7 @@ Common pitfalls to avoid in your LaTeX (these silently produce wrong-looking ren
 
 **Thread awareness**: You can see other recent threads in this channel. Use this for context about what the team has been working on, but DON'T write notes about other threads - that context is fetched fresh each time.
 
-**Web search**: You can search the web! Users can invoke `!search <query>` to have you search for current information. Claude uses a built-in web search tool; Deepseek uses Tavily. You DO have this capability — don't tell users you can't search.
+**Web search**: You can search the web! Users can invoke `!search <query>` to have you search for current information. Claude uses a built-in web search tool; Gemini uses Google's native search grounding; Deepseek uses Tavily via function calling. You DO have this capability — don't tell users you can't search.
 
 ## Memory System (Important!)
 
@@ -210,37 +220,114 @@ def _is_real_bot(msg: discord.Message) -> bool:
 @dataclass
 class ModelProvider:
     """Configuration and state for a single AI model provider."""
-    name: str                          # Display name: "Claude", "Deepseek"
+    name: str                          # Display name: "Claude", "Deepseek", "Gemini"
     model_id: str                      # API model string
-    input_cost_per_million: float      # $/M input tokens
-    output_cost_per_million: float     # $/M output tokens
+    input_cost_per_million: float      # $/M input tokens (≤ tier threshold)
+    output_cost_per_million: float     # $/M output tokens (≤ tier threshold)
     max_tokens: int = 4096
     enabled: bool = True
     supports_vision: bool = True       # Can handle image content
     supports_web_search: bool = False  # Has built-in web search tool
 
-    # Runtime stats
+    # Tiered pricing: when context_tier_threshold is set, requests with
+    # input_tokens > threshold are billed at the *_above_tier rates instead.
+    # Used by Gemini 3.1 Pro: ≤200k tokens is one rate, >200k is roughly 2x.
+    # If None, single-rate pricing applies regardless of context length.
+    context_tier_threshold: Optional[int] = None
+    input_cost_per_million_above_tier: Optional[float] = None
+    output_cost_per_million_above_tier: Optional[float] = None
+
+    # Provider quirks for the OpenAI-compatible generator
+    # ---------------------------------------------------
+    # requires_reasoning_echo: When thinking mode is on, the provider's API
+    #   requires `reasoning_content` to be echoed back on every prior assistant
+    #   turn. Deepseek V4 needs this; Gemini's shim handles thinking server-side.
+    # disables_thinking_by_default: The provider enables a thinking/reasoning
+    #   mode by default that we need to explicitly disable with
+    #   `extra_body={"thinking": {"type": "disabled"}}` when thinking=False.
+    #   Deepseek V4 has this; Gemini does not.
+    requires_reasoning_echo: bool = False
+    disables_thinking_by_default: bool = False
+
+    # Which SearchBackend to use when this provider needs to ground via the web.
+    # Values: "tavily", "google_native", or None (no external search). Claude has
+    # supports_web_search=True and uses its native Anthropic web_search tool,
+    # bypassing the SearchBackend system entirely. New backends slot in by
+    # adding a key here and a matching entry in ClaudeBot.search_backends.
+    search_backend: Optional[str] = None
+
+    # Runtime stats — bottom-tier (or all, if untiered)
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_requests: int = 0
 
+    # Runtime stats — above-tier (only used if context_tier_threshold set)
+    total_input_tokens_above_tier: int = 0
+    total_output_tokens_above_tier: int = 0
+
+    def record_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Record one request's usage, routing into the right tier bucket."""
+        if (
+            self.context_tier_threshold is not None
+            and input_tokens > self.context_tier_threshold
+        ):
+            self.total_input_tokens_above_tier += input_tokens
+            self.total_output_tokens_above_tier += output_tokens
+        else:
+            self.total_input_tokens += input_tokens
+            self.total_output_tokens += output_tokens
+
     def get_cost(self) -> float:
-        """Get total cost for this provider."""
+        """Get total cost for this provider across both pricing tiers."""
         input_cost = (self.total_input_tokens / 1_000_000) * self.input_cost_per_million
         output_cost = (self.total_output_tokens / 1_000_000) * self.output_cost_per_million
+        if self.context_tier_threshold is not None:
+            above_in_rate = self.input_cost_per_million_above_tier or self.input_cost_per_million
+            above_out_rate = self.output_cost_per_million_above_tier or self.output_cost_per_million
+            input_cost += (self.total_input_tokens_above_tier / 1_000_000) * above_in_rate
+            output_cost += (self.total_output_tokens_above_tier / 1_000_000) * above_out_rate
         return input_cost + output_cost
 
     def to_stats_dict(self) -> dict:
         return {
             "input_tokens": self.total_input_tokens,
             "output_tokens": self.total_output_tokens,
-            "requests": self.total_requests
+            "input_tokens_above_tier": self.total_input_tokens_above_tier,
+            "output_tokens_above_tier": self.total_output_tokens_above_tier,
+            "requests": self.total_requests,
         }
 
     def load_stats(self, data: dict) -> None:
         self.total_input_tokens = data.get("input_tokens", 0)
         self.total_output_tokens = data.get("output_tokens", 0)
+        self.total_input_tokens_above_tier = data.get("input_tokens_above_tier", 0)
+        self.total_output_tokens_above_tier = data.get("output_tokens_above_tier", 0)
         self.total_requests = data.get("requests", 0)
+
+
+@dataclass
+class SearchResult:
+    """Output of any SearchBackend.
+
+    - text: human-/model-readable summary. When `is_grounded_answer` is True,
+      this is already a synthesized answer (just display it). Otherwise it's
+      raw search results that should be fed back through a model for synthesis.
+    - citations: structured source list for rendering as Discord embeds.
+    - is_grounded_answer: distinguishes "model already answered with citations"
+      (Google native) from "here are raw search hits" (Tavily).
+    - queries_used: search queries actually executed (Google native reports these).
+    """
+    text: str
+    citations: list[dict] = field(default_factory=list)  # [{url, title, snippet}]
+    is_grounded_answer: bool = False
+    queries_used: list[str] = field(default_factory=list)
+
+
+# SearchBackend is just a shape — anything with `async def search(query, max_results=5) -> SearchResult`
+# satisfies it. Backends are instantiated in ClaudeBot.__init__ and keyed by the
+# string a ModelProvider sets in its `search_backend` field. Today: "tavily",
+# "google_native". To add another (e.g. Brave Search): write a class with the
+# same method shape, instantiate it in __init__, key it in self.search_backends.
 
 
 CLAUDE_PROVIDER = ModelProvider(
@@ -259,6 +346,38 @@ DEEPSEEK_PROVIDER = ModelProvider(
     output_cost_per_million=0.87,
     supports_vision=False,
     supports_web_search=False,
+    # Deepseek V4 enables thinking by default and requires reasoning_content
+    # to be echoed back on every prior assistant turn when thinking is on.
+    requires_reasoning_echo=True,
+    disables_thinking_by_default=True,
+    # Deepseek has no native web search; route through Tavily.
+    search_backend="tavily",
+)
+
+GEMINI_PROVIDER = ModelProvider(
+    name="Gemini",
+    # Newest fanciest as of May 2026. The OpenAI shim may also accept
+    # "gemini-3.1-pro" if "-preview" gets rejected — check AI Studio logs.
+    model_id="gemini-3.1-pro-preview",
+    # Standard tier pricing from https://ai.google.dev/gemini-api/docs/pricing
+    # (≤200k input tokens). Above the tier, input is $4.00/M and output $18.00/M.
+    input_cost_per_million=2.0,
+    output_cost_per_million=12.0,
+    context_tier_threshold=200_000,
+    input_cost_per_million_above_tier=4.0,
+    output_cost_per_million_above_tier=18.0,
+    # Caspar can see — unlike Melchior.
+    supports_vision=True,
+    # Chat goes through the OpenAI shim (for codepath uniformity), but search
+    # uses the native API via aiohttp so we get free, high-quality google_search
+    # grounding with structured citations. See _google_native_search.
+    supports_web_search=False,  # search comes via SearchBackend, not the chat API
+    # Gemini's OpenAI shim handles thinking server-side — no echo dance,
+    # no opt-out kwarg required.
+    requires_reasoning_echo=False,
+    disables_thinking_by_default=False,
+    # Native Google Search grounding via aiohttp to the native endpoint.
+    search_backend="google_native",
 )
 
 
@@ -745,7 +864,7 @@ class ConversationManager:
                         # Strip model labels from referenced bot messages too
                         # (skip webhook proxies — those carry user content, not our labels)
                         if _is_real_bot(ref_msg):
-                            ref_text = re.sub(r'^(\*\*\[(?:Claude|Deepseek)\]\*\*\s*)+', '', ref_text)
+                            ref_text = re.sub(r'^(\*\*\[(?:Claude|Deepseek|Gemini)\]\*\*\s*)+', '', ref_text)
                         ref_author = "bot" if _is_real_bot(ref_msg) else ref_msg.author.display_name
                         content.append({
                             "type": "text",
@@ -766,7 +885,7 @@ class ConversationManager:
                 if _is_real_bot(msg):
                     # First, extract which model this is from (check bold first, then plain)
                     model_label = None
-                    label_match = re.match(r'^(?:\*\*\[(Claude|Deepseek)\]\*\*\s*|\[(Claude|Deepseek)\]\s*)+', text)
+                    label_match = re.match(r'^(?:\*\*\[(Claude|Deepseek|Gemini)\]\*\*\s*|\[(Claude|Deepseek|Gemini)\]\s*)+', text)
                     if label_match:
                         # Get the last model name captured (from either group)
                         model_label = label_match.group(1) or label_match.group(2)
@@ -1003,6 +1122,7 @@ class ClaudeBot(commands.Bot):
         # Model providers
         self.claude_provider = CLAUDE_PROVIDER
         self.deepseek_provider = DEEPSEEK_PROVIDER
+        self.gemini_provider = GEMINI_PROVIDER
 
         # Anthropic client
         anthropic_key = os.getenv("ANTHROPIC_API_KEY")
@@ -1030,7 +1150,24 @@ class ClaudeBot(commands.Bot):
             self.deepseek_provider.enabled = False
             print("⚪ Deepseek not configured (DEEPSEEK_API_KEY missing)")
 
-        # Tavily search client (optional - enables web search for Deepseek)
+        # Gemini client (OpenAI-compatible via Google's shim, optional)
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if gemini_key:
+            from openai import OpenAI
+            self.gemini_client = OpenAI(
+                api_key=gemini_key,
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+            )
+            self.gemini_provider.enabled = True
+            print(f"🟢 Gemini enabled (model: {self.gemini_provider.model_id})")
+        else:
+            self.gemini_client = None
+            self.gemini_provider.enabled = False
+            print("⚪ Gemini not configured (GEMINI_API_KEY missing)")
+
+        # Tavily search client (optional - enables web search for Deepseek).
+        # Gemini uses Google's native grounding (no Tavily needed); see
+        # _google_native_search and GEMINI_PROVIDER.search_backend="google_native".
         tavily_key = os.getenv("TAVILY_API_KEY")
         if tavily_key:
             from tavily import TavilyClient
@@ -1040,8 +1177,20 @@ class ClaudeBot(commands.Bot):
             self.tavily_client = None
             print("⚪ Tavily not configured (Deepseek web search disabled)")
 
-        # All providers list (for iteration)
-        self.providers = [self.claude_provider, self.deepseek_provider]
+        # All providers list (for iteration). Order matters: this is the order
+        # !models lists them and the order three-way routing iterates ties.
+        self.providers = [
+            self.claude_provider,
+            self.deepseek_provider,
+            self.gemini_provider,
+        ]
+
+        # Map provider → OpenAI-compatible client so the generic generator can
+        # dispatch without name-matching. Claude uses the anthropic SDK directly.
+        self.openai_compatible_clients: dict[str, object] = {
+            self.deepseek_provider.name: self.deepseek_client,
+            self.gemini_provider.name: self.gemini_client,
+        }
 
         # Conversation manager
         self.manager = ConversationManager()
@@ -1065,8 +1214,9 @@ class ClaudeBot(commands.Bot):
 
     REASONING_CACHE_MAX = 500
     THINK_PREFIXES = ("!think",)
-    CLAUDE_PREFIXES = ("!claude", "!opus")
-    DEEPSEEK_PREFIXES = ("!deepseek",)
+    CLAUDE_PREFIXES = ("!claude", "!opus", "!balthasar")
+    DEEPSEEK_PREFIXES = ("!deepseek", "!melchior")
+    GEMINI_PREFIXES = ("!gemini", "!caspar")
     CLAUDE_THINKING_EFFORT = "high"  # low | medium | high | xhigh | max
     CLAUDE_THINKING_MAX_TOKENS = 16000
 
@@ -1172,16 +1322,22 @@ class ClaudeBot(commands.Bot):
     VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
     def _peel_prefixes(self, content: str) -> tuple[str, set[str], Optional[str]]:
-        """Strip stacked !think / !claude / !opus / !deepseek prefixes in any order.
+        """Strip stacked !think / !claude / !opus / !deepseek / !gemini prefixes in any order.
 
         Returns (remaining_content, set_of_flags, forced_effort).
-        - flags: subset of {'think', 'claude', 'deepseek'}. !opus collapses to 'claude'.
+        - flags: subset of {'think', 'claude', 'deepseek', 'gemini'}. !opus and
+          !balthasar collapse to 'claude'; !melchior to 'deepseek'; !caspar to 'gemini'.
         - forced_effort: set when user used `!think:<level>` syntax (low | medium |
           high | xhigh | max). Implies the 'think' flag.
         """
         flags: set[str] = set()
         forced_effort: Optional[str] = None
-        all_prefixes = self.THINK_PREFIXES + self.CLAUDE_PREFIXES + self.DEEPSEEK_PREFIXES
+        all_prefixes = (
+            self.THINK_PREFIXES
+            + self.CLAUDE_PREFIXES
+            + self.DEEPSEEK_PREFIXES
+            + self.GEMINI_PREFIXES
+        )
         while True:
             stripped = content.strip()
             lower = stripped.lower()
@@ -1220,6 +1376,8 @@ class ClaudeBot(commands.Bot):
                     flags.add("claude")
                 elif prefix in self.DEEPSEEK_PREFIXES:
                     flags.add("deepseek")
+                elif prefix in self.GEMINI_PREFIXES:
+                    flags.add("gemini")
                 content = rest
                 matched = True
                 break
@@ -1316,7 +1474,7 @@ class ClaudeBot(commands.Bot):
                 pass  # Transient API blip — proceed anyway rather than dropping the turn.
 
         # Peel any stacked model/thinking prefixes (!think / !think:<level> /
-        # !claude / !opus / !deepseek)
+        # !claude / !opus / !deepseek / !gemini and the MAGI aliases)
         original_content = message.content or ""
         peeled_content, flags, forced_effort = self._peel_prefixes(original_content)
         forced_thinking = "think" in flags
@@ -1327,15 +1485,21 @@ class ClaudeBot(commands.Bot):
         if "deepseek" in flags and not self.deepseek_provider.enabled:
             await message.channel.send("❌ Deepseek is not configured (no API key).")
             return
+        if "gemini" in flags and not self.gemini_provider.enabled:
+            await message.channel.send("❌ Gemini is not configured (no API key).")
+            return
 
         forced_provider = None
         routing_reason = ""
         if "claude" in flags:
             forced_provider = self.claude_provider
-            routing_reason = "User directly invoked Claude with !claude/!opus."
+            routing_reason = "User directly invoked Claude with !claude/!opus/!balthasar."
         elif "deepseek" in flags:
             forced_provider = self.deepseek_provider
-            routing_reason = "User directly invoked Deepseek with !deepseek."
+            routing_reason = "User directly invoked Deepseek with !deepseek/!melchior."
+        elif "gemini" in flags:
+            forced_provider = self.gemini_provider
+            routing_reason = "User directly invoked Gemini with !gemini/!caspar."
 
         if flags:
             message.content = peeled_content
@@ -1393,7 +1557,7 @@ class ClaudeBot(commands.Bot):
             # Strip any label the model echoed (handles old [Name] and the new
             # [Name · effort] format Claude may have started echoing).
             response = re.sub(
-                r'^(?:\*\*\[(?:Claude|Deepseek)(?:\s·\s\w+)?\]\*\*\s*|\[(?:Claude|Deepseek)(?:\s·\s\w+)?\]\s*)+',
+                r'^(?:\*\*\[(?:Claude|Deepseek|Gemini)(?:\s·\s\w+)?\]\*\*\s*|\[(?:Claude|Deepseek|Gemini)(?:\s·\s\w+)?\]\s*)+',
                 '',
                 response,
             )
@@ -1481,7 +1645,12 @@ class ClaudeBot(commands.Bot):
     # ----- Multi-model support methods -----
 
     def _strip_images_from_messages(self, messages: list[dict]) -> list[dict]:
-        """Remove image content from messages for text-only models like Deepseek."""
+        """Remove image content from messages for text-only models.
+
+        Only call this when provider.supports_vision is False — Gemini and Claude
+        both handle images natively and shouldn't go through this stripping.
+        Deepseek is currently the only text-only provider in the system.
+        """
         stripped = []
         for msg in messages:
             content = msg["content"]
@@ -1546,18 +1715,22 @@ class ClaudeBot(commands.Bot):
         if provider.name == "Claude":
             identity = f"Claude (model: {provider.model_id}), an AI assistant made by Anthropic"
             identity_details = (
-                "**[Deepseek]** messages in the conversation are from your collaborator Deepseek — "
-                "a different model, not you. Your capabilities include vision (you can see images) "
-                "and built-in web search — you can search the web anytime you think it would help, "
-                "not just when users use !search. You tend to shine at complex analysis, code review, "
-                "creative writing, and nuance."
+                "**[Deepseek]** messages are from your collaborator Deepseek (the fast, cheap, "
+                "CJK-strong one) and **[Gemini]** messages are from your collaborator Gemini "
+                "(the abstract-reasoning specialist). Both are different models, not you — "
+                "your responses are labeled **[Claude]** by the bot. Your capabilities include "
+                "vision (you can see images) and built-in web search — you can search the web "
+                "anytime you think it would help, not just when users use !search. You tend "
+                "to shine at complex analysis, code review, creative writing, and nuance."
             )
         elif provider.name == "Deepseek":
             identity = f"Deepseek (model: {provider.model_id}), an AI assistant made by DeepSeek"
             identity_details = (
-                "**[Claude]** messages in the conversation are from your collaborator Claude — "
-                "a different model, not you. You can't see images, but you can search the web "
-                "via Tavily function calling. You tend to shine at fast responses, factual questions, "
+                "**[Claude]** messages are from your collaborator Claude (the careful, "
+                "thorough one) and **[Gemini]** messages are from your collaborator Gemini "
+                "(the abstract-reasoning specialist with vision). Both are different models, "
+                "not you. You can't see images, but you can search the web via Tavily "
+                "function calling. You tend to shine at fast responses, factual questions, "
                 "casual chat, and cost-efficiency.\n\n"
                 "**Chinese language specialty**: You were trained on deep Chinese internet data "
                 "(Zhihu, Baidu Baike, CSDN, Weibo, Douban, etc.) and have a much richer understanding "
@@ -1575,6 +1748,25 @@ class ClaudeBot(commands.Bot):
                 "numbered lists, tables, and headers unless the user specifically asks for structured "
                 "output. Keep it conversational — this is Discord chat, not a report. "
                 "Minimize blank lines between paragraphs."
+            )
+        elif provider.name == "Gemini":
+            identity = f"Gemini (model: {provider.model_id}), an AI assistant made by Google DeepMind"
+            identity_details = (
+                "**[Claude]** messages are from your collaborator Claude (the careful, "
+                "thorough one with strong code review and multi-tool orchestration) and "
+                "**[Deepseek]** messages are from your collaborator Deepseek (the fast, "
+                "cheap, CJK-strong one). Both are different models, not you. You can see "
+                "images and you have native Google Search grounding — when you call the "
+                "web_search tool, the system routes it through Google's own search index "
+                "(not a third-party meta-search), and citations are returned as structured "
+                "groundingMetadata that the bot renders as source embeds. You tend "
+                "to shine at genuinely novel reasoning (the kind ARC-AGI-2 tests), abstract "
+                "pattern-finding, long-context synthesis, multi-step math, and questions "
+                "where the answer requires recombining ideas in a non-obvious way.\n\n"
+                "**Formatting**: Write in flowing prose, not listicles. Avoid walls of "
+                "bullet points, numbered lists, tables, and headers unless the user "
+                "specifically asks for structured output. Keep it conversational — this "
+                "is Discord chat, not a slide deck. Minimize blank lines between paragraphs."
             )
         else:
             identity = f"{provider.name} (model: {provider.model_id}), an AI assistant"
@@ -1594,8 +1786,11 @@ class ClaudeBot(commands.Bot):
         prompt = prompt.replace("{routing_context}", routing_context)
         return prompt
 
-    # Deepseek function-calling tool definition
-    DEEPSEEK_TOOLS = [{
+    # OpenAI-compatible function-calling tool definition.
+    # Shared by both Deepseek and Gemini — both route web search through Tavily
+    # over the OpenAI shim's tool-calling support. (Gemini also has native
+    # google_search grounding, but that requires the native API, not the shim.)
+    OPENAI_COMPATIBLE_TOOLS = [{
         "type": "function",
         "function": {
             "name": "web_search",
@@ -1613,28 +1808,143 @@ class ClaudeBot(commands.Bot):
         }
     }]
 
-    async def _tavily_search(self, query: str, max_results: int = 5) -> str:
-        """Perform a web search using Tavily. Returns formatted results string."""
+    async def _tavily_search(self, query: str, max_results: int = 5) -> SearchResult:
+        """Perform a web search via Tavily. Returns raw hits (not synthesized).
+
+        SearchResult.is_grounded_answer is False — callers should feed .text
+        back through a model for synthesis if they want a coherent answer.
+        """
         if not self.tavily_client:
-            return "Web search is not available (no Tavily API key configured)."
+            return SearchResult(
+                text="Web search is not available (no Tavily API key configured).",
+            )
         try:
             result = await asyncio.to_thread(
                 self.tavily_client.search,
                 query=query,
-                max_results=max_results
+                max_results=max_results,
             )
             if not result.get("results"):
-                return f"No results found for: {query}"
+                return SearchResult(text=f"No results found for: {query}")
 
-            lines = []
+            citations: list[dict] = []
+            lines: list[str] = []
             for r in result["results"]:
                 title = r.get("title", "Untitled")
                 url = r.get("url", "")
                 snippet = r.get("content", "")
+                citations.append({"url": url, "title": title, "snippet": snippet})
                 lines.append(f"**{title}**\n{url}\n{snippet}\n")
-            return "\n".join(lines)
+            return SearchResult(
+                text="\n".join(lines),
+                citations=citations,
+                is_grounded_answer=False,
+                queries_used=[query],
+            )
         except Exception as e:
-            return f"Search error: {e}"
+            return SearchResult(text=f"Search error: {e}")
+
+    async def _google_native_search(self, query: str, max_results: int = 5) -> SearchResult:
+        """Perform a web search via Gemini's native google_search grounding.
+
+        Returns a SearchResult where is_grounded_answer=True — the response is
+        already a synthesized answer with citations from groundingMetadata.
+        Callers should display .text directly and render .citations as embeds.
+
+        Uses raw aiohttp against the native endpoint (no new SDK dep). This is
+        the only Gemini code path that doesn't go through the OpenAI shim.
+        """
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            return SearchResult(
+                text="Native Google search is not available (no GEMINI_API_KEY configured).",
+            )
+        model_id = self.gemini_provider.model_id
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model_id}:generateContent"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": gemini_key,
+        }
+        body = {
+            "contents": [
+                {"role": "user", "parts": [{"text": query}]}
+            ],
+            "tools": [{"google_search": {}}],
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=body, timeout=60) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        return SearchResult(
+                            text=f"Google native search error (HTTP {resp.status}): {err_text[:500]}",
+                        )
+                    data = await resp.json()
+        except asyncio.TimeoutError:
+            return SearchResult(text="Google native search timed out.")
+        except Exception as e:
+            return SearchResult(text=f"Google native search error: {e}")
+
+        # Parse response: candidates[0].content.parts[*].text + groundingMetadata
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return SearchResult(text=f"No results for: {query}")
+        candidate = candidates[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        text = "".join(p.get("text", "") for p in parts).strip()
+        if not text:
+            text = f"No textual response for: {query}"
+
+        # Track usage if reported (Gemini returns usageMetadata at top level)
+        usage = data.get("usageMetadata", {})
+        prompt_tokens = usage.get("promptTokenCount", 0)
+        output_tokens = usage.get("candidatesTokenCount", 0)
+        if prompt_tokens or output_tokens:
+            self.gemini_provider.record_usage(prompt_tokens, output_tokens)
+            self.gemini_provider.total_requests += 1
+
+        # Extract structured citations from groundingMetadata.groundingChunks
+        grounding = candidate.get("groundingMetadata", {})
+        citations: list[dict] = []
+        seen_urls: set[str] = set()
+        for chunk in grounding.get("groundingChunks", []):
+            web = chunk.get("web", {})
+            curl = web.get("uri", "")
+            title = web.get("title", "")
+            if curl and curl not in seen_urls:
+                seen_urls.add(curl)
+                citations.append({"url": curl, "title": title, "snippet": ""})
+            if len(citations) >= max_results:
+                break
+
+        queries_used = grounding.get("webSearchQueries", [query])
+
+        return SearchResult(
+            text=text,
+            citations=citations,
+            is_grounded_answer=True,
+            queries_used=queries_used,
+        )
+
+    async def _search_for(self, provider: ModelProvider, query: str, max_results: int = 5) -> SearchResult:
+        """Dispatch a search to the provider's preferred SearchBackend.
+
+        Falls back to Tavily if the provider's preferred backend isn't available.
+        Returns an empty-ish SearchResult if nothing is configured.
+        """
+        backend = provider.search_backend
+        if backend == "google_native" and os.getenv("GEMINI_API_KEY"):
+            return await self._google_native_search(query, max_results=max_results)
+        # Default / fallback: Tavily (if configured)
+        if self.tavily_client:
+            return await self._tavily_search(query, max_results=max_results)
+        return SearchResult(
+            text=f"No search backend available for {provider.name} "
+                 "(set GEMINI_API_KEY for native grounding or TAVILY_API_KEY for Tavily).",
+        )
 
     URL_PATTERN = re.compile(r'https?://[^\s\)\]<>\"\'`]+[^\s\.\,\)\]<>\"\'`:]')
     URL_EXTRACT_MAX = 3
@@ -1770,80 +2080,140 @@ class ClaudeBot(commands.Bot):
             # Cost bonus - cheap = preferred for routine tasks
             score += 0.15
 
+        elif provider.name == "Gemini":
+            # Gemini excels at: novel/abstract reasoning, long-context synthesis,
+            # multi-step math, pattern-finding, and questions where the answer
+            # requires recombining ideas non-obviously (ARC-AGI-2 territory).
+            # Also strong on math/scientific reasoning (GPQA Diamond leader).
+            if word_count > 60:
+                score += 0.1  # long prompts benefit from its context handling
+            if any(kw in text_lower for kw in [
+                'reason', 'reasoning', 'puzzle', 'riddle', 'pattern',
+                'abstract', 'prove', 'proof', 'derive', 'derivation',
+                'novel', 'unusual', 'counterintuitive', 'paradox',
+                'physics', 'chemistry', 'biology', 'theorem', 'lemma',
+                'integral', 'derivative', 'limit', 'differential',
+            ]):
+                score += 0.15
+            # Math notation / equations — Gemini is strong here
+            if '$' in message_text or '\\' in message_text or '∫' in message_text or '∑' in message_text:
+                score += 0.1
+            # Very long context — synthesizing across a lot of material
+            if word_count > 200:
+                score += 0.1
+            # Mid-tier cost — cheaper than Claude, pricier than Deepseek.
+            # Smaller cost penalty than Claude, no bonus like Deepseek.
+            score -= 0.08
+
         return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _avg_cost_per_million(provider: ModelProvider) -> float:
+        """Average of input + output $/M as a single tiebreak scalar.
+        Lower = cheaper = preferred when scores are tied."""
+        return (provider.input_cost_per_million + provider.output_cost_per_million) / 2
 
     async def _select_model(self, message: discord.Message, guild_id: int) -> tuple[ModelProvider, str]:
         """Select which model should respond to this message.
         Returns (provider, routing_reason) tuple."""
-        # Hard rule: only Claude can handle images
+        enabled = [p for p in self.providers if p.enabled]
+        if not enabled:
+            # Shouldn't happen — on_message gates earlier — but fail gracefully.
+            return self.claude_provider, "No providers enabled; defaulting to Claude."
+
+        # Hard rule: images require a vision-capable provider. Filter the pool
+        # down to vision-capable providers and let normal scoring pick among them.
         has_images = any(
             any(a.filename.lower().endswith(ext) for ext in CONFIG.image_types)
             for a in message.attachments
         )
-        if has_images and self.claude_provider.enabled:
-            return self.claude_provider, "Image detected — only Claude has vision capability."
+        if has_images:
+            vision_pool = [p for p in enabled if p.supports_vision]
+            if vision_pool:
+                enabled = vision_pool
+                vision_routing_note = (
+                    " (filtered to vision-capable providers because the message "
+                    "contains image attachments)"
+                )
+            else:
+                # Fall back to whatever's enabled even though none can see.
+                vision_routing_note = " (no vision-capable provider enabled — image ignored)"
+        else:
+            vision_routing_note = ""
 
-        # Only one model available?
-        if not self.deepseek_provider.enabled:
-            return self.claude_provider, "Only Claude is configured (no Deepseek API key)."
-        if not self.claude_provider.enabled:
-            return self.deepseek_provider, "Only Deepseek is configured (no Claude API key)."
+        # Only one provider available in the (possibly filtered) pool?
+        if len(enabled) == 1:
+            only = enabled[0]
+            return only, f"Only {only.name} is available{vision_routing_note}."
 
         # User preference for this channel?
         channel_id = message.channel.id
         parent_id = getattr(message.channel, 'parent_id', None)
         pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id)
-        if pref == "claude":
-            return self.claude_provider, "User set channel preference to Claude (!prefer claude)."
-        elif pref == "deepseek":
-            return self.deepseek_provider, "User set channel preference to Deepseek (!prefer deepseek)."
+        pref_map = {
+            "claude": self.claude_provider,
+            "deepseek": self.deepseek_provider,
+            "gemini": self.gemini_provider,
+        }
+        if pref in pref_map and pref_map[pref] in enabled:
+            chosen = pref_map[pref]
+            return chosen, f"User set channel preference to {chosen.name} (!prefer {pref}).{vision_routing_note}"
 
         # Global default override?
-        if CONFIG.default_model == "claude":
-            return self.claude_provider, "Global default model is set to Claude."
-        elif CONFIG.default_model == "deepseek":
-            return self.deepseek_provider, "Global default model is set to Deepseek."
+        if CONFIG.default_model in pref_map and pref_map[CONFIG.default_model] in enabled:
+            chosen = pref_map[CONFIG.default_model]
+            return chosen, f"Global default model is set to {chosen.name}.{vision_routing_note}"
 
-        # Auto-select via confidence heuristic
+        # Auto-select via confidence heuristic — three-way argmax with a
+        # cost-based tiebreak (cheaper wins ties). The scoring functions
+        # already encode each model's cost via per-provider penalties/bonuses,
+        # so this is just final disambiguation.
         text = message.content or ""
-        claude_score = self._estimate_confidence(text, self.claude_provider)
-        deepseek_score = self._estimate_confidence(text, self.deepseek_provider)
+        scores = {p.name: self._estimate_confidence(text, p) for p in enabled}
+        # Sort: primary = score desc, secondary = cost asc (cheaper wins ties).
+        ranked = sorted(
+            enabled,
+            key=lambda p: (-scores[p.name], self._avg_cost_per_million(p)),
+        )
+        winner = ranked[0]
+        score_str = ", ".join(f"{p.name} {scores[p.name]:.2f}" for p in ranked)
+        reason = (
+            f"Auto-routed by heuristic: {score_str}. {winner.name} wins "
+            f"(cost-based tiebreak applies on ties).{vision_routing_note}"
+        )
+        return winner, reason
 
-        # Prefer cheaper model when close
-        if claude_score > deepseek_score + 0.05:
-            reason = (
-                f"Auto-routed by heuristic: Claude scored {claude_score:.2f} vs "
-                f"Deepseek {deepseek_score:.2f}. Claude won by >{(claude_score - deepseek_score):.2f} "
-                f"(needs >0.05 margin over Deepseek's cost advantage)."
-            )
-            return self.claude_provider, reason
-        else:
-            reason = (
-                f"Auto-routed by heuristic: Deepseek scored {deepseek_score:.2f} vs "
-                f"Claude {claude_score:.2f}. Deepseek wins ties and close calls "
-                f"(margin was {(claude_score - deepseek_score):.2f}, needs >0.05 for Claude)."
-            )
-            return self.deepseek_provider, reason
-
-    async def _generate_deepseek_response(
+    async def _generate_openai_compatible_response(
         self,
+        client,
+        provider: ModelProvider,
         guild_id: int,
         messages: list[dict],
         system: str,
         thinking: bool = False,
     ) -> tuple[str, list[str], str]:
-        """Generate response using Deepseek with optional tool calling.
+        """Generate response using any OpenAI-compatible provider (Deepseek, Gemini).
+
+        Uses provider.* quirks flags to handle per-provider differences:
+        - supports_vision: keep image content if True, strip otherwise
+        - requires_reasoning_echo: echo reasoning_content on prior assistant turns
+        - disables_thinking_by_default: send extra_body to opt out when thinking=False
 
         Returns (text, reactions, reasoning_content). reasoning_content is empty
-        unless thinking mode was enabled and Deepseek returned a reasoning block.
+        unless thinking mode was enabled and the provider returned a reasoning block.
         """
-        # Convert to OpenAI format and strip images
-        openai_messages = self._strip_images_from_messages(messages)
+        # Convert to OpenAI format. Only strip images for text-only providers;
+        # vision-capable providers (Gemini) keep the image blocks intact.
+        if provider.supports_vision:
+            openai_messages = list(messages)
+        else:
+            openai_messages = self._strip_images_from_messages(messages)
         openai_messages = self._convert_messages_to_openai_format(openai_messages)
 
-        # When thinking mode is on, Deepseek requires reasoning_content on every
-        # prior assistant turn (empty string is fine for ones we don't have).
-        if thinking:
+        # When thinking is on AND the provider requires it, echo reasoning_content
+        # on every prior assistant turn (empty string fine for ones we don't have).
+        # Gemini's shim handles thinking server-side so this is skipped.
+        if thinking and provider.requires_reasoning_echo:
             for msg in openai_messages:
                 if msg.get("role") == "assistant":
                     msg_id = msg.get("_msg_id")
@@ -1854,32 +2224,33 @@ class ClaudeBot(commands.Bot):
         openai_messages.insert(0, {"role": "system", "content": system})
 
         # Include web search tool if Tavily is available
-        tools = self.DEEPSEEK_TOOLS if self.tavily_client else None
+        tools = self.OPENAI_COMPATIBLE_TOOLS if self.tavily_client else None
 
         try:
             api_kwargs = {
-                "model": self.deepseek_provider.model_id,
-                "max_tokens": self.deepseek_provider.max_tokens,
+                "model": provider.model_id,
+                "max_tokens": provider.max_tokens,
                 "messages": self._strip_internal_keys(openai_messages),
             }
-            if not thinking:
-                # Deepseek V4 enables thinking mode by default and requires
-                # reasoning_content to be echoed on every prior assistant turn.
+            if not thinking and provider.disables_thinking_by_default:
+                # Provider has thinking on by default and needs the disable kwarg.
                 # We reconstruct history from plain Discord text, so we can't
-                # preserve reasoning blocks — disable thinking instead.
+                # preserve reasoning blocks anyway — disable thinking instead.
                 api_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
             if tools:
                 api_kwargs["tools"] = tools
 
             response = await asyncio.to_thread(
-                self.deepseek_client.chat.completions.create,
+                client.chat.completions.create,
                 **api_kwargs,
             )
 
-            # Track usage
-            self.deepseek_provider.total_input_tokens += response.usage.prompt_tokens
-            self.deepseek_provider.total_output_tokens += response.usage.completion_tokens
-            self.deepseek_provider.total_requests += 1
+            # Track usage (tiered if provider has context_tier_threshold set)
+            provider.record_usage(
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+            )
+            provider.total_requests += 1
 
             # Handle tool calls (max 3 rounds to prevent loops)
             tool_rounds = 0
@@ -1900,41 +2271,45 @@ class ClaudeBot(commands.Bot):
                         for tc in assistant_msg.tool_calls
                     ]
                 }
-                if thinking:
+                if thinking and provider.requires_reasoning_echo:
                     tool_assistant["reasoning_content"] = (
                         getattr(assistant_msg, "reasoning_content", None) or ""
                     )
                 openai_messages.append(tool_assistant)
 
-                # Execute each tool call
+                # Execute each tool call. Routed through _search_for so each
+                # provider uses its configured backend (Deepseek → Tavily,
+                # Gemini → native google_search grounding, etc.).
                 for tool_call in assistant_msg.tool_calls:
                     if tool_call.function.name == "web_search":
                         import json as _json
                         args = _json.loads(tool_call.function.arguments)
                         query = args.get("query", "")
-                        search_results = await self._tavily_search(query)
+                        search_result = await self._search_for(provider, query)
                         openai_messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "content": search_results,
+                            "content": search_result.text,
                         })
 
                 # Continue conversation with tool results — refresh messages
                 # since api_kwargs holds a stripped copy.
                 api_kwargs["messages"] = self._strip_internal_keys(openai_messages)
                 response = await asyncio.to_thread(
-                    self.deepseek_client.chat.completions.create,
+                    client.chat.completions.create,
                     **api_kwargs,
                 )
 
                 # Track additional usage
-                self.deepseek_provider.total_input_tokens += response.usage.prompt_tokens
-                self.deepseek_provider.total_output_tokens += response.usage.completion_tokens
+                provider.record_usage(
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                )
 
             response_text = response.choices[0].message.content or ""
             reasoning = (
                 getattr(response.choices[0].message, "reasoning_content", None) or ""
-            ) if thinking else ""
+            ) if (thinking and provider.requires_reasoning_echo) else ""
 
             # Process notes and reactions (same patterns as Claude)
             note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
@@ -1949,7 +2324,7 @@ class ClaudeBot(commands.Bot):
             for match in re.finditer(reaction_pattern, response_text):
                 reactions.append(match.group(1).strip())
             response_text = re.sub(reaction_pattern, '', response_text).strip()
-            # Clean up Deepseek's verbose formatting
+            # Clean up verbose formatting (both Deepseek and Gemini tend to over-format)
             response_text = re.sub(r'\n\s*\n\s*\n', '\n\n', response_text)  # Triple+ newlines → double
             response_text = re.sub(r'\n\n+(#+\s)', r'\n\1', response_text)  # Extra newlines before headers
             response_text = re.sub(r'\n\n+(\*\*[^*]+\*\*:)', r'\n\1', response_text)  # Extra newlines before bold labels
@@ -1958,7 +2333,7 @@ class ClaudeBot(commands.Bot):
             return response_text, reactions, reasoning
 
         except Exception as e:
-            return f"Deepseek Error: {e}", [], ""
+            return f"{provider.name} Error: {e}", [], ""
 
     async def _generate_response(
         self,
@@ -2068,9 +2443,14 @@ class ClaudeBot(commands.Bot):
 
         system = "\n\n".join(system_parts)
 
-        # Dispatch to the appropriate model
-        if provider.name == "Deepseek":
-            return await self._generate_deepseek_response(guild_id, messages, system, thinking=thinking)
+        # Dispatch to the appropriate model. OpenAI-compatible providers
+        # (Deepseek, Gemini) share the same generation path; Claude uses the
+        # Anthropic SDK directly with its own tool/thinking machinery.
+        if provider.name in self.openai_compatible_clients:
+            client = self.openai_compatible_clients[provider.name]
+            return await self._generate_openai_compatible_response(
+                client, provider, guild_id, messages, system, thinking=thinking
+            )
 
         # Claude path (default) — with organic web search capability
         try:
@@ -2605,76 +2985,122 @@ class ClaudeBot(commands.Bot):
                 await message.channel.send("📭 No other threads found in this channel.")
         
         elif cmd == "!search":
-            # Web search - available via Claude (native) or Deepseek (Tavily)
-            if not self.claude_provider.enabled and not self.tavily_client:
-                await message.channel.send("❌ Web search requires Claude (ANTHROPIC_API_KEY) or Tavily (TAVILY_API_KEY).")
-                return
-            if len(parts) >= 2:
-                query = message.content[8:].strip()  # len("!search ") = 8
+            # Web search is available via any of:
+            #   - Claude's native web_search tool (ANTHROPIC_API_KEY)
+            #   - Gemini's native google_search grounding (GEMINI_API_KEY)
+            #   - Any OpenAI-compatible provider via Tavily (TAVILY_API_KEY)
+            #
+            # Pick the searcher in this order: channel preference → Claude →
+            # Gemini (native) → Deepseek (Tavily).
+            has_gemini_native = self.gemini_provider.enabled and bool(os.getenv("GEMINI_API_KEY"))
+            eligible: list[ModelProvider] = []
+            if self.claude_provider.enabled:
+                eligible.append(self.claude_provider)
+            if has_gemini_native:
+                eligible.append(self.gemini_provider)
+            elif self.gemini_provider.enabled and self.tavily_client:
+                eligible.append(self.gemini_provider)
+            if self.deepseek_provider.enabled and self.tavily_client:
+                eligible.append(self.deepseek_provider)
 
-                await message.channel.send(f"🔍 Searching: *{query}*")
-
-                # Determine which model handles the search
-                channel_id = message.channel.id
-                parent_id = getattr(message.channel, 'parent_id', None)
-                ch_pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id)
-
-                use_deepseek_search = (
-                    self.tavily_client
-                    and self.deepseek_provider.enabled
-                    and (ch_pref == "deepseek" or (not self.claude_provider.enabled))
-                )
-
-                if use_deepseek_search:
-                    # Deepseek + Tavily search
-                    async with message.channel.typing():
-                        search_results = await self._tavily_search(query)
-                        # Pull conversation history so Deepseek can interpret
-                        # context-dependent queries ("links for what you said").
-                        # Replace the last user message (the !search command)
-                        # with a synthesis prompt that includes the search hits.
-                        history = await self.manager.fetch_thread_history(message.channel)
-                        history = self._strip_internal_keys(history)
-                        synthesis_prompt = (
-                            f"Based on these web search results, answer the query: {query}\n\n"
-                            f"Search results:\n{search_results}"
-                        )
-                        if history and history[-1].get("role") == "user":
-                            history[-1] = {"role": "user", "content": synthesis_prompt}
-                        else:
-                            history.append({"role": "user", "content": synthesis_prompt})
-                        search_messages = history
-                        response_text, _, _ = await self._generate_deepseek_response(
-                            guild_id, search_messages,
-                            "You are a helpful assistant. Summarize the search results clearly and cite your sources with URLs. "
-                            "Use the prior conversation as context when the user's query refers back to it."
-                        )
-                    if self.multi_model_active:
-                        response_text = f"**[Deepseek]** {response_text}"
-                    await self._send_response(message.channel, response_text)
-                else:
-                    # Claude native web search
-                    async with message.channel.typing():
-                        response_text, embeds = await self._web_search(
-                            query,
-                            message.channel,
-                            guild_id
-                        )
-                    if self.multi_model_active:
-                        response_text = f"**[Claude]** {response_text}"
-                    await self._send_response(message.channel, response_text)
-                    for embed in embeds:
-                        await message.channel.send(embed=embed)
-
+            if not eligible:
                 await message.channel.send(
-                    f"*💡 Web search incurs additional token costs. Use `!cost` to check usage.*"
+                    "❌ Web search requires one of: ANTHROPIC_API_KEY (Claude native), "
+                    "GEMINI_API_KEY (Gemini native grounding), or TAVILY_API_KEY (Deepseek/Gemini)."
                 )
-            else:
+                return
+
+            if len(parts) < 2:
                 await message.channel.send(
                     "Usage: `!search <query>`\n"
                     "Example: `!search latest news on Claude AI`\n\n"
                     "⚠️ Web search costs extra tokens (~$0.01-0.03 per search)"
                 )
+                return
+
+            query = message.content[8:].strip()  # len("!search ") = 8
+            await message.channel.send(f"🔍 Searching: *{query}*")
+
+            # Pick the searcher
+            channel_id = message.channel.id
+            parent_id = getattr(message.channel, 'parent_id', None)
+            ch_pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id)
+            pref_map = {
+                "claude": self.claude_provider,
+                "deepseek": self.deepseek_provider,
+                "gemini": self.gemini_provider,
+            }
+            searcher: Optional[ModelProvider] = None
+            if ch_pref in pref_map and pref_map[ch_pref] in eligible:
+                searcher = pref_map[ch_pref]
+            if searcher is None:
+                # Default order: Claude > Gemini (native grounding) > Deepseek (Tavily).
+                for p in (self.claude_provider, self.gemini_provider, self.deepseek_provider):
+                    if p in eligible:
+                        searcher = p
+                        break
+
+            # Dispatch
+            if searcher is self.claude_provider:
+                # Claude native web search — existing path
+                async with message.channel.typing():
+                    response_text, embeds = await self._web_search(
+                        query, message.channel, guild_id
+                    )
+                if self.multi_model_active:
+                    response_text = f"**[Claude]** {response_text}"
+                await self._send_response(message.channel, response_text)
+                for embed in embeds:
+                    await message.channel.send(embed=embed)
+            else:
+                # OpenAI-compatible provider — dispatch through SearchBackend
+                async with message.channel.typing():
+                    search_result = await self._search_for(searcher, query)
+
+                    if search_result.is_grounded_answer:
+                        # Gemini native: backend already synthesized the answer.
+                        # Display directly; we don't need to round-trip through
+                        # the chat model again.
+                        response_text = search_result.text
+                    else:
+                        # Tavily: feed raw hits through the chosen model for synthesis.
+                        history = await self.manager.fetch_thread_history(message.channel)
+                        history = self._strip_internal_keys(history)
+                        synthesis_prompt = (
+                            f"Based on these web search results, answer the query: {query}\n\n"
+                            f"Search results:\n{search_result.text}"
+                        )
+                        if history and history[-1].get("role") == "user":
+                            history[-1] = {"role": "user", "content": synthesis_prompt}
+                        else:
+                            history.append({"role": "user", "content": synthesis_prompt})
+                        client = self.openai_compatible_clients[searcher.name]
+                        response_text, _, _ = await self._generate_openai_compatible_response(
+                            client, searcher, guild_id, history,
+                            "You are a helpful assistant. Summarize the search results clearly and "
+                            "cite your sources with URLs. Use the prior conversation as context when "
+                            "the user's query refers back to it.",
+                        )
+
+                if self.multi_model_active:
+                    response_text = f"**[{searcher.name}]** {response_text}"
+                await self._send_response(message.channel, response_text)
+
+                # Render citation embeds (works for both Tavily and Google native)
+                if search_result.citations:
+                    embed = discord.Embed(title="🔍 Sources", color=discord.Color.blue())
+                    for i, cit in enumerate(
+                        search_result.citations[:CONFIG.max_search_results_in_embed], 1
+                    ):
+                        title = cit.get("title") or cit.get("url", "")[:60] or "(untitled)"
+                        url = cit.get("url", "")
+                        value = f"[{title}]({url})" if url else title
+                        embed.add_field(name=f"Source {i}", value=value, inline=False)
+                    await message.channel.send(embed=embed)
+
+            await message.channel.send(
+                "*💡 Web search incurs additional token costs. Use `!cost` to check usage.*"
+            )
         
         elif cmd == "!summarize":
             # Manually save a thread summary to long-term memory
@@ -2766,8 +3192,8 @@ class ClaudeBot(commands.Bot):
         elif cmd == "!prefer":
             if len(parts) >= 2:
                 pref = parts[1].lower()
-                if pref not in ("claude", "deepseek", "auto"):
-                    await message.channel.send("Usage: `!prefer [claude|deepseek|auto]`")
+                if pref not in ("claude", "deepseek", "gemini", "auto"):
+                    await message.channel.send("Usage: `!prefer [claude|deepseek|gemini|auto]`")
                     return
                 channel_id = message.channel.id
                 # Use parent channel for threads
@@ -2780,6 +3206,8 @@ class ClaudeBot(commands.Bot):
                     await message.channel.send("❌ Deepseek is not configured (no API key).")
                 elif pref == "claude" and not self.claude_provider.enabled:
                     await message.channel.send("❌ Claude is not configured (no API key).")
+                elif pref == "gemini" and not self.gemini_provider.enabled:
+                    await message.channel.send("❌ Gemini is not configured (no API key).")
                 else:
                     self.channel_preferences[channel_id] = pref
                     await message.channel.send(f"✅ This channel will always use **{pref.title()}**.")
@@ -2789,7 +3217,7 @@ class ClaudeBot(commands.Bot):
                 pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id, "auto")
                 await message.channel.send(
                     f"Current preference: **{pref}**\n"
-                    f"Usage: `!prefer [claude|deepseek|auto]`"
+                    f"Usage: `!prefer [claude|deepseek|gemini|auto]`"
                 )
 
         elif cmd == "!calibration":
@@ -2814,15 +3242,16 @@ class ClaudeBot(commands.Bot):
 `!cost` - Show total API usage and cost per model
 `!memories` - List all memories (both types)
 `!threads` - Show other recent threads in this channel
-`!search <query>` - Web search via Claude or Deepseek (costs extra, ~$0.01-0.03)
+`!search <query>` - Web search via Claude, Deepseek, or Gemini (costs extra, ~$0.01-0.03)
 
-**Multi-model (Hydra):**
-`!claude <message>` / `!opus <message>` - Force Claude to respond
-`!deepseek <message>` - Force Deepseek to respond
+**Multi-model (Hydra / MAGI):**
+`!claude <message>` / `!opus <message>` / `!balthasar <message>` - Force Claude to respond
+`!deepseek <message>` / `!melchior <message>` - Force Deepseek to respond
+`!gemini <message>` / `!caspar <message>` - Force Gemini to respond
 `!think <message>` - Use extended thinking (deeper reasoning, slower & costlier)
 `!think:<level> <message>` - Force a specific effort level (low|medium|high|xhigh|max)
 `!models` - Show available models and their usage stats
-`!prefer [claude|deepseek|auto]` - Set model preference for this channel
+`!prefer [claude|deepseek|gemini|auto]` - Set model preference for this channel
 `!calibration` - Show model confidence calibration stats
 React with 👍/👎 to bot responses to improve model selection
 Stack prefixes to combine: `!think !claude <message>` forces Claude with thinking on.
@@ -2847,13 +3276,13 @@ These fade after ~48h if not relevant, or stick around if referenced.
 🔴 Almost gone (<30% life)
 
 **Features:**
-📷 Upload images and I can see them (Claude only)
+📷 Upload images and I can see them (Claude + Gemini have vision)
 💬 I respond in threads (one channel, multiple convos)
 📎 Long code blocks become file attachments
 😀 I can react to your messages with emoji
 🧵 I can see other threads for context
-🔍 Web search with citations (both models — Claude native, Deepseek via Tavily)
-🐉 Multi-model: Claude + Deepseek with smart routing
+🔍 Web search with citations (Claude + Gemini native; Deepseek via Tavily)
+🐉 Multi-model: Claude (Balthasar) + Deepseek (Melchior) + Gemini (Caspar) with smart routing
             """
             await message.channel.send(help_text)
 
@@ -2866,8 +3295,8 @@ def main():
     if not os.getenv("DISCORD_TOKEN"):
         print("❌ DISCORD_TOKEN not set in environment!")
         return
-    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("DEEPSEEK_API_KEY"):
-        print("❌ At least one API key required: ANTHROPIC_API_KEY or DEEPSEEK_API_KEY")
+    if not any(os.getenv(k) for k in ("ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "GEMINI_API_KEY")):
+        print("❌ At least one API key required: ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, or GEMINI_API_KEY")
         return
 
     bot = ClaudeBot()
