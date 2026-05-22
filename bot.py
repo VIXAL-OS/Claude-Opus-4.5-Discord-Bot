@@ -1328,10 +1328,15 @@ class ClaudeBot(commands.Bot):
         self.deepseek_provider = DEEPSEEK_PROVIDER
         self.gemini_provider = GEMINI_PROVIDER
 
-        # Anthropic client
+        # Anthropic client. max_retries=4 (default 2) absorbs more transient
+        # 5xx blips silently — important for bookclub mode where cache-creation
+        # calls send ~450k tokens and are the heaviest possible requests.
         anthropic_key = os.getenv("ANTHROPIC_API_KEY")
         if anthropic_key:
-            self.claude_client = anthropic.Anthropic(api_key=anthropic_key)
+            self.claude_client = anthropic.Anthropic(
+                api_key=anthropic_key,
+                max_retries=4,
+            )
             self.claude_provider.enabled = True
             print(f"🟢 Claude enabled (model: {self.claude_provider.model_id})")
         else:
@@ -3456,9 +3461,21 @@ class ClaudeBot(commands.Bot):
 
             return response_text, reactions, ""
 
+        except anthropic.APIStatusError as e:
+            if e.status_code >= 500:
+                req_id = getattr(e, "request_id", None) or "<not reported>"
+                return (
+                    f"⚠️ Claude returned {e.status_code} (Anthropic-side blip — "
+                    f"`req_id={req_id}`). Bookclub mode sends huge cache-creation "
+                    f"requests that occasionally hit transient backend issues. "
+                    f"Try `!claude` again — these usually clear in seconds.",
+                    [],
+                    "",
+                )
+            return f"Claude Error {e.status_code}: {e.message}", [], ""
         except anthropic.APIError as e:
             return f"Claude Error: {e}", [], ""
-    
+
     async def _web_search(
         self,
         query: str,
@@ -3579,6 +3596,15 @@ class ClaudeBot(commands.Bot):
             
             return final_text.strip(), embeds
             
+        except anthropic.APIStatusError as e:
+            if e.status_code >= 500:
+                req_id = getattr(e, "request_id", None) or "<not reported>"
+                return (
+                    f"⚠️ Claude search returned {e.status_code} (Anthropic-side "
+                    f"blip — `req_id={req_id}`). Try `!search` again.",
+                    [],
+                )
+            return f"❌ Search API Error {e.status_code}: {e.message}", []
         except anthropic.APIError as e:
             return f"❌ Search API Error: {e}", []
     
@@ -4048,6 +4074,17 @@ class ClaudeBot(commands.Bot):
                             await message.channel.send(
                                 f"❌ Long-term memory full. Use `!forget <key>` to make room.\n"
                                 f"Summary was: {summary}"
+                            )
+                    except anthropic.APIStatusError as e:
+                        if e.status_code >= 500:
+                            req_id = getattr(e, "request_id", None) or "<not reported>"
+                            await message.channel.send(
+                                f"⚠️ Claude returned {e.status_code} (Anthropic-side blip, "
+                                f"`req_id={req_id}`). Try `!summarize` again."
+                            )
+                        else:
+                            await message.channel.send(
+                                f"❌ Summary API Error {e.status_code}: {e.message}"
                             )
                     except anthropic.APIError as e:
                         await message.channel.send(f"❌ Couldn't generate summary: {e}")
