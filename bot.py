@@ -2453,15 +2453,22 @@ class ClaudeBot(commands.Bot):
         )
 
     async def _create_gemini_cache(
-        self, material: "ReadingMaterial"
+        self,
+        material: "ReadingMaterial",
+        system_text: Optional[str] = None,
+        tools: Optional[list] = None,
     ) -> Optional[tuple[str, datetime]]:
         """Create a Gemini cachedContents entry for a reading material.
 
         POSTs to /v1beta/cachedContents with the fic as a user/model exchange
         prefix and a 24-hour TTL. Returns (cache_name, expires_at) on success,
-        None on failure. Costs are billed only for the cache storage TTL plus
-        the cache-hit input pricing — much cheaper than uploading the fic each
-        turn.
+        None on failure.
+
+        Per Gemini's API, generateContent calls referencing a cachedContent
+        can NOT also set systemInstruction, tools, or tool_config — those
+        have to be baked into the cache at creation time. So we accept them
+        here and put them on the cache. The chat call then only supplies
+        cachedContent + new contents + generationConfig.
         """
         gemini_key = os.getenv("GEMINI_API_KEY")
         if not gemini_key:
@@ -2477,7 +2484,7 @@ class ClaudeBot(commands.Bot):
             f"Here is the full text — please read it; I'll ask questions about "
             f"it afterwards.\n\n"
         )
-        body = {
+        body: dict = {
             "model": f"models/{self.gemini_provider.model_id}",
             "contents": [
                 {
@@ -2494,6 +2501,10 @@ class ClaudeBot(commands.Bot):
             ],
             "ttl": "86400s",  # 24 hours
         }
+        if system_text:
+            body["systemInstruction"] = {"parts": [{"text": system_text}]}
+        if tools:
+            body["tools"] = tools
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=body, timeout=180) as resp:
@@ -2523,19 +2534,28 @@ class ClaudeBot(commands.Bot):
         print(f"🟢 Created Gemini cache {cache_name} (expires {expires_at:%Y-%m-%d %H:%M})")
         return cache_name, expires_at
 
-    async def _ensure_gemini_cache(self, material: "ReadingMaterial") -> Optional[str]:
+    async def _ensure_gemini_cache(
+        self,
+        material: "ReadingMaterial",
+        system_text: Optional[str] = None,
+        tools: Optional[list] = None,
+    ) -> Optional[str]:
         """Get a Gemini cache handle for this material, creating one if needed.
 
         Reuses existing cache if it's still valid (with a 5-minute safety
-        margin). Returns the cache name (e.g. "cachedContents/abc123") or None
-        if creation failed and we should fall back to inline injection.
+        margin). On a miss, creates a fresh cache with the supplied
+        systemInstruction + tools baked in (since chat calls referencing a
+        cache cannot set those fields themselves). Returns the cache name
+        (e.g. "cachedContents/abc123") or None if creation failed.
         """
         existing = material.cache_handles.get("Gemini")
         expires = material.cache_expires_at.get("Gemini")
         if existing and expires and expires > datetime.now() + timedelta(minutes=5):
             return existing
 
-        result = await self._create_gemini_cache(material)
+        result = await self._create_gemini_cache(
+            material, system_text=system_text, tools=tools
+        )
         if result is None:
             return None
         cache_name, expires_at = result
@@ -2996,44 +3016,57 @@ class ClaudeBot(commands.Bot):
         if not gemini_key:
             return "Gemini Error: GEMINI_API_KEY not set", [], ""
 
-        # Ensure cache exists if we have reading material. _ensure_gemini_cache
-        # returns None on failure; we'll fall back to inlining the fic in
-        # systemInstruction below.
+        # If we have reading material, we'll use the cache. The cache holds
+        # the fic AND systemInstruction AND tools — chat calls referencing
+        # a cachedContent cannot set those fields themselves (Gemini API
+        # rejects with HTTP 400). So we either:
+        # - cache hit → chat call only sets cachedContent + contents + config
+        # - cache miss / no material → chat call sets systemInstruction +
+        #   tools inline.
+        cache_tools = [{"google_search": {}}]
+        # The system we'd bake into a cache for this material. Includes the
+        # fic as a system block (Gemini's cache treats systemInstruction +
+        # contents together as the cached prefix).
+        cache_system_text = system
         cache_name: Optional[str] = None
         if reading_material is not None:
-            cache_name = await self._ensure_gemini_cache(reading_material)
+            cache_name = await self._ensure_gemini_cache(
+                reading_material,
+                system_text=cache_system_text,
+                tools=cache_tools,
+            )
 
         # Convert messages: Anthropic-style → Gemini native format.
-        # Drop the system role (Gemini takes that as a separate field).
+        # Drop the system role (Gemini takes that as a separate field, or it
+        # lives in the cache).
         non_system_messages = [m for m in messages if m.get("role") != "system"]
         gemini_contents = self._convert_messages_to_gemini_format(
             self._strip_internal_keys(non_system_messages)
         )
 
-        # System instruction. When cache holds the fic, system is just live
-        # context (identity, memory, routing). When no cache, we inline the
-        # fic here.
-        if reading_material is not None and cache_name is None:
-            # Cache failed — fall back to inline injection
-            full_system = (
-                self._build_reading_material_system_block(reading_material) + "\n\n" + system
-            )
-        else:
-            full_system = system
-
         body: dict = {
             "contents": gemini_contents,
-            "systemInstruction": {"parts": [{"text": full_system}]},
             "generationConfig": {
                 "maxOutputTokens": self.gemini_provider.max_tokens,
             },
-            # Native google_search grounding — the actual feature that
-            # justifies this code path's existence. Gemini decides when to
-            # ground; grounded responses come back with groundingMetadata.
-            "tools": [{"google_search": {}}],
         }
         if cache_name:
+            # Cache holds systemInstruction + tools + fic. Chat call must
+            # not set any of those (HTTP 400 otherwise).
             body["cachedContent"] = cache_name
+        else:
+            # No cache (no material loaded, or cache creation failed).
+            # Inline the fic in systemInstruction if we have one.
+            if reading_material is not None:
+                inline_system = (
+                    self._build_reading_material_system_block(reading_material)
+                    + "\n\n"
+                    + system
+                )
+            else:
+                inline_system = system
+            body["systemInstruction"] = {"parts": [{"text": inline_system}]}
+            body["tools"] = cache_tools
 
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -3043,25 +3076,56 @@ class ClaudeBot(commands.Bot):
             "Content-Type": "application/json",
             "x-goog-api-key": gemini_key,
         }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=body, timeout=180) as resp:
-                    if resp.status != 200:
-                        err_text = await resp.text()
-                        # If cache was the problem, invalidate it and retry inline next turn
-                        if cache_name and ("cachedContent" in err_text or "CACHE" in err_text.upper()):
-                            print(f"⚠️  Gemini cache {cache_name} rejected; clearing handle")
-                            reading_material.cache_handles.pop("Gemini", None)
-                            reading_material.cache_expires_at.pop("Gemini", None)
-                            self.manager.mark_dirty()
-                        return f"Gemini Error: HTTP {resp.status}: {err_text[:500]}", [], ""
-                    data = await resp.json()
-        except asyncio.TimeoutError:
-            return "Gemini Error: native API request timed out", [], ""
-        except aiohttp.ClientError as e:
-            return f"Gemini Error: network error: {e}", [], ""
-        except Exception as e:
-            return f"Gemini Error: {type(e).__name__}: {e}", [], ""
+
+        async def post_body(b: dict) -> tuple[Optional[dict], Optional[str]]:
+            """Returns (data, error_text). Exactly one is non-None."""
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, headers=headers, json=b, timeout=180) as resp:
+                        if resp.status != 200:
+                            return None, await resp.text()
+                        return await resp.json(), None
+            except asyncio.TimeoutError:
+                return None, "TIMEOUT"
+            except aiohttp.ClientError as e:
+                return None, f"NETWORK: {e}"
+            except Exception as e:
+                return None, f"{type(e).__name__}: {e}"
+
+        data, err_text = await post_body(body)
+
+        # If the cache reference caused the 400 (stale cache from an older
+        # version of the code that didn't bake in system/tools, etc.),
+        # invalidate the handle and retry once with everything inline.
+        if data is None and cache_name and err_text and (
+            "cachedContent" in err_text
+            or "CachedContent" in err_text
+            or "CACHE" in err_text.upper()
+        ):
+            print(f"⚠️  Gemini cache {cache_name} rejected; clearing handle and retrying inline")
+            reading_material.cache_handles.pop("Gemini", None)
+            reading_material.cache_expires_at.pop("Gemini", None)
+            self.manager.mark_dirty()
+            # Rebuild body without cache reference
+            inline_system = (
+                self._build_reading_material_system_block(reading_material)
+                + "\n\n"
+                + system
+            ) if reading_material is not None else system
+            retry_body = {
+                "contents": gemini_contents,
+                "generationConfig": body["generationConfig"],
+                "systemInstruction": {"parts": [{"text": inline_system}]},
+                "tools": cache_tools,
+            }
+            data, err_text = await post_body(retry_body)
+
+        if data is None:
+            if err_text == "TIMEOUT":
+                return "Gemini Error: native API request timed out", [], ""
+            if err_text and err_text.startswith("NETWORK:"):
+                return f"Gemini Error: network error: {err_text[8:].strip()}", [], ""
+            return f"Gemini Error: HTTP error: {(err_text or 'unknown')[:500]}", [], ""
 
         # Parse response
         candidates = data.get("candidates", [])
