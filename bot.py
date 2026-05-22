@@ -2367,6 +2367,70 @@ class ClaudeBot(commands.Bot):
             chapter_breaks=chapter_breaks,
         ), None
 
+    # Chapter heading patterns we look for in uploaded HTML / text. Anchored
+    # to line starts (via re.MULTILINE) so we don't match phrases in prose like
+    # "she opened to Chapter 3 and read…". Each pattern matches a full line so
+    # we get the whole heading text (including ":" + subtitle) back as group 1.
+    CHAPTER_HEADING_RE = re.compile(
+        r'^('
+        r'Chapter\s+\d+[^\n]{0,200}'          # "Chapter 1", "Chapter 12: ..."
+        r'|Prologue[^\n]{0,200}'
+        r'|Epilogue[^\n]{0,200}'
+        r'|Interlude(?:\s+\d+)?[^\n]{0,200}'
+        r'|Part\s+\d+[^\n]{0,200}'             # "Part 1: ..."
+        r')$',
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+    @classmethod
+    def _detect_chapter_breaks(cls, text: str) -> list[tuple[int, str]]:
+        """Find chapter heading positions in text. Returns (char_offset, title) list.
+
+        Heuristic: matches lines that look like "Chapter N[: Title]",
+        "Prologue", "Epilogue", "Interlude [N]", or "Part N". Works for AO3
+        download HTML's heading layout once it's been get_text'd. Returns
+        empty list if no headings found — callers should treat that as
+        "no chapter structure available."
+        """
+        return [
+            (m.start(), m.group(1).strip())
+            for m in cls.CHAPTER_HEADING_RE.finditer(text)
+        ]
+
+    @staticmethod
+    def _slice_material_to_chapters(
+        material: "ReadingMaterial",
+        start_ch: int,
+        end_ch: int,
+    ) -> "ReadingMaterial":
+        """Return a new ReadingMaterial covering chapters start_ch..end_ch (1-indexed inclusive).
+
+        Caller is responsible for validating the range. Adjusted chapter_breaks
+        on the sliced material have offsets relative to the sliced text (so
+        !chapters on a scoped thread shows the right numbers).
+        """
+        breaks = material.chapter_breaks
+        start_offset = breaks[start_ch - 1][0]
+        if end_ch < len(breaks):
+            end_offset = breaks[end_ch][0]
+        else:
+            end_offset = len(material.text)
+        sliced_text = material.text[start_offset:end_offset].strip()
+        sliced_breaks = [
+            (b[0] - start_offset, b[1])
+            for b in breaks[start_ch - 1:end_ch]
+        ]
+        range_desc = (
+            f"Chapter {start_ch}" if start_ch == end_ch
+            else f"Chapters {start_ch}-{end_ch}"
+        )
+        return ReadingMaterial(
+            url=f"{material.url}#scope=ch{start_ch}-{end_ch}",
+            title=f"{material.title} — {range_desc}",
+            text=sliced_text,
+            chapter_breaks=sliced_breaks,
+        )
+
     @staticmethod
     def _build_reading_material_system_block(material: "ReadingMaterial") -> str:
         """Format a reading material as a system-prompt block.
@@ -4131,11 +4195,17 @@ class ClaudeBot(commands.Bot):
             else:
                 title = re.sub(r"\.(txt|html|htm|md)$", "", attachment.filename, flags=re.IGNORECASE)
 
+            # Best-effort chapter detection. Looks for heading-shaped lines:
+            # "Chapter N", "Chapter N: Title", "Prologue", "Epilogue",
+            # "Interlude N". Used by !scope / !chapters; harmless if no
+            # matches (chapter_breaks stays empty).
+            chapter_breaks: list[tuple[int, str]] = self._detect_chapter_breaks(text)
+
             material = ReadingMaterial(
                 url=f"upload://{attachment.filename}",
                 title=title,
                 text=text,
-                chapter_breaks=[],
+                chapter_breaks=chapter_breaks,
             )
 
             # Provider fit check (same as !load)
@@ -4204,6 +4274,128 @@ class ClaudeBot(commands.Bot):
                 if len(material.chapter_breaks) > 30:
                     lines.append(f"  … and {len(material.chapter_breaks) - 30} more")
             await self._send_response(message.channel, "\n".join(lines))
+
+        elif cmd == "!chapters":
+            # Show chapter TOC with per-chapter token estimates. Looks at
+            # this thread's scoped material first, then falls back to the
+            # parent channel's full material.
+            ch_id = message.channel.id
+            parent_id = getattr(message.channel, 'parent_id', None)
+            material = self.manager.reading_materials.get(ch_id) or (
+                self.manager.reading_materials.get(parent_id) if parent_id else None
+            )
+            if material is None:
+                await message.channel.send("Nothing loaded. Use `!load_text` (with file attachment) or `!load <ao3-url>`.")
+                return
+            breaks = material.chapter_breaks
+            if not breaks:
+                await message.channel.send(
+                    f"📚 **{material.title}** has no detected chapter structure "
+                    f"(~{material.estimated_tokens:,} tokens total). "
+                    "`!scope` won't work unless the bot can find chapter headings."
+                )
+                return
+            lines = [f"📚 **{material.title}** — {len(breaks)} chapter(s)"]
+            for i, (offset, ch_title) in enumerate(breaks, 1):
+                next_offset = breaks[i][0] if i < len(breaks) else len(material.text)
+                ch_tokens = int((next_offset - offset) / CONFIG.chars_per_token)
+                lines.append(f"  {i}. {ch_title} — ~{ch_tokens:,} tokens")
+            lines.append("\nUse `!scope chapter N` (in a thread) to discuss just one chapter.")
+            await self._send_response(message.channel, "\n".join(lines))
+
+        elif cmd == "!scope":
+            # Thread-only. Slice the parent channel's loaded material to a
+            # chapter range and pin the slice to this thread. Generation
+            # lookup checks thread_id first, so the slice overrides the
+            # parent's full material for any !claude/!deepseek/!gemini turn
+            # in this thread. Each scope gets its own caches automatically
+            # (content-hashed for Claude/Deepseek; new explicit cache for
+            # Gemini on first scoped turn).
+            if not isinstance(message.channel, discord.Thread):
+                await message.channel.send(
+                    "❌ `!scope` only works inside a thread. Create a thread for the chapter "
+                    "you want to discuss, then run `!scope chapter N` there."
+                )
+                return
+            parent_id = message.channel.parent_id
+            if parent_id is None:
+                await message.channel.send("❌ This thread has no parent channel.")
+                return
+            parent_material = self.manager.reading_materials.get(parent_id)
+            if parent_material is None:
+                await message.channel.send(
+                    "❌ No reading material loaded in the parent channel. "
+                    "Use `!load_text` or `!load` there first, then come back to scope this thread."
+                )
+                return
+            if not parent_material.chapter_breaks:
+                await message.channel.send(
+                    "❌ The loaded material doesn't have detected chapter structure. "
+                    "Re-upload via `!load_text` (the new parser tries to detect chapter "
+                    "headings) — or use `!chapters` to confirm."
+                )
+                return
+
+            n_chapters = len(parent_material.chapter_breaks)
+            if len(parts) < 2:
+                await message.channel.send(
+                    f"Usage: `!scope chapter N` or `!scope chapters N-M` "
+                    f"(this work has {n_chapters} chapters). See `!chapters` for the TOC."
+                )
+                return
+
+            spec = message.content[len("!scope "):].strip().lower()
+            # Accept "chapter N", "chapters N-M", "N", "N-M"
+            match = re.match(r'^(?:chapters?\s+)?(\d+)(?:\s*-\s*(\d+))?$', spec)
+            if not match:
+                await message.channel.send(
+                    "Usage: `!scope chapter N` or `!scope chapters N-M`"
+                )
+                return
+            start_ch = int(match.group(1))
+            end_ch = int(match.group(2)) if match.group(2) else start_ch
+            if start_ch < 1 or end_ch > n_chapters or start_ch > end_ch:
+                await message.channel.send(
+                    f"❌ Invalid range. This work has chapters 1-{n_chapters}."
+                )
+                return
+
+            scoped = self._slice_material_to_chapters(
+                parent_material, start_ch, end_ch
+            )
+            self.manager.reading_materials[message.channel.id] = scoped
+            self.manager.mark_dirty()
+            await self.manager.save_memories_async(providers=self.providers)
+
+            range_desc = (
+                f"Chapter {start_ch}" if start_ch == end_ch
+                else f"Chapters {start_ch}-{end_ch}"
+            )
+            tier_note = ""
+            if scoped.estimated_tokens < 200_000:
+                tier_note = " (under Gemini's ≤200k tier — cheaper per turn)"
+            await message.channel.send(
+                f"📖 This thread is now scoped to **{range_desc}**\n"
+                f"  ~{scoped.estimated_tokens:,} tokens, "
+                f"{scoped.word_count:,} words{tier_note}\n"
+                f"  Models in this thread only see the scoped text — no spoilers from later chapters.\n"
+                f"  `!unscope` to drop the scope; `!unload` (in parent) to drop the whole work."
+            )
+
+        elif cmd == "!unscope":
+            if not isinstance(message.channel, discord.Thread):
+                await message.channel.send("❌ `!unscope` only meaningful inside a thread.")
+                return
+            thread_id = message.channel.id
+            scoped = self.manager.reading_materials.pop(thread_id, None)
+            if scoped is None:
+                await message.channel.send("This thread isn't scoped.")
+            else:
+                self.manager.mark_dirty()
+                await self.manager.save_memories_async(providers=self.providers)
+                await message.channel.send(
+                    "📖 Unscoped this thread. Models will see the full work loaded in the parent channel."
+                )
 
         elif cmd == "!models":
             lines = ["🤖 **Available Models**"]
@@ -4306,9 +4498,12 @@ effort level is shown in the response routing.
 **Bookclub mode (pinned long texts):**
 `!load <url>` - Load an AO3 work into this channel's context
 `!load_text [title]` - (with .txt/.html/.md attachment) load from a file — works when AO3 is shields-up
-`!unload` - Drop the loaded work
-`!reading` - Show what's currently loaded + chapter table of contents
-Once loaded, every model sees the full text on every turn (Claude + Gemini use caching to keep cost down). Discussion across `!claude`, `!deepseek`, `!gemini` all share the same source text.
+`!chapters` - Show the chapter table of contents with per-chapter token counts
+`!scope chapter N` / `!scope chapters N-M` - (in a thread) restrict that thread to a chapter range so models only see those chapters — spoiler-safe + much cheaper per turn
+`!unscope` - (in a thread) drop the scope and use the parent channel's full work
+`!unload` - Drop the loaded work entirely
+`!reading` - Show what's currently loaded for this channel/thread
+Workflow: load the whole work in a channel once → create a thread per chapter → `!scope chapter N` in each thread. Each model's caches (Claude ephemeral, Gemini cachedContent, Deepseek server-side) are content-hashed, so each scope gets its own cheap cache after the first turn.
 Tip: set `AO3_COOKIE` in `.env` with your logged-in session cookie to bypass AO3's shields-up rate-limiting.
 
 **Working memory (auto-managed):**
