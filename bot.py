@@ -2094,32 +2094,88 @@ class ClaudeBot(commands.Bot):
         work_id = match.group(1)
         return f"https://archiveofourown.org/works/{work_id}?view_full_work=true&view_adult=true"
 
-    async def _fetch_ao3_work(self, url: str) -> Optional[ReadingMaterial]:
-        """Fetch an AO3 work and return a populated ReadingMaterial.
+    async def _fetch_ao3_work(self, url: str) -> tuple[Optional[ReadingMaterial], Optional[str]]:
+        """Fetch an AO3 work and return (material, error_reason).
 
-        Returns None if the URL isn't AO3, the fetch fails, or bs4 isn't
-        installed. The full-work view is requested with adult-content gate
-        bypassed.
+        Exactly one of the two is non-None. The error_reason is a
+        user-facing string (used by !load to give a specific message).
+        Common cases:
+        - "missing_bs4"        : beautifulsoup4 not installed
+        - "bad_url"            : URL didn't match AO3 work pattern
+        - "shields_up"         : AO3 is load-shedding anonymous traffic
+        - "auth_required"      : work is registered-only / locked
+        - "http_404"           : work not found
+        - "http_<status>"      : other non-200 response
+        - "network_error: ..." : aiohttp/network exception
+        - "no_content"         : parsed but couldn't find chapter text
         """
         if not _HAS_BS4:
-            return None
+            return None, "missing_bs4"
         normalized = self._build_ao3_full_work_url(url)
         if not normalized:
-            return None
+            return None, "bad_url"
 
+        # Standard browser UA — AO3's anti-bot heuristics aren't UA-based,
+        # but using a real browser string costs nothing.
         headers = {
-            # AO3 returns 403 to default-aiohttp User-Agent strings; use a
-            # bot-identifying UA that still includes a browser token.
-            "User-Agent": "Mozilla/5.0 (compatible; HydraBot/1.0; AO3 bookclub fetcher)"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
         }
-        try:
-            async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.get(normalized, timeout=60) as resp:
-                    if resp.status != 200:
-                        return None
-                    html_text = await resp.text()
-        except (asyncio.TimeoutError, aiohttp.ClientError):
-            return None
+        # Logged-in cookie bypasses shields-up and accesses registered-only works.
+        # To populate: log in at archiveofourown.org in your browser, open dev
+        # tools → Application → Cookies → copy `_otwarchive_session`. Format the
+        # env var as just the cookie value (no "Cookie:" prefix).
+        ao3_cookie = os.getenv("AO3_COOKIE", "").strip()
+        if ao3_cookie:
+            # Accept either bare value or "name=value" form
+            cookie_header = (
+                ao3_cookie if "=" in ao3_cookie
+                else f"_otwarchive_session={ao3_cookie}"
+            )
+            headers["Cookie"] = cookie_header
+
+        html_text = ""
+        last_status: Optional[int] = None
+        last_network_err: Optional[str] = None
+        # Retry on transient failures (network errors, 5xx). 403 shields-up
+        # is NOT retried — it's deliberate load-shedding, won't fix in 10s.
+        for attempt, delay in enumerate([0, 2, 5]):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                async with aiohttp.ClientSession(headers=headers) as session:
+                    async with session.get(normalized, timeout=60) as resp:
+                        last_status = resp.status
+                        if resp.status == 200:
+                            html_text = await resp.text()
+                            break
+                        if resp.status == 403:
+                            # Peek at the body to confirm shields-up vs other 403
+                            body = await resp.text()
+                            if "Shields are up" in body or "shields are up" in body.lower():
+                                return None, "shields_up"
+                            # Other 403 — auth required (locked work)
+                            return None, "auth_required"
+                        if resp.status == 404:
+                            return None, "http_404"
+                        if 500 <= resp.status < 600:
+                            # Retry transient server errors
+                            continue
+                        # Other non-200 — bail
+                        return None, f"http_{resp.status}"
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                last_network_err = f"{type(e).__name__}: {e}"
+                continue
+
+        if not html_text:
+            if last_status is not None:
+                return None, f"http_{last_status}"
+            return None, f"network_error: {last_network_err or 'unknown'}"
 
         soup = _BeautifulSoup(html_text, "html.parser")
 
@@ -2130,7 +2186,7 @@ class ClaudeBot(commands.Bot):
         # Main chapter content lives in #chapters
         chapters_container = soup.select_one("#chapters")
         if chapters_container is None:
-            return None
+            return None, "no_content"
 
         body_parts: list[str] = []
         chapter_breaks: list[tuple[int, str]] = []
@@ -2159,7 +2215,7 @@ class ClaudeBot(commands.Bot):
 
         full_text = "".join(body_parts).strip()
         if not full_text:
-            return None
+            return None, "no_content"
 
         # Normalize whitespace and decode any lingering HTML entities
         full_text = re.sub(r"\n{3,}", "\n\n", full_text)
@@ -2170,7 +2226,7 @@ class ClaudeBot(commands.Bot):
             title=title,
             text=full_text,
             chapter_breaks=chapter_breaks,
-        )
+        ), None
 
     @staticmethod
     def _build_reading_material_system_block(material: "ReadingMaterial") -> str:
@@ -3623,14 +3679,46 @@ class ClaudeBot(commands.Bot):
 
             await message.channel.send(f"📥 Fetching {url} …")
             async with message.channel.typing():
-                material = await self._fetch_ao3_work(url)
+                material, err_reason = await self._fetch_ao3_work(url)
 
             if material is None:
-                await message.channel.send(
-                    "❌ Couldn't fetch or parse that work. Possible causes: "
-                    "the work is locked (registered-users-only), AO3 returned a non-200, "
-                    "or the URL doesn't point to a normal AO3 work page."
-                )
+                error_messages = {
+                    "shields_up": (
+                        "⛔ **AO3 is shields-up** right now — they're shedding "
+                        "anonymous traffic to keep the site responsive for "
+                        "logged-in users. Options:\n"
+                        "  1. Wait for shields to come down "
+                        "(check https://archiveofourown.org/ or @AO3_Status on Bluesky).\n"
+                        "  2. Set `AO3_COOKIE` in `.env` with your logged-in "
+                        "`_otwarchive_session` cookie value, then `!load` again — "
+                        "logged-in requests bypass shields-up.\n"
+                        "  3. Use `!load_text` with a `.txt` or `.html` attachment "
+                        "if you have the work saved locally."
+                    ),
+                    "auth_required": (
+                        "🔒 That work appears to be **registered-users-only**. "
+                        "Set `AO3_COOKIE` in `.env` with a logged-in session cookie "
+                        "and try again, or use `!load_text` with an attached file."
+                    ),
+                    "http_404": "❌ AO3 returned 404 — the work doesn't exist or has been deleted.",
+                    "no_content": (
+                        "❌ Fetched the page but couldn't find chapter content. "
+                        "AO3's HTML may have changed shape, or this is an unusual work format. "
+                        "Try `!load_text` with the work text as an attachment."
+                    ),
+                    "bad_url": (
+                        "❌ I only know how to load AO3 work URLs right now. "
+                        "Expected something like `https://archiveofourown.org/works/12345`."
+                    ),
+                    "missing_bs4": (
+                        "❌ AO3 fetcher needs `beautifulsoup4`. Install with:\n"
+                        "```\npip install beautifulsoup4\n```\nThen restart the bot."
+                    ),
+                }
+                msg = error_messages.get(err_reason or "")
+                if msg is None:
+                    msg = f"❌ Couldn't load the work (reason: `{err_reason}`). Try `!load_text` with a file attachment instead."
+                await message.channel.send(msg)
                 return
 
             # Check which providers can fit it
@@ -3664,6 +3752,110 @@ class ClaudeBot(commands.Bot):
                 "`!claude what do you think of chapter 1?` to start. "
                 "Use `!unload` when done."
             )
+            await message.channel.send("\n".join(lines))
+
+        elif cmd == "!load_text":
+            # Manual fallback for when AO3 is shields-up, the work is locked,
+            # or the user already has the text saved locally. Accepts a .txt
+            # or .html attachment; title comes from the command arg if given
+            # else the filename.
+            channel_id = message.channel.id
+            if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
+                channel_id = message.channel.parent_id
+
+            attachments = [
+                a for a in message.attachments
+                if a.filename.lower().endswith((".txt", ".html", ".htm", ".md"))
+            ]
+            if not attachments:
+                await message.channel.send(
+                    "Usage: attach a `.txt`, `.html`, or `.md` file with `!load_text [title]` as the message.\n"
+                    "The file's contents will be pinned to this channel as reading material — "
+                    "use this when AO3 is shields-up, the work is locked, or you have the text saved locally."
+                )
+                return
+
+            attachment = attachments[0]
+            if attachment.size > 8 * 1024 * 1024:  # 8 MB safety cap
+                await message.channel.send(
+                    f"❌ File too large ({attachment.size / 1024 / 1024:.1f} MB). "
+                    "Keep it under 8 MB — a typical fic-sized text file is well under that."
+                )
+                return
+
+            await message.channel.send(f"📥 Reading {attachment.filename} …")
+            try:
+                raw = await self.manager._fetch_text_file(attachment.url)
+            except Exception as e:
+                await message.channel.send(f"❌ Couldn't read file: {e}")
+                return
+            if not raw:
+                await message.channel.send("❌ File came back empty.")
+                return
+
+            # If it's HTML, strip tags. Otherwise treat as plain text.
+            is_html = attachment.filename.lower().endswith((".html", ".htm"))
+            if is_html:
+                if not _HAS_BS4:
+                    await message.channel.send(
+                        "❌ HTML files need `beautifulsoup4`. Install with `pip install beautifulsoup4`, "
+                        "or convert to `.txt` and try again."
+                    )
+                    return
+                soup = _BeautifulSoup(raw, "html.parser")
+                # Strip scripts/styles
+                for tag in soup(["script", "style", "nav", "header", "footer"]):
+                    tag.decompose()
+                # AO3 download HTMLs have a #chapters wrapper; everything else
+                # just gets the body text.
+                container = soup.select_one("#chapters") or soup.body or soup
+                text = container.get_text("\n", strip=True)
+            else:
+                text = raw
+            text = re.sub(r"\n{3,}", "\n\n", text).strip()
+            text = _html.unescape(text)
+
+            if not text:
+                await message.channel.send("❌ File parsed to empty text.")
+                return
+
+            # Title: from command arg if given, else filename without extension
+            if len(parts) >= 2:
+                title = message.content.split(maxsplit=1)[1].strip()
+            else:
+                title = re.sub(r"\.(txt|html|htm|md)$", "", attachment.filename, flags=re.IGNORECASE)
+
+            material = ReadingMaterial(
+                url=f"upload://{attachment.filename}",
+                title=title,
+                text=text,
+                chapter_breaks=[],
+            )
+
+            # Provider fit check (same as !load)
+            budget_reserve = 50_000
+            needed = material.estimated_tokens + budget_reserve
+            fits: list[str] = []
+            cant_fit: list[str] = []
+            for p in self.providers:
+                if not p.enabled:
+                    continue
+                if p.max_context_tokens >= needed:
+                    fits.append(p.name)
+                else:
+                    cant_fit.append(f"{p.name} ({p.max_context_tokens:,} ctx)")
+
+            self.manager.reading_materials[channel_id] = material
+            self.manager.mark_dirty()
+
+            lines = [
+                f"📚 Loaded **{material.title}** from `{attachment.filename}`",
+                f"  ~{material.estimated_tokens:,} tokens, {material.word_count:,} words",
+                f"  Fits in context for: {', '.join(fits) if fits else '(none — too long!)'}",
+            ]
+            if cant_fit:
+                lines.append(f"  ⚠️  Won't fit for: {', '.join(cant_fit)}")
+            lines.append("\nPinned to this channel. Use `!unload` when done.")
             await message.channel.send("\n".join(lines))
 
         elif cmd == "!unload":
@@ -3803,9 +3995,11 @@ effort level is shown in the response routing.
 
 **Bookclub mode (pinned long texts):**
 `!load <url>` - Load an AO3 work into this channel's context
+`!load_text [title]` - (with .txt/.html/.md attachment) load from a file — works when AO3 is shields-up
 `!unload` - Drop the loaded work
 `!reading` - Show what's currently loaded + chapter table of contents
 Once loaded, every model sees the full text on every turn (Claude + Gemini use caching to keep cost down). Discussion across `!claude`, `!deepseek`, `!gemini` all share the same source text.
+Tip: set `AO3_COOKIE` in `.env` with your logged-in session cookie to bypass AO3's shields-up rate-limiting.
 
 **Working memory (auto-managed):**
 The AI automatically jots down notes during conversation.
