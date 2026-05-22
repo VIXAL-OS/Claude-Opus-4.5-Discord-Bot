@@ -390,11 +390,14 @@ GEMINI_PROVIDER = ModelProvider(
     context_tier_threshold=200_000,
     input_cost_per_million_above_tier=4.0,
     output_cost_per_million_above_tier=18.0,
-    # 1M context standard for Gemini Pro line. Implicit caching is enabled
-    # automatically on the native API but NOT exposed via the OpenAI shim —
-    # for the bookclub feature we use explicit cachedContent via aiohttp
-    # and pass the cache name as extra_body={"cached_content": "..."} on
-    # subsequent shim calls.
+    # 1M context standard for Gemini Pro line. Caching is currently NOT
+    # working: Google's OpenAI shim docs claim extra_body cached_content is
+    # supported, but the API rejects it with 400 "Unknown name cached_content"
+    # as of May 2026. The _create_gemini_cache helper still works against the
+    # native API — the missing piece is a native-API chat path that can
+    # reference the cache. Until then, the fic is inline-injected every turn
+    # and we pay $4/M (above-tier) per call. Implicit caching may apply
+    # server-side but isn't visible in shim responses.
     max_context_tokens=1_000_000,
     # Caspar can see — unlike Melchior.
     supports_vision=True,
@@ -2623,19 +2626,21 @@ class ClaudeBot(commands.Bot):
                     cached = self._get_reasoning(msg_id) if msg_id is not None else ""
                     msg["reasoning_content"] = cached
 
-        # Handle reading material. For Gemini, we try the explicit-cache path
-        # first (avoids re-uploading the fic every turn); on failure we fall
-        # back to prepending. For Deepseek, prepending is fine — their server
-        # auto-caches the prefix and bills cached tokens at ~99% off.
-        gemini_cache_name: Optional[str] = None
+        # Handle reading material — always inline for now.
+        #
+        # NOTE on Gemini caching: the OpenAI shim's docs claim explicit caching
+        # works via extra_body={"cached_content": "cachedContents/..."}, but the
+        # API actually rejects it with HTTP 400 "Unknown name 'cached_content':
+        # Cannot find field." We have working code in _create_gemini_cache that
+        # creates a cache via the native API — but referencing it from the shim
+        # doesn't work. Proper fix is to route Gemini-with-reading-material
+        # through the native generateContent endpoint instead of the shim. Until
+        # then, both Deepseek and Gemini get the fic injected into the system
+        # message every turn. Deepseek's server-side cache makes that ~free
+        # (~99% off). Gemini pays full $4/M-above-200k until we add the native
+        # path — see Issue/TODO: "Native Gemini chat path for cached_content".
         if reading_material is not None:
-            if provider.name == "Gemini":
-                gemini_cache_name = await self._ensure_gemini_cache(reading_material)
-                if gemini_cache_name is None:
-                    # Cache creation failed — fall back to inline.
-                    system = self._build_reading_material_system_block(reading_material) + "\n\n" + system
-            else:
-                system = self._build_reading_material_system_block(reading_material) + "\n\n" + system
+            system = self._build_reading_material_system_block(reading_material) + "\n\n" + system
 
         # Prepend system message (OpenAI uses it as first message)
         openai_messages.insert(0, {"role": "system", "content": system})
@@ -2655,8 +2660,6 @@ class ClaudeBot(commands.Bot):
                 # We reconstruct history from plain Discord text, so we can't
                 # preserve reasoning blocks anyway — disable thinking instead.
                 extra_body["thinking"] = {"type": "disabled"}
-            if gemini_cache_name is not None:
-                extra_body["cached_content"] = gemini_cache_name
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
             if tools:
