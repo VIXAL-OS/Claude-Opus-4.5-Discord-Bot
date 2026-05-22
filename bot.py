@@ -4041,6 +4041,9 @@ class ClaudeBot(commands.Bot):
 
             self.manager.reading_materials[channel_id] = material
             self.manager.mark_dirty()
+            # Force an immediate save so a hard restart in the next 60s
+            # doesn't lose the load. Non-blocking — runs in a worker thread.
+            await self.manager.save_memories_async(providers=self.providers)
 
             lines = [
                 f"📚 Loaded **{material.title}**",
@@ -4150,6 +4153,9 @@ class ClaudeBot(commands.Bot):
 
             self.manager.reading_materials[channel_id] = material
             self.manager.mark_dirty()
+            # Force an immediate save so a hard restart in the next 60s
+            # doesn't lose the load. Non-blocking — runs in a worker thread.
+            await self.manager.save_memories_async(providers=self.providers)
 
             lines = [
                 f"📚 Loaded **{material.title}** from `{attachment.filename}`",
@@ -4170,6 +4176,7 @@ class ClaudeBot(commands.Bot):
                 await message.channel.send("Nothing loaded in this channel.")
             else:
                 self.manager.mark_dirty()
+                await self.manager.save_memories_async(providers=self.providers)
                 await message.channel.send(f"📤 Unloaded **{material.title}**.")
 
         elif cmd == "!reading":
