@@ -21,7 +21,8 @@ Features:
 - Cost tracking with per-provider tiered pricing
 
 Setup:
-1. pip install discord.py anthropic openai python-dotenv aiohttp tavily-python
+1. pip install discord.py anthropic openai python-dotenv aiohttp tavily-python beautifulsoup4
+   (beautifulsoup4 is only required for bookclub mode / AO3 fetching.)
 2. Create .env with DISCORD_TOKEN plus at least one of:
    ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY
 3. Create config.json with allowed_channels list
@@ -36,7 +37,7 @@ from discord.ext import commands
 import anthropic
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from functools import partial
 import json
@@ -46,7 +47,18 @@ import aiohttp
 import base64
 import re
 import io
+import html as _html
 from dotenv import load_dotenv
+
+# beautifulsoup4 is an optional dep used only by the AO3 fetcher in bookclub
+# mode. The bot starts fine without it; !load just returns a clear pip-install
+# message if it's missing.
+try:
+    from bs4 import BeautifulSoup as _BeautifulSoup
+    _HAS_BS4 = True
+except ImportError:
+    _BeautifulSoup = None
+    _HAS_BS4 = False
 
 # matplotlib's mathtext is used to render LaTeX equations to PNG attachments
 # so Discord (which has no native math rendering) can show them properly.
@@ -70,13 +82,16 @@ class BotConfig:
     default_model: str = "auto"  # "auto", "claude", "deepseek", or "gemini"
 
     # Context management (THE KEY TO NOT BEING MYK)
-    max_messages_to_fetch: int = 20        # Fetch from Discord history
+    # Bumped 20 → 60 and 50k → 800k to accommodate book-club mode where a
+    # loaded reading material (e.g. a 320k-token AO3 fic) lives in system
+    # context across a long discussion thread.
+    max_messages_to_fetch: int = 60        # Fetch from Discord history
     max_longterm_memories: int = 25        # Explicit memories (!remember)
     max_working_notes: int = 10            # Auto-notes from Claude
     working_memory_decay_hours: float = 48.0  # Notes fade after ~48h
 
     # Token budgeting (approximate)
-    max_input_tokens: int = 50000          # Stay well under 200k limit
+    max_input_tokens: int = 800_000        # Headroom for fic + discussion + memory
     chars_per_token: float = 4.0           # Rough estimate
 
     # Web search settings
@@ -225,6 +240,10 @@ class ModelProvider:
     input_cost_per_million: float      # $/M input tokens (≤ tier threshold)
     output_cost_per_million: float     # $/M output tokens (≤ tier threshold)
     max_tokens: int = 4096
+    # Context window in tokens — the API limit, not our budget. Used to gate
+    # whether !load can attach a reading material to this provider's calls
+    # (book-club mode requires ~320k+ for fics like Almost Nowhere).
+    max_context_tokens: int = 200_000
     enabled: bool = True
     supports_vision: bool = True       # Can handle image content
     supports_web_search: bool = False  # Has built-in web search tool
@@ -335,6 +354,7 @@ CLAUDE_PROVIDER = ModelProvider(
     model_id="claude-opus-4-7",
     input_cost_per_million=15.0,
     output_cost_per_million=75.0,
+    max_context_tokens=1_000_000,  # 1M GA'd for Opus 4.6+ in March 2026
     supports_vision=True,
     supports_web_search=True,
 )
@@ -344,6 +364,10 @@ DEEPSEEK_PROVIDER = ModelProvider(
     model_id="deepseek-v4-pro",
     input_cost_per_million=0.435,
     output_cost_per_million=0.87,
+    # 1M context per DeepSeek V4-Pro docs (max output 384k). Server-side
+    # context caching is automatic; cached input is ~99% off ($0.003625/M
+    # vs $0.435/M) — no client flags required.
+    max_context_tokens=1_000_000,
     supports_vision=False,
     supports_web_search=False,
     # Deepseek V4 enables thinking by default and requires reasoning_content
@@ -366,6 +390,12 @@ GEMINI_PROVIDER = ModelProvider(
     context_tier_threshold=200_000,
     input_cost_per_million_above_tier=4.0,
     output_cost_per_million_above_tier=18.0,
+    # 1M context standard for Gemini Pro line. Implicit caching is enabled
+    # automatically on the native API but NOT exposed via the OpenAI shim —
+    # for the bookclub feature we use explicit cachedContent via aiohttp
+    # and pass the cache name as extra_body={"cached_content": "..."} on
+    # subsequent shim calls.
+    max_context_tokens=1_000_000,
     # Caspar can see — unlike Melchior.
     supports_vision=True,
     # Chat goes through the OpenAI shim (for codepath uniformity), but search
@@ -731,6 +761,75 @@ class TwoTierMemory:
         return memory
 
 # =============================================================================
+# READING MATERIAL (Bookclub mode — pinned long text per channel)
+# =============================================================================
+
+@dataclass
+class ReadingMaterial:
+    """A long text resource pinned to a Discord channel for bookclub mode.
+
+    Loaded once via !load <url>, then injected into every model call's system
+    context for that channel until !unload. Designed for AO3 fics and similar
+    long-form works (~50k–500k tokens).
+
+    The gemini_cache_name field stores the explicit-cache handle from
+    /v1beta/cachedContents — Gemini's OpenAI shim doesn't support implicit
+    caching, so for cost control we create an explicit cache once and
+    reference it via extra_body={"cached_content": ...} on each shim call.
+    """
+    url: str
+    title: str
+    text: str
+    chapter_breaks: list[tuple[int, str]] = field(default_factory=list)
+    # ^ list of (char_offset, chapter_name) tuples for navigation/preview
+    loaded_at: datetime = field(default_factory=datetime.now)
+    # Provider-specific cache handles. Keyed by provider name. Currently only
+    # Gemini populates this (via _create_gemini_cache). Claude uses
+    # cache_control on the system block, which doesn't need a stored handle.
+    cache_handles: dict[str, str] = field(default_factory=dict)
+    cache_expires_at: dict[str, datetime] = field(default_factory=dict)
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Rough token count using BotConfig's chars_per_token estimate."""
+        return int(len(self.text) / CONFIG.chars_per_token)
+
+    @property
+    def word_count(self) -> int:
+        return len(self.text.split())
+
+    def to_dict(self) -> dict:
+        return {
+            "url": self.url,
+            "title": self.title,
+            "text": self.text,
+            "chapter_breaks": self.chapter_breaks,
+            "loaded_at": self.loaded_at.isoformat(),
+            "cache_handles": dict(self.cache_handles),
+            "cache_expires_at": {
+                k: v.isoformat() for k, v in self.cache_expires_at.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReadingMaterial":
+        return cls(
+            url=data["url"],
+            title=data.get("title", ""),
+            text=data["text"],
+            chapter_breaks=[tuple(b) for b in data.get("chapter_breaks", [])],
+            loaded_at=datetime.fromisoformat(
+                data.get("loaded_at", datetime.now().isoformat())
+            ),
+            cache_handles=dict(data.get("cache_handles", {})),
+            cache_expires_at={
+                k: datetime.fromisoformat(v)
+                for k, v in data.get("cache_expires_at", {}).items()
+            },
+        )
+
+
+# =============================================================================
 # CONVERSATION MANAGER (Uses Discord as message store)
 # =============================================================================
 
@@ -754,6 +853,9 @@ class ConversationManager:
         # Track last response per channel for feedback
         self.last_response_model: dict[int, str] = {}
         self.last_response_index: dict[int, int] = {}
+        # channel_id -> ReadingMaterial (bookclub mode). Per-channel rather
+        # than per-guild because different channels may read different works.
+        self.reading_materials: dict[int, ReadingMaterial] = {}
     
     async def fetch_thread_index(
         self,
@@ -987,10 +1089,10 @@ class ConversationManager:
                         return data.decode('latin-1')
         return None
     
-    def estimate_tokens(self, messages: list[dict], guild_id: int) -> int:
-        """Estimate context size in tokens."""
+    def estimate_tokens(self, messages: list[dict], guild_id: int, channel_id: Optional[int] = None) -> int:
+        """Estimate context size in tokens (includes loaded reading material if any)."""
         total_chars = len(CONFIG.system_prompt)
-        
+
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
@@ -1001,27 +1103,36 @@ class ConversationManager:
                         total_chars += len(part.get("text", ""))
                     elif part.get("type") == "image":
                         total_chars += 1000  # Rough estimate for image tokens
-        
+
         memory_str = self.memories[guild_id].get_context_string()
         total_chars += len(memory_str)
-        
+
+        # Reading material adds substantial weight (often the dominant term).
+        if channel_id is not None and channel_id in self.reading_materials:
+            total_chars += len(self.reading_materials[channel_id].text)
+
         return int(total_chars / CONFIG.chars_per_token)
-    
-    def get_context_info(self, messages: list[dict], guild_id: int) -> str:
+
+    def get_context_info(self, messages: list[dict], guild_id: int, channel_id: Optional[int] = None) -> str:
         """Get human-readable context info."""
         msg_count = len(messages)
         memory = self.memories[guild_id]
         working_count = len(memory.working.notes)
         longterm_count = len(memory.longterm.entries)
-        est_tokens = self.estimate_tokens(messages, guild_id)
+        est_tokens = self.estimate_tokens(messages, guild_id, channel_id=channel_id)
         # Use Claude pricing as worst-case estimate
         est_cost = (est_tokens / 1_000_000) * CLAUDE_PROVIDER.input_cost_per_million
+
+        material_note = ""
+        if channel_id is not None and channel_id in self.reading_materials:
+            mat = self.reading_materials[channel_id]
+            material_note = f", 📚 {mat.title} loaded (~{mat.estimated_tokens:,} tokens)"
 
         return (
             f"📊 Context: {msg_count} messages, "
             f"{working_count}/{CONFIG.max_working_notes} working notes, "
             f"{longterm_count}/{CONFIG.max_longterm_memories} long-term memories, "
-            f"~{est_tokens:,} tokens (~${est_cost:.3f} worst-case)"
+            f"~{est_tokens:,} tokens (~${est_cost:.3f} worst-case){material_note}"
         )
     
     def get_cost_summary(self, providers: list[ModelProvider]) -> str:
@@ -1056,6 +1167,14 @@ class ConversationManager:
         if providers:
             data["_model_stats"] = {
                 p.name: p.to_stats_dict() for p in providers
+            }
+        # Reading materials (bookclub mode). Stored under a metadata key so
+        # we don't collide with guild_ids. Persisted because a fic loaded
+        # via !load should survive a bot restart.
+        if self.reading_materials:
+            data["_reading_materials"] = {
+                str(channel_id): material.to_dict()
+                for channel_id, material in self.reading_materials.items()
             }
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
@@ -1102,7 +1221,18 @@ class ConversationManager:
                     if p.name in data["_model_stats"]:
                         p.load_stats(data["_model_stats"][p.name])
 
-            print(f"Loaded memories for {guild_count} guilds")
+            # Load reading materials (bookclub mode)
+            material_count = 0
+            if "_reading_materials" in data:
+                for ch_id_str, material_data in data["_reading_materials"].items():
+                    try:
+                        self.reading_materials[int(ch_id_str)] = ReadingMaterial.from_dict(material_data)
+                        material_count += 1
+                    except (KeyError, ValueError) as e:
+                        print(f"⚠️  Skipping malformed reading material for channel {ch_id_str}: {e}")
+
+            print(f"Loaded memories for {guild_count} guilds" +
+                  (f", {material_count} reading material(s)" if material_count else ""))
         except FileNotFoundError:
             print("No existing memories file, starting fresh")
 
@@ -1946,6 +2076,215 @@ class ClaudeBot(commands.Bot):
                  "(set GEMINI_API_KEY for native grounding or TAVILY_API_KEY for Tavily).",
         )
 
+    # ----- Reading material (bookclub mode) -----
+
+    AO3_WORK_ID_RE = re.compile(r"archiveofourown\.org/works/(\d+)")
+
+    @classmethod
+    def _build_ao3_full_work_url(cls, url: str) -> Optional[str]:
+        """Normalize any AO3 work URL to its full-work, adult-bypass form.
+
+        Accepts: works/12345, works/12345/chapters/67890, with query strings, etc.
+        Returns: works/12345?view_full_work=true&view_adult=true (or None if
+        the URL doesn't match the AO3 work pattern).
+        """
+        match = cls.AO3_WORK_ID_RE.search(url)
+        if not match:
+            return None
+        work_id = match.group(1)
+        return f"https://archiveofourown.org/works/{work_id}?view_full_work=true&view_adult=true"
+
+    async def _fetch_ao3_work(self, url: str) -> Optional[ReadingMaterial]:
+        """Fetch an AO3 work and return a populated ReadingMaterial.
+
+        Returns None if the URL isn't AO3, the fetch fails, or bs4 isn't
+        installed. The full-work view is requested with adult-content gate
+        bypassed.
+        """
+        if not _HAS_BS4:
+            return None
+        normalized = self._build_ao3_full_work_url(url)
+        if not normalized:
+            return None
+
+        headers = {
+            # AO3 returns 403 to default-aiohttp User-Agent strings; use a
+            # bot-identifying UA that still includes a browser token.
+            "User-Agent": "Mozilla/5.0 (compatible; HydraBot/1.0; AO3 bookclub fetcher)"
+        }
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.get(normalized, timeout=60) as resp:
+                    if resp.status != 200:
+                        return None
+                    html_text = await resp.text()
+        except (asyncio.TimeoutError, aiohttp.ClientError):
+            return None
+
+        soup = _BeautifulSoup(html_text, "html.parser")
+
+        # Work title (in preface metadata)
+        title_tag = soup.select_one("h2.title.heading") or soup.select_one("h2.title")
+        title = title_tag.get_text(strip=True) if title_tag else "Untitled AO3 Work"
+
+        # Main chapter content lives in #chapters
+        chapters_container = soup.select_one("#chapters")
+        if chapters_container is None:
+            return None
+
+        body_parts: list[str] = []
+        chapter_breaks: list[tuple[int, str]] = []
+        chapter_divs = chapters_container.select("div.chapter")
+
+        if chapter_divs:
+            # Multi-chapter work — each <div class="chapter"> has its own
+            # title + userstuff body.
+            for idx, ch_div in enumerate(chapter_divs, 1):
+                ch_title_tag = ch_div.select_one("h3.title")
+                if ch_title_tag:
+                    ch_title = ch_title_tag.get_text(" ", strip=True)
+                else:
+                    ch_title = f"Chapter {idx}"
+
+                body_tag = ch_div.select_one("div.userstuff")
+                body_text = body_tag.get_text("\n", strip=True) if body_tag else ""
+                offset = sum(len(p) for p in body_parts)
+                chapter_breaks.append((offset, ch_title))
+                body_parts.append(f"## {ch_title}\n\n{body_text}\n\n")
+        else:
+            # Single-chapter / oneshot — one userstuff block under #chapters
+            body_tag = chapters_container.select_one("div.userstuff")
+            if body_tag:
+                body_parts.append(body_tag.get_text("\n", strip=True))
+
+        full_text = "".join(body_parts).strip()
+        if not full_text:
+            return None
+
+        # Normalize whitespace and decode any lingering HTML entities
+        full_text = re.sub(r"\n{3,}", "\n\n", full_text)
+        full_text = _html.unescape(full_text)
+
+        return ReadingMaterial(
+            url=url,
+            title=title,
+            text=full_text,
+            chapter_breaks=chapter_breaks,
+        )
+
+    @staticmethod
+    def _build_reading_material_system_block(material: "ReadingMaterial") -> str:
+        """Format a reading material as a system-prompt block.
+
+        Used by all three providers — for Claude it becomes a separately
+        cacheable block; for Deepseek/Gemini-fallback it gets prepended to
+        the live system text. The framing tells the model to treat the text
+        as primary source for any bookclub discussion.
+        """
+        return (
+            f"## Reading Material: {material.title}\n\n"
+            f"This text has been loaded for bookclub discussion in this channel "
+            f"(source: {material.url}). You have full access to the work below — "
+            f"reference specific passages, characters, plot points, and structural "
+            f"choices freely. Treat it as the canonical source for any question "
+            f"about the work. The text follows between the markers.\n\n"
+            f"--- BEGIN WORK ---\n\n"
+            f"{material.text}\n\n"
+            f"--- END WORK ---"
+        )
+
+    async def _create_gemini_cache(
+        self, material: "ReadingMaterial"
+    ) -> Optional[tuple[str, datetime]]:
+        """Create a Gemini cachedContents entry for a reading material.
+
+        POSTs to /v1beta/cachedContents with the fic as a user/model exchange
+        prefix and a 24-hour TTL. Returns (cache_name, expires_at) on success,
+        None on failure. Costs are billed only for the cache storage TTL plus
+        the cache-hit input pricing — much cheaper than uploading the fic each
+        turn.
+        """
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            return None
+        url = "https://generativelanguage.googleapis.com/v1beta/cachedContents"
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": gemini_key,
+        }
+        fic_intro = (
+            f"I'm going to share a work with you for a bookclub discussion. "
+            f"It's titled '{material.title}' (source: {material.url}). "
+            f"Here is the full text — please read it; I'll ask questions about "
+            f"it afterwards.\n\n"
+        )
+        body = {
+            "model": f"models/{self.gemini_provider.model_id}",
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": fic_intro + material.text}],
+                },
+                {
+                    "role": "model",
+                    "parts": [{"text":
+                        "I've read the full work and have it loaded. Ready to "
+                        "discuss whenever you'd like."
+                    }],
+                },
+            ],
+            "ttl": "86400s",  # 24 hours
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=body, timeout=180) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        print(f"⚠️  Gemini cache creation failed: HTTP {resp.status}: {err_text[:300]}")
+                        return None
+                    data = await resp.json()
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            print(f"⚠️  Gemini cache creation network error: {e}")
+            return None
+        except Exception as e:
+            print(f"⚠️  Gemini cache creation unexpected error: {e}")
+            return None
+
+        cache_name = data.get("name", "")
+        expire_time_str = data.get("expireTime", "")
+        if not cache_name:
+            return None
+        try:
+            # ISO 8601 with Z suffix → fromisoformat needs +00:00
+            expires_at = datetime.fromisoformat(expire_time_str.replace("Z", "+00:00"))
+            # Strip tz for naive comparisons with our datetime.now() elsewhere
+            expires_at = expires_at.replace(tzinfo=None)
+        except (ValueError, AttributeError):
+            expires_at = datetime.now() + timedelta(hours=24)
+        print(f"🟢 Created Gemini cache {cache_name} (expires {expires_at:%Y-%m-%d %H:%M})")
+        return cache_name, expires_at
+
+    async def _ensure_gemini_cache(self, material: "ReadingMaterial") -> Optional[str]:
+        """Get a Gemini cache handle for this material, creating one if needed.
+
+        Reuses existing cache if it's still valid (with a 5-minute safety
+        margin). Returns the cache name (e.g. "cachedContents/abc123") or None
+        if creation failed and we should fall back to inline injection.
+        """
+        existing = material.cache_handles.get("Gemini")
+        expires = material.cache_expires_at.get("Gemini")
+        if existing and expires and expires > datetime.now() + timedelta(minutes=5):
+            return existing
+
+        result = await self._create_gemini_cache(material)
+        if result is None:
+            return None
+        cache_name, expires_at = result
+        material.cache_handles["Gemini"] = cache_name
+        material.cache_expires_at["Gemini"] = expires_at
+        self.manager.mark_dirty()  # persist the new cache handle
+        return cache_name
+
     URL_PATTERN = re.compile(r'https?://[^\s\)\]<>\"\'`]+[^\s\.\,\)\]<>\"\'`:]')
     URL_EXTRACT_MAX = 3
     URL_EXTRACT_CHAR_CAP = 20000
@@ -2191,6 +2530,7 @@ class ClaudeBot(commands.Bot):
         messages: list[dict],
         system: str,
         thinking: bool = False,
+        reading_material: Optional["ReadingMaterial"] = None,
     ) -> tuple[str, list[str], str]:
         """Generate response using any OpenAI-compatible provider (Deepseek, Gemini).
 
@@ -2198,6 +2538,13 @@ class ClaudeBot(commands.Bot):
         - supports_vision: keep image content if True, strip otherwise
         - requires_reasoning_echo: echo reasoning_content on prior assistant turns
         - disables_thinking_by_default: send extra_body to opt out when thinking=False
+
+        Reading material handling (bookclub mode):
+        - Gemini: create / reuse an explicit cachedContents entry via native
+          API, reference it via extra_body={"cached_content": "..."} so the
+          fic isn't re-uploaded every turn.
+        - Other providers (Deepseek): prepend the fic to the system message.
+          Deepseek's server-side prefix caching makes this cheap automatically.
 
         Returns (text, reactions, reasoning_content). reasoning_content is empty
         unless thinking mode was enabled and the provider returned a reasoning block.
@@ -2220,6 +2567,20 @@ class ClaudeBot(commands.Bot):
                     cached = self._get_reasoning(msg_id) if msg_id is not None else ""
                     msg["reasoning_content"] = cached
 
+        # Handle reading material. For Gemini, we try the explicit-cache path
+        # first (avoids re-uploading the fic every turn); on failure we fall
+        # back to prepending. For Deepseek, prepending is fine — their server
+        # auto-caches the prefix and bills cached tokens at ~99% off.
+        gemini_cache_name: Optional[str] = None
+        if reading_material is not None:
+            if provider.name == "Gemini":
+                gemini_cache_name = await self._ensure_gemini_cache(reading_material)
+                if gemini_cache_name is None:
+                    # Cache creation failed — fall back to inline.
+                    system = self._build_reading_material_system_block(reading_material) + "\n\n" + system
+            else:
+                system = self._build_reading_material_system_block(reading_material) + "\n\n" + system
+
         # Prepend system message (OpenAI uses it as first message)
         openai_messages.insert(0, {"role": "system", "content": system})
 
@@ -2232,11 +2593,16 @@ class ClaudeBot(commands.Bot):
                 "max_tokens": provider.max_tokens,
                 "messages": self._strip_internal_keys(openai_messages),
             }
+            extra_body: dict = {}
             if not thinking and provider.disables_thinking_by_default:
                 # Provider has thinking on by default and needs the disable kwarg.
                 # We reconstruct history from plain Discord text, so we can't
                 # preserve reasoning blocks anyway — disable thinking instead.
-                api_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                extra_body["thinking"] = {"type": "disabled"}
+            if gemini_cache_name is not None:
+                extra_body["cached_content"] = gemini_cache_name
+            if extra_body:
+                api_kwargs["extra_body"] = extra_body
             if tools:
                 api_kwargs["tools"] = tools
 
@@ -2443,13 +2809,31 @@ class ClaudeBot(commands.Bot):
 
         system = "\n\n".join(system_parts)
 
+        # Look up reading material pinned to this channel (bookclub mode).
+        # Use parent channel for threads so a thread inside a bookclub
+        # channel sees the same loaded fic.
+        channel_id = getattr(channel, "id", None)
+        parent_id = getattr(channel, "parent_id", None)
+        reading_material: Optional[ReadingMaterial] = (
+            self.manager.reading_materials.get(channel_id)
+            or (self.manager.reading_materials.get(parent_id) if parent_id else None)
+        )
+        # Gate: don't try to inject material that won't fit alongside discussion.
+        # Reserve ~50k tokens for chat history + memory + system framing.
+        if reading_material is not None:
+            needed = reading_material.estimated_tokens + 50_000
+            if provider.max_context_tokens < needed:
+                reading_material = None  # silently drop for this provider
+
         # Dispatch to the appropriate model. OpenAI-compatible providers
         # (Deepseek, Gemini) share the same generation path; Claude uses the
         # Anthropic SDK directly with its own tool/thinking machinery.
         if provider.name in self.openai_compatible_clients:
             client = self.openai_compatible_clients[provider.name]
             return await self._generate_openai_compatible_response(
-                client, provider, guild_id, messages, system, thinking=thinking
+                client, provider, guild_id, messages, system,
+                thinking=thinking,
+                reading_material=reading_material,
             )
 
         # Claude path (default) — with organic web search capability
@@ -2460,10 +2844,28 @@ class ClaudeBot(commands.Bot):
                 "name": "web_search"
             }]
 
+            # When a reading material is loaded, send system as a list of
+            # blocks with cache_control on the (very large) fic block. The
+            # cache marker tells Anthropic to cache everything up through
+            # that block; subsequent requests with the same fic hit the
+            # cache at ~10% pricing.
+            if reading_material is not None:
+                fic_block_text = self._build_reading_material_system_block(reading_material)
+                claude_system = [
+                    {
+                        "type": "text",
+                        "text": fic_block_text,
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {"type": "text", "text": system},
+                ]
+            else:
+                claude_system = system
+
             claude_kwargs = {
                 "model": self.claude_provider.model_id,
                 "max_tokens": self.claude_provider.max_tokens,
-                "system": system,
+                "system": claude_system,
                 "tools": claude_tools,
             }
             if thinking:
@@ -2883,7 +3285,11 @@ class ClaudeBot(commands.Bot):
         
         if cmd == "!context":
             messages = await self.manager.fetch_thread_history(message.channel)
-            info = self.manager.get_context_info(messages, guild_id)
+            # Look up channel-level reading material via parent channel for threads
+            ctx_channel_id = message.channel.id
+            if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
+                ctx_channel_id = message.channel.parent_id
+            info = self.manager.get_context_info(messages, guild_id, channel_id=ctx_channel_id)
             await message.channel.send(info)
         
         elif cmd == "!cost":
@@ -3166,7 +3572,137 @@ class ClaudeBot(commands.Bot):
                     "`!summarize <key>` - Auto-generate summary of this thread\n"
                     "`!summarize <key> <your summary>` - Save your own summary"
                 )
-        
+
+        elif cmd == "!load":
+            # Bookclub mode: load a long text (currently AO3 fics) into this
+            # channel's pinned context. Persists across restarts. Per-channel
+            # so different channels can read different works.
+            channel_id = message.channel.id
+            if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
+                channel_id = message.channel.parent_id
+
+            if len(parts) < 2:
+                current = self.manager.reading_materials.get(channel_id)
+                if current:
+                    chapter_count = len(current.chapter_breaks) or 1
+                    await message.channel.send(
+                        f"📚 Currently loaded: **{current.title}**\n"
+                        f"  Source: {current.url}\n"
+                        f"  ~{current.estimated_tokens:,} tokens, "
+                        f"{current.word_count:,} words, {chapter_count} chapter(s)\n"
+                        f"  Loaded: {current.loaded_at.strftime('%Y-%m-%d %H:%M')}\n\n"
+                        f"Use `!unload` to drop it, or `!load <url>` to swap."
+                    )
+                else:
+                    await message.channel.send(
+                        "Usage: `!load <url>` — load a long text into this channel for bookclub mode.\n"
+                        "Currently supports AO3 work URLs. Bot will fetch the full work and "
+                        "pin it into every model's system context until you `!unload`."
+                    )
+                return
+
+            url = parts[1].strip()
+            # Strip Discord's auto-link brackets if present
+            url = url.strip("<>").rstrip("/")
+
+            ao3_normalized = self._build_ao3_full_work_url(url)
+            if ao3_normalized is None:
+                await message.channel.send(
+                    "❌ I only know how to load AO3 work URLs right now. "
+                    "Expected something like `https://archiveofourown.org/works/12345`."
+                )
+                return
+
+            if not _HAS_BS4:
+                await message.channel.send(
+                    "❌ AO3 fetcher needs `beautifulsoup4`. Install with:\n"
+                    "```\npip install beautifulsoup4\n```\n"
+                    "Then restart the bot."
+                )
+                return
+
+            await message.channel.send(f"📥 Fetching {url} …")
+            async with message.channel.typing():
+                material = await self._fetch_ao3_work(url)
+
+            if material is None:
+                await message.channel.send(
+                    "❌ Couldn't fetch or parse that work. Possible causes: "
+                    "the work is locked (registered-users-only), AO3 returned a non-200, "
+                    "or the URL doesn't point to a normal AO3 work page."
+                )
+                return
+
+            # Check which providers can fit it
+            chapter_count = len(material.chapter_breaks) or 1
+            fits: list[str] = []
+            cant_fit: list[str] = []
+            # Reserve some budget for memory, history, system framing
+            budget_reserve = 50_000
+            needed = material.estimated_tokens + budget_reserve
+            for p in self.providers:
+                if not p.enabled:
+                    continue
+                if p.max_context_tokens >= needed:
+                    fits.append(p.name)
+                else:
+                    cant_fit.append(f"{p.name} ({p.max_context_tokens:,} ctx)")
+
+            self.manager.reading_materials[channel_id] = material
+            self.manager.mark_dirty()
+
+            lines = [
+                f"📚 Loaded **{material.title}**",
+                f"  ~{material.estimated_tokens:,} tokens, "
+                f"{material.word_count:,} words, {chapter_count} chapter(s)",
+                f"  Fits in context for: {', '.join(fits) if fits else '(none — too long!)'}",
+            ]
+            if cant_fit:
+                lines.append(f"  ⚠️  Won't fit for: {', '.join(cant_fit)} — those models will see the discussion only, not the source text.")
+            lines.append(
+                "\nThe text is now pinned to this channel's context. Try "
+                "`!claude what do you think of chapter 1?` to start. "
+                "Use `!unload` when done."
+            )
+            await message.channel.send("\n".join(lines))
+
+        elif cmd == "!unload":
+            channel_id = message.channel.id
+            if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
+                channel_id = message.channel.parent_id
+            material = self.manager.reading_materials.pop(channel_id, None)
+            if material is None:
+                await message.channel.send("Nothing loaded in this channel.")
+            else:
+                self.manager.mark_dirty()
+                await message.channel.send(f"📤 Unloaded **{material.title}**.")
+
+        elif cmd == "!reading":
+            # Lightweight info command — shows what's loaded without the
+            # "no usage" path that !load has. Also includes a chapter table
+            # of contents if available.
+            channel_id = message.channel.id
+            if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
+                channel_id = message.channel.parent_id
+            material = self.manager.reading_materials.get(channel_id)
+            if material is None:
+                await message.channel.send("Nothing loaded in this channel. Use `!load <url>` to start a bookclub.")
+                return
+            lines = [
+                f"📚 **{material.title}**",
+                f"  Source: {material.url}",
+                f"  ~{material.estimated_tokens:,} tokens, "
+                f"{material.word_count:,} words",
+                f"  Loaded: {material.loaded_at.strftime('%Y-%m-%d %H:%M')}",
+            ]
+            if material.chapter_breaks:
+                lines.append(f"\n**Chapters** ({len(material.chapter_breaks)}):")
+                for i, (_, ch_title) in enumerate(material.chapter_breaks[:30], 1):
+                    lines.append(f"  {i}. {ch_title}")
+                if len(material.chapter_breaks) > 30:
+                    lines.append(f"  … and {len(material.chapter_breaks) - 30} more")
+            await self._send_response(message.channel, "\n".join(lines))
+
         elif cmd == "!models":
             lines = ["🤖 **Available Models**"]
             for p in self.providers:
@@ -3265,6 +3801,12 @@ effort level is shown in the response routing.
 `!summarize <key>` - Auto-summarize this thread and save it
 `!summarize <key> <summary>` - Save your own thread summary
 
+**Bookclub mode (pinned long texts):**
+`!load <url>` - Load an AO3 work into this channel's context
+`!unload` - Drop the loaded work
+`!reading` - Show what's currently loaded + chapter table of contents
+Once loaded, every model sees the full text on every turn (Claude + Gemini use caching to keep cost down). Discussion across `!claude`, `!deepseek`, `!gemini` all share the same source text.
+
 **Working memory (auto-managed):**
 The AI automatically jots down notes during conversation.
 These fade after ~48h if not relevant, or stick around if referenced.
@@ -3282,6 +3824,7 @@ These fade after ~48h if not relevant, or stick around if referenced.
 😀 I can react to your messages with emoji
 🧵 I can see other threads for context
 🔍 Web search with citations (Claude + Gemini native; Deepseek via Tavily)
+📚 Bookclub mode: `!load <ao3-url>` pins a fic to the channel for cross-model discussion
 🐉 Multi-model: Claude (Balthasar) + Deepseek (Melchior) + Gemini (Caspar) with smart routing
             """
             await message.channel.send(help_text)
