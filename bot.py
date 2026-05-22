@@ -390,14 +390,12 @@ GEMINI_PROVIDER = ModelProvider(
     context_tier_threshold=200_000,
     input_cost_per_million_above_tier=4.0,
     output_cost_per_million_above_tier=18.0,
-    # 1M context standard for Gemini Pro line. Caching is currently NOT
-    # working: Google's OpenAI shim docs claim extra_body cached_content is
-    # supported, but the API rejects it with 400 "Unknown name cached_content"
-    # as of May 2026. The _create_gemini_cache helper still works against the
-    # native API — the missing piece is a native-API chat path that can
-    # reference the cache. Until then, the fic is inline-injected every turn
-    # and we pay $4/M (above-tier) per call. Implicit caching may apply
-    # server-side but isn't visible in shim responses.
+    # 1M context standard for Gemini Pro line. Bookclub-mode chat (when a
+    # reading material is loaded) routes through _generate_gemini_native_response
+    # instead of the OpenAI shim, so we can reference cachedContent — Google's
+    # shim still rejects extra_body cached_content as of May 2026, so the
+    # native path is the only one that gets the cache discount. Non-bookclub
+    # chat stays on the shim for uniformity with Deepseek.
     max_context_tokens=1_000_000,
     # Caspar can see — unlike Melchior.
     supports_vision=True,
@@ -1809,6 +1807,39 @@ class ClaudeBot(commands.Bot):
                 stripped.append(msg)
         return stripped
 
+    def _convert_messages_to_gemini_format(self, messages: list[dict]) -> list[dict]:
+        """Convert internal/Anthropic message format to Gemini native format.
+
+        Gemini uses {role, parts: [{text} | {inlineData}]} with role="model"
+        for assistant turns. Image blocks become {inlineData: {mimeType, data}}.
+        Used by _generate_gemini_native_response (the bookclub-mode chat path).
+        """
+        converted: list[dict] = []
+        for msg in messages:
+            content = msg.get("content", "")
+            # Gemini uses "model" for assistant; "user" stays "user". No "system"
+            # in contents — that goes in systemInstruction.
+            role = "model" if msg.get("role") == "assistant" else "user"
+            parts: list[dict] = []
+            if isinstance(content, str):
+                parts.append({"text": content})
+            elif isinstance(content, list):
+                for block in content:
+                    bt = block.get("type")
+                    if bt == "text":
+                        parts.append({"text": block.get("text", "")})
+                    elif bt == "image":
+                        source = block.get("source", {})
+                        parts.append({
+                            "inlineData": {
+                                "mimeType": source.get("media_type", "image/png"),
+                                "data": source.get("data", ""),
+                            }
+                        })
+            if parts:
+                converted.append({"role": role, "parts": parts})
+        return converted
+
     def _convert_messages_to_openai_format(self, messages: list[dict]) -> list[dict]:
         """Convert Anthropic-format messages to OpenAI chat format."""
         converted = []
@@ -2760,6 +2791,148 @@ class ClaudeBot(commands.Bot):
         except Exception as e:
             return f"{provider.name} Error: {e}", [], ""
 
+    async def _generate_gemini_native_response(
+        self,
+        guild_id: int,
+        messages: list[dict],
+        system: str,
+        thinking: bool = False,
+        reading_material: Optional["ReadingMaterial"] = None,
+    ) -> tuple[str, list[str], str]:
+        """Generate Gemini response via the native generateContent endpoint.
+
+        Used when reading_material is loaded — only path that can reference
+        cachedContent (the OpenAI shim rejects extra_body cached_content with
+        HTTP 400 as of May 2026). Bypasses the openai SDK entirely, talking
+        to the native API via aiohttp.
+
+        For non-bookclub Gemini calls we still use the OpenAI shim because:
+        (a) the shim works fine without caching needs, (b) it keeps the
+        Deepseek/Gemini code path uniform, and (c) less native code to
+        maintain.
+
+        Returns (text, reactions, reasoning_content). reasoning_content is
+        always empty — native API surfaces thinking differently and we
+        don't need it for our Discord-history-based context.
+        """
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            return "Gemini Error: GEMINI_API_KEY not set", [], ""
+
+        # Ensure cache exists if we have reading material. _ensure_gemini_cache
+        # returns None on failure; we'll fall back to inlining the fic in
+        # systemInstruction below.
+        cache_name: Optional[str] = None
+        if reading_material is not None:
+            cache_name = await self._ensure_gemini_cache(reading_material)
+
+        # Convert messages: Anthropic-style → Gemini native format.
+        # Drop the system role (Gemini takes that as a separate field).
+        non_system_messages = [m for m in messages if m.get("role") != "system"]
+        gemini_contents = self._convert_messages_to_gemini_format(
+            self._strip_internal_keys(non_system_messages)
+        )
+
+        # System instruction. When cache holds the fic, system is just live
+        # context (identity, memory, routing). When no cache, we inline the
+        # fic here.
+        if reading_material is not None and cache_name is None:
+            # Cache failed — fall back to inline injection
+            full_system = (
+                self._build_reading_material_system_block(reading_material) + "\n\n" + system
+            )
+        else:
+            full_system = system
+
+        body: dict = {
+            "contents": gemini_contents,
+            "systemInstruction": {"parts": [{"text": full_system}]},
+            "generationConfig": {
+                "maxOutputTokens": self.gemini_provider.max_tokens,
+            },
+            # Native google_search grounding — the actual feature that
+            # justifies this code path's existence. Gemini decides when to
+            # ground; grounded responses come back with groundingMetadata.
+            "tools": [{"google_search": {}}],
+        }
+        if cache_name:
+            body["cachedContent"] = cache_name
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self.gemini_provider.model_id}:generateContent"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": gemini_key,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=body, timeout=180) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        # If cache was the problem, invalidate it and retry inline next turn
+                        if cache_name and ("cachedContent" in err_text or "CACHE" in err_text.upper()):
+                            print(f"⚠️  Gemini cache {cache_name} rejected; clearing handle")
+                            reading_material.cache_handles.pop("Gemini", None)
+                            reading_material.cache_expires_at.pop("Gemini", None)
+                            self.manager.mark_dirty()
+                        return f"Gemini Error: HTTP {resp.status}: {err_text[:500]}", [], ""
+                    data = await resp.json()
+        except asyncio.TimeoutError:
+            return "Gemini Error: native API request timed out", [], ""
+        except aiohttp.ClientError as e:
+            return f"Gemini Error: network error: {e}", [], ""
+        except Exception as e:
+            return f"Gemini Error: {type(e).__name__}: {e}", [], ""
+
+        # Parse response
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return "Gemini Error: no candidates in response", [], ""
+        candidate = candidates[0]
+        parts = candidate.get("content", {}).get("parts", [])
+        response_text = "".join(p.get("text", "") for p in parts).strip()
+        if not response_text:
+            finish_reason = candidate.get("finishReason", "UNKNOWN")
+            return f"Gemini Error: empty response (finishReason={finish_reason})", [], ""
+
+        # Track usage. Native API reports cachedContentTokenCount separately —
+        # those are billed at ~25% of normal input rate. Our ModelProvider
+        # doesn't model that yet, so we record total prompt tokens at the
+        # normal rate (slight over-estimate when cache is hot).
+        usage = data.get("usageMetadata", {})
+        prompt_tokens = usage.get("promptTokenCount", 0)
+        output_tokens = usage.get("candidatesTokenCount", 0)
+        cached_tokens = usage.get("cachedContentTokenCount", 0)
+        self.gemini_provider.record_usage(prompt_tokens, output_tokens)
+        self.gemini_provider.total_requests += 1
+        if cached_tokens:
+            # Light-touch logging so it's visible the cache is actually doing work.
+            print(f"🟢 Gemini cache hit: {cached_tokens:,} cached tokens / {prompt_tokens:,} total")
+
+        # Process notes and reactions (same patterns as other generators)
+        note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
+        for match in re.finditer(note_pattern, response_text):
+            key = match.group(1).strip()
+            value = match.group(2).strip()
+            self.manager.memories[guild_id].working.add(key, value)
+        response_text = re.sub(note_pattern, '', response_text)
+
+        reactions: list[str] = []
+        reaction_pattern = r'\[react:\s*([^\]]+)\]'
+        for match in re.finditer(reaction_pattern, response_text):
+            reactions.append(match.group(1).strip())
+        response_text = re.sub(reaction_pattern, '', response_text).strip()
+
+        # Same formatting cleanup as the shim path
+        response_text = re.sub(r'\n\s*\n\s*\n', '\n\n', response_text)
+        response_text = re.sub(r'\n\n+(#+\s)', r'\n\1', response_text)
+        response_text = re.sub(r'\n\n+(\*\*[^*]+\*\*:)', r'\n\1', response_text)
+        response_text = re.sub(r'  +', ' ', response_text)
+
+        return response_text, reactions, ""
+
     async def _generate_response(
         self,
         channel: discord.abc.Messageable,
@@ -2884,9 +3057,22 @@ class ClaudeBot(commands.Bot):
             if provider.max_context_tokens < needed:
                 reading_material = None  # silently drop for this provider
 
-        # Dispatch to the appropriate model. OpenAI-compatible providers
-        # (Deepseek, Gemini) share the same generation path; Claude uses the
-        # Anthropic SDK directly with its own tool/thinking machinery.
+        # Dispatch to the appropriate model.
+        #
+        # - Gemini + reading material → native generateContent path (only one
+        #   that can reference cachedContent). Includes inline google_search
+        #   grounding for organic web lookups during discussion.
+        # - Gemini without reading material → OpenAI shim (simpler, uniform
+        #   with Deepseek; we don't need the native features for normal chat).
+        # - Deepseek → OpenAI shim. Reading material gets inline-injected;
+        #   DeepSeek's automatic server-side prefix caching makes that ~free.
+        # - Claude → native Anthropic SDK with its own tool/thinking machinery.
+        if provider is self.gemini_provider and reading_material is not None:
+            return await self._generate_gemini_native_response(
+                guild_id, messages, system,
+                thinking=thinking,
+                reading_material=reading_material,
+            )
         if provider.name in self.openai_compatible_clients:
             client = self.openai_compatible_clients[provider.name]
             return await self._generate_openai_compatible_response(
