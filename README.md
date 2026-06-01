@@ -1,6 +1,6 @@
 # Hydra Discord Bot (Opus-Deipseek)
 
-A multi-model Discord bot powered by **Claude Opus 4.7**, **DeepSeek V4-Pro**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts) across all three.
+A multi-model Discord bot powered by **Claude Opus 4.8**, **DeepSeek V4-Pro**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts) across all three.
 
 Affectionately maps to the EVA *MAGI* trinity:
 - **Claude / Balthasar** — careful, thorough, vision, native Anthropic web search, multi-tool orchestration
@@ -232,11 +232,11 @@ The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemin
 
 | Model | Input | Cached input | Output | Typical chat | Bookclub (320k cached) |
 |-------|-------|--------------|--------|--------------|------------------------|
-| Claude Opus 4.7 | $15/M | $1.50/M (10%) | $75/M | ~$0.02-0.05 | ~$0.50/turn after cache |
+| Claude Opus 4.8 | $5/M | $0.50/M (10%) | $25/M | ~$0.02-0.05 | ~$0.16/turn after cache |
 | Gemini 3.1 Pro | $2-4/M (tiered ≤/>200k) | $0.50-1.00/M (25%) | $12-18/M | ~$0.01-0.02 | ~$0.40/turn after cache |
 | DeepSeek V4 Pro | $0.435/M | $0.003625/M (~99%) | $0.87/M | ~$0.0005-0.002 | ~$0.005/turn after cache |
 
-DeepSeek handles routine chat at ~50-100× less cost. Gemini specializes in long-context synthesis and novel reasoning. Claude handles complex tasks that justify the premium. Use `!cost` to see real-time breakdown including cache hit rates.
+DeepSeek handles routine chat at ~10-30× less cost. Gemini specializes in long-context synthesis and novel reasoning. Claude handles complex tasks that justify the premium. Use `!cost` to see real-time breakdown including cache hit rates.
 
 Caching is the difference between $5/turn and $0.50/turn for Claude bookclub mode, so it matters. The bot tracks cached and uncached tokens separately and reports the hit rate per provider.
 

@@ -28,7 +28,7 @@ Setup:
 3. Create config.json with allowed_channels list
 4. python bot.py
 
-Cost estimate: ~$0.02-0.05 per message with Opus 4.7 (Claude); cheaper on Deepseek;
+Cost estimate: ~$0.02-0.05 per message with Opus 4.8 (Claude); cheaper on Deepseek;
 Gemini sits in between depending on context size.
 """
 
@@ -401,13 +401,13 @@ class SearchResult:
 
 CLAUDE_PROVIDER = ModelProvider(
     name="Claude",
-    model_id="claude-opus-4-7",
-    input_cost_per_million=15.0,
-    output_cost_per_million=75.0,
+    model_id="claude-opus-4-8",
+    input_cost_per_million=5.0,
+    output_cost_per_million=25.0,
     # cache_read_input_tokens bill at 10% of standard input rate. (Cache
     # writes on the first turn are billed at 1.25x; we lump those into the
     # regular input counter — a small under-bill once per session.)
-    cached_input_cost_per_million=1.5,
+    cached_input_cost_per_million=0.5,
     max_context_tokens=1_000_000,  # 1M GA'd for Opus 4.6+ in March 2026
     supports_vision=True,
     supports_web_search=True,
@@ -1488,7 +1488,7 @@ class ClaudeBot(commands.Bot):
 
     @staticmethod
     def _pick_effort(text: str, prev_used_thinking: bool = False) -> Optional[str]:
-        """Classify a prompt into an Opus 4.7 thinking-effort level.
+        """Classify a prompt into an Opus 4.8 thinking-effort level.
 
         Returns None | "high" | "xhigh" | "max". None means thinking off
         (cheap chat path). Casual register and first-person emotional
@@ -3364,7 +3364,7 @@ class ClaudeBot(commands.Bot):
                 "tools": claude_tools,
             }
             if thinking:
-                # Adaptive thinking on Opus 4.7: model decides depth; effort
+                # Adaptive thinking on Opus 4.8: model decides depth; effort
                 # controls overall thinking/acting budget. effort=None falls
                 # back to the class default ("high"). xhigh/max need ≥64K
                 # max_tokens or they truncate mid-thought.
