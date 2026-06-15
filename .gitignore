@@ -2,3 +2,4 @@
 memories.json
 __pycache__/
 config.json
+.claude/
