@@ -472,6 +472,16 @@ GEMINI_PROVIDER = ModelProvider(
 )
 
 
+# Bookclub Gemini caching knobs. Gemini context caches bill storage per
+# token-hour for their whole TTL whether or not they're ever read, so a big fic
+# cache that's created-and-abandoned is pure waste. Keep the TTL bounded and
+# always delete caches on !unload/!unscope (see _drop_gemini_cache).
+GEMINI_CACHE_TTL_SECONDS = 24 * 3600  # cache auto-expires after this
+# Rough storage rate for the heads-up estimate logged at cache creation. VERIFY
+# against current Gemini pricing — used only for a console warning, not billing.
+GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR = 1.0
+
+
 # =============================================================================
 # CALIBRATION TRACKER
 # =============================================================================
@@ -2511,7 +2521,7 @@ class ClaudeBot(commands.Bot):
                     }],
                 },
             ],
-            "ttl": "86400s",  # 24 hours
+            "ttl": f"{GEMINI_CACHE_TTL_SECONDS}s",
         }
         if system_text:
             body["systemInstruction"] = {"parts": [{"text": system_text}]}
@@ -2542,8 +2552,28 @@ class ClaudeBot(commands.Bot):
             # Strip tz for naive comparisons with our datetime.now() elsewhere
             expires_at = expires_at.replace(tzinfo=None)
         except (ValueError, AttributeError):
-            expires_at = datetime.now() + timedelta(hours=24)
-        print(f"🟢 Created Gemini cache {cache_name} (expires {expires_at:%Y-%m-%d %H:%M})")
+            expires_at = datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
+
+        # Record the creation cost. Cache creation bills the cached tokens at
+        # ~the input rate (one-time); this used to be completely untracked,
+        # which is how bookclub caching ran up a silent ~$156 bill. Storage is
+        # billed separately per token-hour over the TTL — we can't meter that
+        # from here, so log a heads-up estimate (deletion on !unload bounds it).
+        cached_tokens = int((data.get("usageMetadata") or {}).get("totalTokenCount", 0)) \
+            or material.estimated_tokens
+        self.gemini_provider.record_usage(cached_tokens, 0)
+        self.gemini_provider.total_requests += 1
+        storage_est = (
+            (cached_tokens / 1_000_000)
+            * GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR
+            * (GEMINI_CACHE_TTL_SECONDS / 3600)
+        )
+        print(
+            f"🟢 Created Gemini cache {cache_name} "
+            f"({cached_tokens:,} tok, expires {expires_at:%Y-%m-%d %H:%M}); "
+            f"~${storage_est:.2f} storage if kept its full "
+            f"{GEMINI_CACHE_TTL_SECONDS // 3600}h TTL — deleted on !unload"
+        )
         return cache_name, expires_at
 
     async def _ensure_gemini_cache(
@@ -2564,6 +2594,10 @@ class ClaudeBot(commands.Bot):
         expires = material.cache_expires_at.get("Gemini")
         if existing and expires and expires > datetime.now() + timedelta(minutes=5):
             return existing
+        # Existing handle is missing/stale — best-effort delete any old cache so
+        # we don't leave an overlapping one billing storage, then make a fresh one.
+        if existing:
+            await self._delete_gemini_cache(existing)
 
         result = await self._create_gemini_cache(
             material, system_text=system_text, tools=tools
@@ -2575,6 +2609,40 @@ class ClaudeBot(commands.Bot):
         material.cache_expires_at["Gemini"] = expires_at
         self.manager.mark_dirty()  # persist the new cache handle
         return cache_name
+
+    async def _delete_gemini_cache(self, cache_name: Optional[str]) -> bool:
+        """Delete a Gemini cachedContents entry to stop its storage billing.
+
+        Best-effort: a 404 (already expired/deleted) counts as success. Gemini
+        bills cache storage per token-hour for the whole TTL, so deleting a
+        cache the moment we're done with it is what keeps bookclub cheap."""
+        if not cache_name:
+            return False
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            return False
+        url = f"https://generativelanguage.googleapis.com/v1beta/{cache_name}"
+        headers = {"x-goog-api-key": gemini_key}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(url, headers=headers, timeout=60) as resp:
+                    if resp.status in (200, 204, 404):
+                        print(f"🗑️  Deleted Gemini cache {cache_name} (HTTP {resp.status})")
+                        return True
+                    print(f"⚠️  Gemini cache delete {cache_name}: HTTP {resp.status}: "
+                          f"{(await resp.text())[:200]}")
+                    return False
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            print(f"⚠️  Gemini cache delete network error: {e}")
+            return False
+
+    async def _drop_gemini_cache(self, material: "ReadingMaterial") -> None:
+        """Delete a material's live Gemini cache (if any) and clear its handle."""
+        cache_name = material.cache_handles.pop("Gemini", None)
+        material.cache_expires_at.pop("Gemini", None)
+        if cache_name:
+            await self._delete_gemini_cache(cache_name)
+            self.manager.mark_dirty()
 
     URL_PATTERN = re.compile(r'https?://[^\s\)\]<>\"\'`]+[^\s\.\,\)\]<>\"\'`:]')
     URL_EXTRACT_MAX = 3
@@ -4555,6 +4623,7 @@ class ClaudeBot(commands.Bot):
             if material is None:
                 await message.channel.send("Nothing loaded in this channel.")
             else:
+                await self._drop_gemini_cache(material)  # stop cache storage billing
                 self.manager.mark_dirty()
                 await self.manager.save_memories_async(providers=self.providers)
                 await message.channel.send(f"📤 Unloaded **{material.title}**.")
@@ -4701,6 +4770,7 @@ class ClaudeBot(commands.Bot):
             if scoped is None:
                 await message.channel.send("This thread isn't scoped.")
             else:
+                await self._drop_gemini_cache(scoped)  # stop cache storage billing
                 self.manager.mark_dirty()
                 await self.manager.save_memories_async(providers=self.providers)
                 await message.channel.send(
