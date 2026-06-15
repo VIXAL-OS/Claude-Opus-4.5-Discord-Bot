@@ -297,6 +297,12 @@ class ModelProvider:
     total_output_tokens_above_tier: int = 0
     total_cached_input_tokens_above_tier: int = 0
 
+    # Estimated cache-storage cost. Gemini context caches bill per token-hour for
+    # their whole TTL — a time-based charge we can't meter per request — so this
+    # is an upper-bound estimate accumulated at cache creation and surfaced in
+    # !cost (see _create_gemini_cache / get_cost_summary).
+    total_cache_storage_cost_est: float = 0.0
+
     def record_usage(
         self,
         input_tokens: int,
@@ -362,6 +368,7 @@ class ModelProvider:
             "output_tokens_above_tier": self.total_output_tokens_above_tier,
             "cached_input_tokens_above_tier": self.total_cached_input_tokens_above_tier,
             "requests": self.total_requests,
+            "cache_storage_cost_est": self.total_cache_storage_cost_est,
         }
 
     def load_stats(self, data: dict) -> None:
@@ -372,6 +379,7 @@ class ModelProvider:
         self.total_output_tokens_above_tier = data.get("output_tokens_above_tier", 0)
         self.total_cached_input_tokens_above_tier = data.get("cached_input_tokens_above_tier", 0)
         self.total_requests = data.get("requests", 0)
+        self.total_cache_storage_cost_est = data.get("cache_storage_cost_est", 0.0)
 
 
 @dataclass
@@ -1210,12 +1218,15 @@ class ConversationManager:
         """Get total cost summary across all models, including cache hit rate."""
         lines = ["💰 **Cost Summary**"]
         grand_total = 0.0
+        storage_total = 0.0
 
         for p in providers:
-            if p.total_requests == 0:
+            storage_est = p.total_cache_storage_cost_est
+            if p.total_requests == 0 and storage_est == 0.0:
                 continue
             cost = p.get_cost()
             grand_total += cost
+            storage_total += storage_est
 
             # Sum uncached + cached across both pricing tiers
             uncached_in = p.total_input_tokens + p.total_input_tokens_above_tier
@@ -1234,11 +1245,23 @@ class ConversationManager:
                 f"{uncached_in:,} in + {out_tokens:,} out{cache_note} = "
                 f"${cost:.4f}"
             )
+            if storage_est > 0:
+                lines.append(
+                    f"      ⏳ + ~${storage_est:.4f} est. Gemini cache storage "
+                    f"(time-based, separate from tokens)"
+                )
 
-        if grand_total == 0:
+        if grand_total == 0 and storage_total == 0:
             return "💰 No API calls made yet."
 
-        lines.append(f"\n  **Total**: ${grand_total:.4f}")
+        if storage_total > 0:
+            lines.append(
+                f"\n  **Total**: ${grand_total:.4f} tokens "
+                f"+ ~${storage_total:.4f} cache storage (est) "
+                f"= **~${grand_total + storage_total:.4f}**"
+            )
+        else:
+            lines.append(f"\n  **Total**: ${grand_total:.4f}")
         return "\n".join(lines)
     
     def save_memories(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:
@@ -2527,6 +2550,10 @@ class ClaudeBot(commands.Bot):
             body["systemInstruction"] = {"parts": [{"text": system_text}]}
         if tools:
             body["tools"] = tools
+        print(
+            f"📤 Uploading '{material.title}' (~{material.estimated_tokens:,} tokens) "
+            f"to a Gemini context cache (TTL {GEMINI_CACHE_TTL_SECONDS // 3600}h)…"
+        )
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, headers=headers, json=body, timeout=180) as resp:
@@ -2568,6 +2595,7 @@ class ClaudeBot(commands.Bot):
             * GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR
             * (GEMINI_CACHE_TTL_SECONDS / 3600)
         )
+        self.gemini_provider.total_cache_storage_cost_est += storage_est
         print(
             f"🟢 Created Gemini cache {cache_name} "
             f"({cached_tokens:,} tok, expires {expires_at:%Y-%m-%d %H:%M}); "
@@ -2643,6 +2671,14 @@ class ClaudeBot(commands.Bot):
         if cache_name:
             await self._delete_gemini_cache(cache_name)
             self.manager.mark_dirty()
+
+    async def _set_reading_material(self, key: int, material: "ReadingMaterial") -> None:
+        """Pin a reading material to a channel/thread key, first dropping any prior
+        material's Gemini cache so we don't orphan it (the !load-over-a-load leak)."""
+        old = self.manager.reading_materials.get(key)
+        if old is not None and old is not material:
+            await self._drop_gemini_cache(old)
+        self.manager.reading_materials[key] = material
 
     URL_PATTERN = re.compile(r'https?://[^\s\)\]<>\"\'`]+[^\s\.\,\)\]<>\"\'`:]')
     URL_EXTRACT_MAX = 3
@@ -4481,7 +4517,7 @@ class ClaudeBot(commands.Bot):
                 else:
                     cant_fit.append(f"{p.name} ({p.max_context_tokens:,} ctx)")
 
-            self.manager.reading_materials[channel_id] = material
+            await self._set_reading_material(channel_id, material)
             self.manager.mark_dirty()
             # Force an immediate save so a hard restart in the next 60s
             # doesn't lose the load. Non-blocking — runs in a worker thread.
@@ -4599,7 +4635,7 @@ class ClaudeBot(commands.Bot):
                 else:
                     cant_fit.append(f"{p.name} ({p.max_context_tokens:,} ctx)")
 
-            self.manager.reading_materials[channel_id] = material
+            await self._set_reading_material(channel_id, material)
             self.manager.mark_dirty()
             # Force an immediate save so a hard restart in the next 60s
             # doesn't lose the load. Non-blocking — runs in a worker thread.
@@ -4742,7 +4778,7 @@ class ClaudeBot(commands.Bot):
             scoped = self._slice_material_to_chapters(
                 parent_material, start_ch, end_ch
             )
-            self.manager.reading_materials[message.channel.id] = scoped
+            await self._set_reading_material(message.channel.id, scoped)
             self.manager.mark_dirty()
             await self.manager.save_memories_async(providers=self.providers)
 
