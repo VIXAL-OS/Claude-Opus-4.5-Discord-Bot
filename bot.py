@@ -1407,6 +1407,13 @@ class ClaudeBot(commands.Bot):
         # Per-channel model preferences
         self.channel_preferences: dict[int, str] = {}
 
+        # Research panel (!research): which providers form the panel and who
+        # judges. Names must match ModelProvider.name. Defaults reuse models we
+        # already pay for — no GPT. (Fable 5 is intentionally omitted: not
+        # generally accessible yet.) Disabled members are skipped at runtime.
+        self.panel_members: list[str] = ["Claude", "Gemini", "Deepseek"]
+        self.panel_judge: str = "Claude"
+
         # Reasoning cache for thinking-mode multi-turn (keyed by Discord msg.id).
         # Deepseek requires reasoning_content to be echoed back on every prior
         # assistant turn whenever thinking mode is enabled on the current call.
@@ -3331,13 +3338,40 @@ class ClaudeBot(commands.Bot):
                 reading_material=reading_material,
             )
 
-        # Claude path (default) — with organic web search capability
+        # Claude path (default) — delegated to _generate_claude_response so the
+        # research panel and judge can reuse Claude with the same tool / thinking
+        # / cache machinery. The implementation lives in that method below.
+        return await self._generate_claude_response(
+            guild_id,
+            messages,
+            system,
+            thinking=thinking,
+            effort=effort,
+            reading_material=reading_material,
+        )
+
+    async def _generate_claude_response(
+        self,
+        guild_id: int,
+        messages: list[dict],
+        system: str,
+        thinking: bool = False,
+        effort: Optional[str] = None,
+        reading_material: Optional["ReadingMaterial"] = None,
+        tools: Optional[list] = None,
+    ) -> tuple[str, list[str], str]:
+        """Generate a response from Claude via the native Anthropic SDK.
+
+        Extracted from _generate_response so other call sites (the research
+        panel/judge) can call Claude directly. tools=None gives Claude its
+        default web_search tool; pass tools=[] to disable web search (e.g. the
+        judge synthesis step). Returns (response_text, reactions, reasoning).
+        """
+        # Default to giving Claude the web search tool; [] disables it.
+        if tools is None:
+            tools = [{"type": "web_search_20250305", "name": "web_search"}]
+
         try:
-            # Give Claude the web search tool so it can search organically
-            claude_tools = [{
-                "type": "web_search_20250305",
-                "name": "web_search"
-            }]
 
             # When a reading material is loaded, send system as a list of
             # blocks with cache_control on the (very large) fic block. The
@@ -3361,8 +3395,9 @@ class ClaudeBot(commands.Bot):
                 "model": self.claude_provider.model_id,
                 "max_tokens": self.claude_provider.max_tokens,
                 "system": claude_system,
-                "tools": claude_tools,
             }
+            if tools:
+                claude_kwargs["tools"] = tools
             if thinking:
                 # Adaptive thinking on Opus 4.8: model decides depth; effort
                 # controls overall thinking/acting budget. effort=None falls
@@ -3475,6 +3510,106 @@ class ClaudeBot(commands.Bot):
             return f"Claude Error {e.status_code}: {e.message}", [], ""
         except anthropic.APIError as e:
             return f"Claude Error: {e}", [], ""
+
+    async def _panel_complete(
+        self,
+        provider: ModelProvider,
+        guild_id: int,
+        messages: list[dict],
+        system: str,
+        *,
+        claude_tools: Optional[list] = None,
+    ) -> str:
+        """Run one model (panel member or judge) on a shared prompt; return its text.
+
+        Reuses the normal per-provider generation paths so usage/cost tracking and
+        each provider's own web search come along for free. claude_tools is
+        forwarded only on the Claude path — pass [] to disable Claude's web search
+        (used for the judge so it synthesises rather than re-researches)."""
+        if provider is self.claude_provider:
+            text, _, _ = await self._generate_claude_response(
+                guild_id, messages, system, tools=claude_tools,
+            )
+            return text
+        client = self.openai_compatible_clients.get(provider.name)
+        if client is None:
+            raise RuntimeError(f"no OpenAI-compatible client for {provider.name}")
+        text, _, _ = await self._generate_openai_compatible_response(
+            client, provider, guild_id, messages, system,
+        )
+        return text
+
+    @staticmethod
+    def _is_provider_error(provider: ModelProvider, text: str) -> bool:
+        """True if text is one of our own error sentinels, not a real answer.
+
+        The generation helpers return error STRINGS (not exceptions) on API
+        failure, so the panel has to recognise them to drop a failed member."""
+        if not text or not text.strip():
+            return True
+        head = text.lstrip()
+        return (
+            head.startswith(f"{provider.name} Error")
+            or head.startswith("Claude Error")
+            or head.startswith("⚠️ Claude returned")
+        )
+
+    async def _run_panel(
+        self,
+        guild_id: int,
+        messages: list[dict],
+        system: str,
+        members: list[ModelProvider],
+    ) -> list[tuple[ModelProvider, str]]:
+        """Fan a shared prompt out to every panel member concurrently.
+
+        Fault-tolerant: a member that raises, errors, or returns empty is dropped
+        (logged) rather than killing the panel. Returns [(provider, answer), ...]
+        for survivors, in the members' original order."""
+        async def run_one(provider: ModelProvider):
+            try:
+                text = await self._panel_complete(provider, guild_id, list(messages), system)
+            except Exception as e:
+                print(f"⚠️  Panel member {provider.name} raised: {e}")
+                return provider, None
+            if self._is_provider_error(provider, text):
+                print(f"⚠️  Panel member {provider.name} failed: {text[:120]!r}")
+                return provider, None
+            return provider, text.strip()
+
+        results = await asyncio.gather(*(run_one(p) for p in members))
+        return [(p, t) for p, t in results if t]
+
+    async def _judge(
+        self,
+        guild_id: int,
+        query: str,
+        answers: list[tuple[ModelProvider, str]],
+        judge: ModelProvider,
+    ) -> str:
+        """Have the judge model synthesise the panel's answers into one verdict."""
+        panel_block = "\n\n".join(
+            f"### Answer from {p.name}\n{text}" for p, text in answers
+        )
+        judge_system = (
+            "You are the judge of a panel of AI models that independently answered a "
+            "research question. You are given the question and each model's answer. Do NOT "
+            "simply concatenate or average them. Compare them critically: where they agree, "
+            "treat the claim as higher-confidence; where they conflict, resolve it and say "
+            "why; flag claims that look unsupported. Produce ONE authoritative, well-structured "
+            "answer that is better than any single input. Attribute a contested or non-obvious "
+            "claim to the model(s) it came from only when that helps the reader judge "
+            "reliability. Don't mention being a judge or narrate your process — just give the "
+            "answer."
+        )
+        judge_messages = [{
+            "role": "user",
+            "content": f"Research question:\n{query}\n\nPanel answers:\n\n{panel_block}",
+        }]
+        # Disable Claude's web search for judging — synthesise from answers given.
+        return await self._panel_complete(
+            judge, guild_id, judge_messages, judge_system, claude_tools=[],
+        )
 
     async def _web_search(
         self,
@@ -4023,6 +4158,80 @@ class ClaudeBot(commands.Bot):
                 "*💡 Web search incurs additional token costs. Use `!cost` to check usage.*"
             )
         
+        elif cmd == "!research":
+            # Multi-model panel: every member answers independently, then a judge
+            # synthesises one answer. Reuses existing per-provider generation (so
+            # cost lands in !cost) and each member's own web search.
+            query = content[len(cmd):].strip()
+            if not query:
+                await message.channel.send(
+                    "Usage: `!research <question>`\n"
+                    "Convenes a multi-model panel — each model answers independently, then a "
+                    "judge synthesises them into one answer.\n"
+                    "⚠️ Runs several models (each may web-search) per call — roughly 3–4× the "
+                    "cost and latency of a normal reply."
+                )
+                return
+
+            members = [p for p in self.providers if p.enabled and p.name in self.panel_members]
+            if len(members) < 2:
+                enabled_names = ", ".join(p.name for p in self.providers if p.enabled) or "none"
+                await message.channel.send(
+                    f"❌ The research panel needs ≥2 enabled providers from {self.panel_members}. "
+                    f"Currently enabled: {enabled_names}."
+                )
+                return
+            judge = next(
+                (p for p in self.providers if p.name == self.panel_judge and p.enabled),
+                members[0],
+            )
+
+            await message.channel.send(
+                f"🧪 Convening panel: {', '.join(p.name for p in members)} → "
+                f"**{judge.name}** judging…"
+            )
+
+            # Shared prompt for every member: thread history with the last user
+            # turn replaced by the research question (mirrors !search).
+            history = self._strip_internal_keys(
+                await self.manager.fetch_thread_history(message.channel)
+            )
+            if history and history[-1].get("role") == "user":
+                history[-1] = {"role": "user", "content": query}
+            else:
+                history.append({"role": "user", "content": query})
+
+            member_system = (
+                "You are one member of a panel of AI models answering a research question for "
+                "a technical user. Give your best, most accurate, well-structured answer. Be "
+                "concrete, show your reasoning, and cite sources with URLs when you use the web. "
+                "Another model will synthesise the panel's answers afterward, so optimise for "
+                "correctness and completeness, and don't address the other panelists."
+            )
+
+            async with message.channel.typing():
+                answers = await self._run_panel(guild_id, history, member_system, members)
+                if not answers:
+                    await message.channel.send(
+                        "❌ Every panel member failed to respond — check `!cost` / the logs."
+                    )
+                    return
+                verdict = await self._judge(guild_id, query, answers, judge)
+
+            if self.multi_model_active:
+                verdict = f"**[Panel → {judge.name}]** {verdict}"
+            await self._send_response(message.channel, verdict)
+
+            failed = len(members) - len(answers)
+            note = (
+                f"🧪 Synthesised from {len(answers)} model(s) "
+                f"({', '.join(p.name for p, _ in answers)}) + {judge.name} judge"
+            )
+            if failed:
+                note += f"; {failed} member(s) failed"
+            note += f". Costs ~{len(answers) + 1}× a normal reply — check `!cost`."
+            await message.channel.send(f"*{note}*")
+
         elif cmd == "!summarize":
             # Manually save a thread summary to long-term memory
             # Usage: !summarize <key> <summary>  OR  just !summarize to ask Claude to summarize
@@ -4574,6 +4783,7 @@ class ClaudeBot(commands.Bot):
 `!memories` - List all memories (both types)
 `!threads` - Show other recent threads in this channel
 `!search <query>` - Web search via Claude, Deepseek, or Gemini (costs extra, ~$0.01-0.03)
+`!research <question>` - Multi-model panel + judge → one synthesised answer (~3-4× cost)
 
 **Multi-model (Hydra / MAGI):**
 `!claude <message>` / `!opus <message>` / `!balthasar <message>` - Force Claude to respond
