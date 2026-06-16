@@ -180,7 +180,7 @@ Common pitfalls to avoid in your LaTeX (these silently produce wrong-looking ren
 - Greek letters and operators always need a backslash: `\theta`, `\sigma`, `\sum`, `\int`, `\frac`. Bare `theta` will render as four italic letters.
 - Re-read your equations before sending; a stray missing `_` or `\,` is the difference between a clean render and a confusing one.
 
-**Speech (Mandarin TTS)**: You can attach spoken Mandarin audio by writing `[[speak: 汉字]]` inline — the bot synthesizes it with Azure's Xiaoxiao voice (tones forced to be correct via SSML) and attaches an MP3, replacing the marker with "汉字 🔊" in your text. Use it when teaching Chinese: explain a phrase, then let people HEAR it. You can pin the exact pronunciation by adding pinyin after a pipe: `[[speak: 你好 | nǐ hǎo]]` (tone marks or numbers both work) — prefer this when you've already written the pinyin, since it skips a step and guarantees the tones. Apply tone sandhi in the pinyin you pass (你好 → ní hǎo). Keep each clip to a short word or phrase; you can use up to ~5 in one message, e.g. a tone contrast: 妈 `[[speak:妈|mā]]`, 麻 `[[speak:麻|má]]`, 马 `[[speak:马|mǎ]]`, 骂 `[[speak:骂|mà]]`. Mandarin only.
+**Speech (Mandarin TTS)**: You can attach spoken Mandarin audio inline while teaching. Two ways: write `!speak 汉字` (the command word followed immediately by the Chinese characters) for a quick clip, or `[[speak: 汉字 | nǐ hǎo]]` to ALSO pin the exact pronunciation with pinyin (tone marks or numbers). The bot voices it with Azure's Xiaoxiao voice — tones forced correct via SSML — attaches an MP3, and replaces the marker with "汉字 🔊" in your text. Prefer the `[[speak:汉字|pinyin]]` form when you've already written the pinyin: it's faster and guarantees the tones. Apply tone sandhi in the pinyin you pass (你好 → ní hǎo). Keep each clip to a short word or phrase; up to ~8 per message, e.g. a tone contrast: 妈 `[[speak:妈|mā]]`, 麻 `[[speak:麻|má]]`, 马 `[[speak:马|mǎ]]`, 骂 `[[speak:骂|mà]]`. Mandarin only.
 
 **Images**: You can see images that users upload.
 
@@ -4061,7 +4061,7 @@ class ClaudeBot(commands.Bot):
     # letting Azure infer the tones, so the user still gets audible output.
     MANDARIN_TTS_VOICE = "zh-CN-XiaoxiaoNeural"
     MANDARIN_TTS_MAX_CHARS = 300
-    MANDARIN_SPEAK_INLINE_MAX = 5  # max [[speak:..]] clips synthesized per message
+    MANDARIN_SPEAK_INLINE_MAX = 8  # max inline speak clips synthesized per message
 
     _PINYIN_TONE_MARKS = {
         'ā': ('a', '1'), 'á': ('a', '2'), 'ǎ': ('a', '3'), 'à': ('a', '4'),
@@ -4310,6 +4310,13 @@ class ClaudeBot(commands.Bot):
     SPEAK_MARKER_RE = re.compile(
         r'\[\[\s*speak\s*:\s*([^\]|]+?)\s*(?:\|\s*([^\]]+?)\s*)?\]\]', re.IGNORECASE
     )
+    # Models naturally reach for the bare command form mid-message; normalize
+    # "!speak 汉字" (the command word + a run of CJK characters) into the
+    # [[speak:汉字]] form so both spellings flow through one renderer.
+    BANG_SPEAK_RE = re.compile(
+        r'!speak[ \t]+([一-鿿㐀-䶿　-〿＀-￯]+)',
+        re.IGNORECASE,
+    )
 
     async def _render_speak_attachments(
         self, guild_id: int, text: str, max_files: int
@@ -4319,6 +4326,7 @@ class ClaudeBot(commands.Bot):
         '汉字 🔊'; markers beyond the per-message cap (or that fail to synthesize,
         or when TTS is unconfigured) collapse to just the phrase text so users
         never see raw [[speak:..]] syntax. Returns (cleaned_text, files)."""
+        text = self.BANG_SPEAK_RE.sub(r'[[speak:\1]]', text)  # !speak 汉字 → [[speak:汉字]]
         strip = lambda: self.SPEAK_MARKER_RE.sub(lambda m: m.group(1).strip(), text)
         if max_files <= 0 or not (self.azure_tts_key and self.azure_tts_region):
             return strip(), []
