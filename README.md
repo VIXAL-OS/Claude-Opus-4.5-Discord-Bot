@@ -209,6 +209,8 @@ ANTHROPIC_API_KEY=your_anthropic_key      # Optional if Gemini or DeepSeek only
 DEEPSEEK_API_KEY=your_deepseek_key        # Optional
 GEMINI_API_KEY=your_gemini_key            # Optional
 TAVILY_API_KEY=your_tavily_key            # Optional
+AZURE_TTS_KEY=your_azure_speech_key       # Optional, Mandarin !speak (forced tones)
+AZURE_TTS_REGION=eastus                    # Optional, Azure Speech resource region
 AO3_COOKIE=                               # Optional, for bookclub mode
 ```
 

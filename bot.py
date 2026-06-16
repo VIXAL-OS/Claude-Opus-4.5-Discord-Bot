@@ -1419,6 +1419,17 @@ class ClaudeBot(commands.Bot):
             self.tavily_client = None
             print("⚪ Tavily not configured (Deepseek web search disabled)")
 
+        # Azure Neural TTS (optional — powers the Mandarin !speak command). The
+        # only mainstream backend that lets us FORCE exact tones via SSML
+        # <phoneme>, instead of letting the synthesizer infer them — the whole
+        # point for a language tutor. Free tier: 0.5M chars/month.
+        self.azure_tts_key = os.getenv("AZURE_TTS_KEY")
+        self.azure_tts_region = os.getenv("AZURE_TTS_REGION")
+        if self.azure_tts_key and self.azure_tts_region:
+            print(f"🟢 Azure Mandarin TTS enabled (region: {self.azure_tts_region})")
+        else:
+            print("⚪ Azure TTS not configured (AZURE_TTS_KEY / AZURE_TTS_REGION missing — !speak disabled)")
+
         # All providers list (for iteration). Order matters: this is the order
         # !models lists them and the order three-way routing iterates ties.
         self.providers = [
@@ -4028,7 +4039,201 @@ class ClaudeBot(commands.Bot):
             else:
                 await channel.send(chunk)
         return first_msg
-    
+
+    # --- Mandarin text-to-speech (language-teaching mode) ------------------
+    # Azure Neural TTS is the only mainstream backend that lets us PIN exact
+    # tones via SSML <phoneme> tags rather than letting the synthesizer infer
+    # them — which is the whole point for a tutor. We use the LLM as the
+    # grapheme→pinyin frontend (it already writes perfect tone-marked pinyin
+    # and resolves polyphones / tone sandhi in context — the hard part), then
+    # deterministically convert those marks to Azure's sapi pinyin (tone
+    # NUMBERS) and force them. Anything upstream failing degrades gracefully to
+    # letting Azure infer the tones, so the user still gets audible output.
+    MANDARIN_TTS_VOICE = "zh-CN-XiaoxiaoNeural"
+    MANDARIN_TTS_MAX_CHARS = 300
+
+    _PINYIN_TONE_MARKS = {
+        'ā': ('a', '1'), 'á': ('a', '2'), 'ǎ': ('a', '3'), 'à': ('a', '4'),
+        'ē': ('e', '1'), 'é': ('e', '2'), 'ě': ('e', '3'), 'è': ('e', '4'),
+        'ī': ('i', '1'), 'í': ('i', '2'), 'ǐ': ('i', '3'), 'ì': ('i', '4'),
+        'ō': ('o', '1'), 'ó': ('o', '2'), 'ǒ': ('o', '3'), 'ò': ('o', '4'),
+        'ū': ('u', '1'), 'ú': ('u', '2'), 'ǔ': ('u', '3'), 'ù': ('u', '4'),
+        'ǖ': ('v', '1'), 'ǘ': ('v', '2'), 'ǚ': ('v', '3'), 'ǜ': ('v', '4'),
+        'ü': ('v', '5'),
+    }
+
+    @classmethod
+    def _pinyin_marks_to_numbers(cls, pinyin: str) -> Optional[str]:
+        """Convert tone-marked pinyin ('nǐ hǎo') to Azure sapi pinyin with tone
+        numbers ('ni3 hao3'). Deterministic — we own this so we don't depend on
+        the model emitting the right machine format. Accepts already-numbered
+        syllables too. Returns None if the result isn't clean syllable+tone
+        tokens, in which case the caller lets Azure infer tones rather than
+        forcing a malformed pronunciation."""
+        out_syllables: list[str] = []
+        for raw in pinyin.split():
+            syl = raw.strip().strip(",.!?'’\"；;：:。，！？、")
+            if not syl:
+                continue
+            has_mark = any(ch in cls._PINYIN_TONE_MARKS for ch in syl)
+            if has_mark:
+                tone = '5'
+                chars: list[str] = []
+                for ch in syl:
+                    mapped = cls._PINYIN_TONE_MARKS.get(ch)
+                    if mapped:
+                        base, tone = mapped
+                        chars.append(base)
+                    else:
+                        chars.append(ch)
+                token = ''.join(chars) + tone
+            else:
+                # Already numbered ('ni3'), or toneless ('de') → neutral tone 5.
+                token = syl if syl[-1:].isdigit() else syl + '5'
+            token = token.replace('ü', 'v').replace('Ü', 'v').lower()
+            out_syllables.append(token)
+        if not out_syllables:
+            return None
+        if not all(re.fullmatch(r"[a-z]+[1-5]", s) for s in out_syllables):
+            return None
+        return ' '.join(out_syllables)
+
+    @classmethod
+    def _parse_g2p(cls, out: str, fallback_hanzi: str) -> dict:
+        """Parse the three-line G2P reply into a reading dict
+        {hanzi, citation, surface, surface_numbered}. Tolerant of casing and
+        stray markdown. citation/surface are tone-marked display strings (None
+        if absent); surface_numbered is the sapi pinyin we synthesize (None if
+        the surface line is missing or unconvertible, so the caller lets Azure
+        infer tones). An empty `out` yields the all-None fallback shape."""
+        def grab(label: str, s: str) -> Optional[str]:
+            m = re.match(rf'(?i)^{label}\s*[:：]\s*(.+)$', s)
+            return m.group(1).strip().strip('*`').strip() if m else None
+
+        hanzi: Optional[str] = None
+        citation: Optional[str] = None
+        surface: Optional[str] = None
+        for line in out.splitlines():
+            s = line.strip().lstrip('*`> ').strip()
+            for label in ("HANZI", "CITATION", "SURFACE"):
+                v = grab(label, s)
+                if v is not None:
+                    if label == "HANZI":
+                        hanzi = v
+                    elif label == "CITATION":
+                        citation = v
+                    else:
+                        surface = v
+                    break
+        if not hanzi:
+            hanzi = fallback_hanzi
+        # If the model gave only one pinyin form, treat it as both (no sandhi).
+        if surface and not citation:
+            citation = surface
+        if citation and not surface:
+            surface = citation
+        surface_numbered = cls._pinyin_marks_to_numbers(surface) if surface else None
+        return {
+            "hanzi": hanzi,
+            "citation": citation,
+            "surface": surface,
+            "surface_numbered": surface_numbered,
+        }
+
+    async def _mandarin_g2p(self, guild_id: int, text: str) -> dict:
+        """Use an LLM as the grapheme→phoneme frontend: turn arbitrary input
+        (Chinese characters, pinyin, or an English phrase to translate) into a
+        reading dict — hanzi, the citation (dictionary) tones, the surface tones
+        as actually spoken (tone sandhi applied), and the surface form as Azure
+        sapi pinyin (tone numbers) for synthesis. The LLM resolves polyphones
+        and sandhi in context far better than a static table — the exact failure
+        mode the !research panel flagged.
+
+        Keys: {hanzi, citation, surface, surface_numbered}. citation/surface are
+        tone-marked strings for display (may be None); surface_numbered is what
+        we feed Azure (None → let Azure infer tones). Prefers Deepseek
+        (Chinese-native) then Claude then Gemini. Lands in !cost via the normal
+        generation path."""
+        provider = next(
+            (p for p in (self.deepseek_provider, self.claude_provider, self.gemini_provider)
+             if p.enabled),
+            None,
+        )
+        if provider is None:
+            return self._parse_g2p("", fallback_hanzi=text)
+        system = (
+            "You are the pronunciation frontend for a Mandarin text-to-speech engine and a "
+            "pinyin tutor. Convert the user's input to Mandarin Chinese. The input may be "
+            "Chinese characters, pinyin, or an English phrase to translate. Reply with "
+            "EXACTLY these three lines and nothing else — no markdown, no translation, no "
+            "commentary:\n"
+            "HANZI: <the Chinese characters only>\n"
+            "CITATION: <space-separated syllables with tone marks — the DICTIONARY tone of "
+            "each syllable in isolation, with NO tone sandhi applied>\n"
+            "SURFACE: <the same syllables with tone marks, but WITH tone sandhi applied as "
+            "the phrase is actually spoken>\n"
+            "For example, for the input 你好 you output exactly:\n"
+            "HANZI: 你好\n"
+            "CITATION: nǐ hǎo\n"
+            "SURFACE: ní hǎo\n"
+            "Apply sandhi only where it really occurs: for 谢谢, CITATION and SURFACE are "
+            "identical (xiè xie). Common cases: 3rd+3rd → 2nd+3rd (你好 → ní hǎo); 不 bù → bú "
+            "before a 4th tone (不是 → bú shì); 一 yī → yí/yì depending on the next tone."
+        )
+        messages = [{"role": "user", "content": text}]
+        try:
+            out = await self._panel_complete(provider, guild_id, messages, system)
+        except Exception as e:
+            print(f"⚠️  Mandarin G2P failed: {e}")
+            return self._parse_g2p("", fallback_hanzi=text)
+        if self._is_provider_error(provider, out):
+            return self._parse_g2p("", fallback_hanzi=text)
+        return self._parse_g2p(out, fallback_hanzi=text)
+
+    @classmethod
+    def _build_mandarin_ssml(cls, hanzi: str, pinyin_numbered: Optional[str]) -> str:
+        """Wrap text in zh-CN SSML. When we have numbered pinyin, force the
+        pronunciation with a <phoneme alphabet="sapi"> tag so the tones are
+        exactly what we specify instead of whatever Azure's frontend guesses."""
+        inner = _html.escape(hanzi)
+        if pinyin_numbered:
+            ph = _html.escape(pinyin_numbered, quote=True)
+            inner = f'<phoneme alphabet="sapi" ph="{ph}">{inner}</phoneme>'
+        return (
+            '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+            'xml:lang="zh-CN">'
+            f'<voice name="{cls.MANDARIN_TTS_VOICE}">{inner}</voice>'
+            '</speak>'
+        )
+
+    async def _azure_tts(self, ssml: str) -> Optional[bytes]:
+        """POST SSML to Azure Speech and return MP3 bytes (or None on failure)."""
+        if not (self.azure_tts_key and self.azure_tts_region):
+            return None
+        url = (
+            f"https://{self.azure_tts_region}.tts.speech.microsoft.com"
+            "/cognitiveservices/v1"
+        )
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.azure_tts_key,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "audio-24khz-48kbitrate-mono-mp3",
+            "User-Agent": "OpusDeipseekBot",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, headers=headers, data=ssml.encode("utf-8")
+                ) as resp:
+                    if resp.status != 200:
+                        body = (await resp.text())[:200]
+                        print(f"⚠️  Azure TTS HTTP {resp.status}: {body}")
+                        return None
+                    return await resp.read()
+        except Exception as e:
+            print(f"⚠️  Azure TTS request failed: {e}")
+            return None
+
     async def _handle_command(self, message: discord.Message) -> None:
         """Handle bot commands."""
         content = message.content.strip()
@@ -4335,6 +4540,67 @@ class ClaudeBot(commands.Bot):
                 note += f"; {failed} member(s) failed"
             note += f". Costs ~{len(answers) + 1}× a normal reply — check `!cost`."
             await message.channel.send(f"*{note}*")
+
+        elif cmd == "!speak":
+            # Mandarin text-to-speech for language-teaching mode. The LLM acts as
+            # the grapheme→pinyin frontend; we force those tones into Azure
+            # Xiaoxiao via SSML <phoneme> and attach the MP3 (mirrors the LaTeX
+            # PNG path). See _mandarin_g2p / _build_mandarin_ssml / _azure_tts.
+            text = content[len(cmd):].strip()
+            if not text:
+                await message.channel.send(
+                    "Usage: `!speak <chinese / pinyin / phrase to say>`\n"
+                    "Synthesizes Mandarin with the tones forced from pinyin (Azure Xiaoxiao) "
+                    "and attaches an MP3 you can play.\n"
+                    "Examples: `!speak 你好`, `!speak wǒ ài nǐ`, `!speak how do you say thank you`"
+                )
+                return
+            if not (self.azure_tts_key and self.azure_tts_region):
+                await message.channel.send(
+                    "❌ Mandarin TTS isn't configured. Set `AZURE_TTS_KEY` and `AZURE_TTS_REGION` "
+                    "(e.g. `eastus`) in `.env` — Azure's free tier covers 0.5M chars/month."
+                )
+                return
+            if len(text) > self.MANDARIN_TTS_MAX_CHARS:
+                await message.channel.send(
+                    f"❌ That's a bit long for a clip (>{self.MANDARIN_TTS_MAX_CHARS} chars). "
+                    "Try a shorter phrase."
+                )
+                return
+
+            async with message.channel.typing():
+                reading = await self._mandarin_g2p(guild_id, text)
+                hanzi = reading["hanzi"]
+                surface_numbered = reading["surface_numbered"]
+                audio = await self._azure_tts(self._build_mandarin_ssml(hanzi, surface_numbered))
+                if audio is None and surface_numbered is not None:
+                    # Forced-tone SSML may have been rejected (odd syllable);
+                    # retry letting Azure infer tones so the user still gets audio.
+                    print("⚠️  Forced-tone TTS failed; retrying with inferred tones.")
+                    audio = await self._azure_tts(self._build_mandarin_ssml(hanzi, None))
+
+            if audio is None:
+                await message.channel.send(
+                    "❌ TTS synthesis failed — check the logs and that `AZURE_TTS_KEY` / "
+                    "`AZURE_TTS_REGION` are valid."
+                )
+                return
+
+            # Caption: hanzi + pinyin. The audio follows the spoken (sandhi)
+            # form; show the dictionary (citation) form alongside it when they
+            # differ so learners get both — collapse to one line when there's no
+            # sandhi (e.g. 谢谢) so we don't show a pointless duplicate.
+            citation = reading["citation"]
+            surface = reading["surface"]
+            caption = f"🔊 **{hanzi}**"
+            if surface and citation and surface != citation:
+                caption += f"\n**Spoken:** `{surface}`  ·  **Dictionary:** `{citation}`"
+            elif surface or citation:
+                caption += f"\n`{surface or citation}`"
+            await message.channel.send(
+                caption,
+                file=discord.File(io.BytesIO(audio), filename="speak.mp3"),
+            )
 
         elif cmd == "!summarize":
             # Manually save a thread summary to long-term memory
@@ -4890,6 +5156,7 @@ class ClaudeBot(commands.Bot):
 `!threads` - Show other recent threads in this channel
 `!search <query>` - Web search via Claude, Deepseek, or Gemini (costs extra, ~$0.01-0.03)
 `!research <question>` - Multi-model panel + judge → one synthesised answer (~3-4× cost)
+`!speak <chinese / pinyin / phrase>` - Mandarin TTS with tones forced from pinyin → MP3 (Azure Xiaoxiao; needs AZURE_TTS_KEY)
 
 **Multi-model (Hydra / MAGI):**
 `!claude <message>` / `!opus <message>` / `!balthasar <message>` - Force Claude to respond
