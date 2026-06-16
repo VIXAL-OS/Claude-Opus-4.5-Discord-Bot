@@ -180,7 +180,7 @@ Common pitfalls to avoid in your LaTeX (these silently produce wrong-looking ren
 - Greek letters and operators always need a backslash: `\theta`, `\sigma`, `\sum`, `\int`, `\frac`. Bare `theta` will render as four italic letters.
 - Re-read your equations before sending; a stray missing `_` or `\,` is the difference between a clean render and a confusing one.
 
-**Speech (Mandarin TTS)**: You can attach spoken Mandarin audio inline while teaching. Two ways: write `!speak 汉字` (the command word followed immediately by the Chinese characters) for a quick clip, or `[[speak: 汉字 | nǐ hǎo]]` to ALSO pin the exact pronunciation with pinyin (tone marks or numbers). The bot voices it with Azure's Xiaoxiao voice — tones forced correct via SSML — attaches an MP3, and replaces the marker with "汉字 🔊" in your text. Prefer the `[[speak:汉字|pinyin]]` form when you've already written the pinyin: it's faster and guarantees the tones. Apply tone sandhi in the pinyin you pass (你好 → ní hǎo). Keep each clip to a short word or phrase; up to ~8 per message, e.g. a tone contrast: 妈 `[[speak:妈|mā]]`, 麻 `[[speak:麻|má]]`, 马 `[[speak:马|mǎ]]`, 骂 `[[speak:骂|mà]]`. Mandarin only.
+**Speech (Mandarin TTS)**: You can attach spoken Mandarin audio inline while teaching — just write `!speak 汉字` (the command word followed immediately by the Chinese characters). The bot voices it with Azure's Xiaoxiao voice (tones forced correct via SSML), attaches an MP3, and rewrites the marker as "汉字 (spoken `pīnyīn` · dict. `pīnyīn`) 🔊" — it computes and appends the correct, sandhi-aware pinyin (both the spoken form and the dictionary form) for you. So you do NOT need to hand-write the pinyin next to a phrase you're speaking — let the bot be the source of truth; this avoids tone-mark mistakes. Up to ~8 clips per message, e.g. a tone contrast: !speak 妈, !speak 麻, !speak 马, !speak 骂. If you ever need to override the pronunciation, use `[[speak: 汉字 | nǐ hǎo]]` to pin exact pinyin (tone marks or numbers). Mandarin only.
 
 **Images**: You can see images that users upload.
 
@@ -4318,6 +4318,20 @@ class ClaudeBot(commands.Bot):
         re.IGNORECASE,
     )
 
+    @staticmethod
+    def _inline_pinyin_annot(reading: dict) -> str:
+        """Compact pinyin annotation for an inline speak clip: the spoken
+        (sandhi) and dictionary (citation) forms, collapsing to one when there's
+        no sandhi. Empty string if no pinyin is available. This makes the bot —
+        not the model's hand-typing — the source of truth for the pinyin."""
+        surface = reading.get("surface")
+        citation = reading.get("citation")
+        if surface and citation and surface != citation:
+            return f" (spoken `{surface}` · dict. `{citation}`)"
+        if surface or citation:
+            return f" (`{surface or citation}`)"
+        return ""
+
     async def _render_speak_attachments(
         self, guild_id: int, text: str, max_files: int
     ) -> tuple[str, list[discord.File]]:
@@ -4335,22 +4349,21 @@ class ClaudeBot(commands.Bot):
             return text, []
         synth = matches[:min(max_files, self.MANDARIN_SPEAK_INLINE_MAX)]
 
-        async def one(m: re.Match) -> Optional[bytes]:
+        async def one(m: re.Match) -> tuple[Optional[bytes], dict]:
             hanzi = m.group(1).strip()[:self.MANDARIN_TTS_MAX_CHARS]
             py = (m.group(2) or "").strip() or None
-            audio, _ = await self._synthesize_mandarin(guild_id, hanzi, pinyin=py)
-            return audio
-        audios = await asyncio.gather(*(one(m) for m in synth))
+            return await self._synthesize_mandarin(guild_id, hanzi, pinyin=py)
+        results = await asyncio.gather(*(one(m) for m in synth))
 
         files: list[discord.File] = []
         out: list[str] = []
         last = 0
-        for m, audio in zip(synth, audios):
+        for m, (audio, reading) in zip(synth, results):
             out.append(text[last:m.start()])
             hanzi = m.group(1).strip()
             if audio is not None:
                 files.append(discord.File(io.BytesIO(audio), filename=f"speak_{len(files)+1}.mp3"))
-                out.append(f"{hanzi} 🔊")
+                out.append(f"{hanzi}{self._inline_pinyin_annot(reading)} 🔊")
             else:
                 out.append(hanzi)
             last = m.end()
@@ -5275,7 +5288,7 @@ class ClaudeBot(commands.Bot):
 `!search <query>` - Web search via Claude, Deepseek, or Gemini (costs extra, ~$0.01-0.03)
 `!research <question>` - Multi-model panel + judge → one synthesised answer (~3-4× cost)
 `!speak <chinese / pinyin / phrase>` - Mandarin TTS with tones forced from pinyin → MP3 (Azure Xiaoxiao; needs AZURE_TTS_KEY)
-   (models can also voice phrases inline while teaching, via `[[speak:汉字]]`)
+   (models can also voice phrases inline while teaching, via `!speak 汉字`)
 
 **Multi-model (Hydra / MAGI):**
 `!claude <message>` / `!opus <message>` / `!balthasar <message>` - Force Claude to respond
