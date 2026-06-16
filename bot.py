@@ -180,6 +180,8 @@ Common pitfalls to avoid in your LaTeX (these silently produce wrong-looking ren
 - Greek letters and operators always need a backslash: `\theta`, `\sigma`, `\sum`, `\int`, `\frac`. Bare `theta` will render as four italic letters.
 - Re-read your equations before sending; a stray missing `_` or `\,` is the difference between a clean render and a confusing one.
 
+**Speech (Mandarin TTS)**: You can attach spoken Mandarin audio by writing `[[speak: 汉字]]` inline — the bot synthesizes it with Azure's Xiaoxiao voice (tones forced to be correct via SSML) and attaches an MP3, replacing the marker with "汉字 🔊" in your text. Use it when teaching Chinese: explain a phrase, then let people HEAR it. You can pin the exact pronunciation by adding pinyin after a pipe: `[[speak: 你好 | nǐ hǎo]]` (tone marks or numbers both work) — prefer this when you've already written the pinyin, since it skips a step and guarantees the tones. Apply tone sandhi in the pinyin you pass (你好 → ní hǎo). Keep each clip to a short word or phrase; you can use up to ~5 in one message, e.g. a tone contrast: 妈 `[[speak:妈|mā]]`, 麻 `[[speak:麻|má]]`, 马 `[[speak:马|mǎ]]`, 骂 `[[speak:骂|mà]]`. Mandarin only.
+
 **Images**: You can see images that users upload.
 
 **Thread awareness**: You can see other recent threads in this channel. Use this for context about what the team has been working on, but DON'T write notes about other threads - that context is fetched fresh each time.
@@ -1868,6 +1870,14 @@ class ClaudeBot(commands.Bot):
         # with code files.
         latex_files = self._render_latex_attachments(response, max_files=10 - len(files))
         files.extend(latex_files)
+
+        # Render inline [[speak:...]] markers to Mandarin TTS attachments so the
+        # models can voice their own lessons. Shares the 10-attachment budget
+        # with code + LaTeX files; strips the markers from the visible text.
+        response, speak_files = await self._render_speak_attachments(
+            message.guild.id, response, max_files=10 - len(files)
+        )
+        files.extend(speak_files)
 
         # Send response (handle Discord's 2000 char limit)
         sent_msg = await self._send_response(thread, response, files)
@@ -4051,6 +4061,7 @@ class ClaudeBot(commands.Bot):
     # letting Azure infer the tones, so the user still gets audible output.
     MANDARIN_TTS_VOICE = "zh-CN-XiaoxiaoNeural"
     MANDARIN_TTS_MAX_CHARS = 300
+    MANDARIN_SPEAK_INLINE_MAX = 5  # max [[speak:..]] clips synthesized per message
 
     _PINYIN_TONE_MARKS = {
         'ā': ('a', '1'), 'á': ('a', '2'), 'ǎ': ('a', '3'), 'à': ('a', '4'),
@@ -4190,19 +4201,49 @@ class ClaudeBot(commands.Bot):
             return self._parse_g2p("", fallback_hanzi=text)
         return self._parse_g2p(out, fallback_hanzi=text)
 
+    @staticmethod
+    def _is_han(ch: str) -> bool:
+        """True for a CJK ideograph (one Mandarin syllable). Used to pair Han
+        characters 1:1 with pinyin syllables when building forced-tone SSML."""
+        return '一' <= ch <= '鿿' or '㐀' <= ch <= '䶿'
+
     @classmethod
     def _build_mandarin_ssml(cls, hanzi: str, pinyin_numbered: Optional[str]) -> str:
-        """Wrap text in zh-CN SSML. When we have numbered pinyin, force the
-        pronunciation with a <phoneme alphabet="sapi"> tag so the tones are
-        exactly what we specify instead of whatever Azure's frontend guesses."""
-        inner = _html.escape(hanzi)
+        """Wrap text in zh-CN SSML. When we have numbered pinyin that lines up
+        1:1 with the Han characters, force the pronunciation with one
+        <phoneme alphabet="sapi"> tag PER SYLLABLE.
+
+        Azure's sapi pinyin is fussy (verified against the live API): it wants a
+        SPACE before the tone digit ('ni 3', not 'ni3') and a separate <phoneme>
+        tag per syllable — a single tag with 'ni3 hao3' is rejected HTTP 400. If
+        the syllable count doesn't match the Han-character count (punctuation is
+        fine; think loanwords, digits, erhua merges), fall back to plain text and
+        let Azure infer the tones rather than emit mismatched SSML."""
+        body: Optional[str] = None
         if pinyin_numbered:
-            ph = _html.escape(pinyin_numbered, quote=True)
-            inner = f'<phoneme alphabet="sapi" ph="{ph}">{inner}</phoneme>'
+            syllables = pinyin_numbered.split()
+            han = [c for c in hanzi if cls._is_han(c)]
+            if syllables and len(han) == len(syllables):
+                parts: list[str] = []
+                it = iter(syllables)
+                for ch in hanzi:
+                    if cls._is_han(ch):
+                        syl = next(it)
+                        m = re.fullmatch(r'([a-z]+)([1-5])', syl)
+                        ph = f"{m.group(1)} {m.group(2)}" if m else syl
+                        parts.append(
+                            f'<phoneme alphabet="sapi" ph="{_html.escape(ph, quote=True)}">'
+                            f'{_html.escape(ch)}</phoneme>'
+                        )
+                    else:
+                        parts.append(_html.escape(ch))
+                body = ''.join(parts)
+        if body is None:
+            body = _html.escape(hanzi)
         return (
             '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
             'xml:lang="zh-CN">'
-            f'<voice name="{cls.MANDARIN_TTS_VOICE}">{inner}</voice>'
+            f'<voice name="{cls.MANDARIN_TTS_VOICE}">{body}</voice>'
             '</speak>'
         )
 
@@ -4233,6 +4274,82 @@ class ClaudeBot(commands.Bot):
         except Exception as e:
             print(f"⚠️  Azure TTS request failed: {e}")
             return None
+
+    async def _synthesize_mandarin(
+        self, guild_id: int, text: str, pinyin: Optional[str] = None
+    ) -> tuple[Optional[bytes], dict]:
+        """Synthesize one Mandarin phrase → (mp3_bytes_or_None, reading_dict).
+
+        If pinyin is supplied (tone marks or numbers — e.g. from an inline
+        [[speak:汉字|pinyin]] marker), use it directly and skip the G2P LLM call;
+        otherwise run the LLM frontend. Tones are forced via SSML, retrying with
+        inferred tones if Azure rejects the forced pronunciation. Shared by the
+        !speak command and the inline [[speak:..]] renderer."""
+        if pinyin:
+            reading = {
+                "hanzi": text,
+                "citation": pinyin,
+                "surface": pinyin,
+                "surface_numbered": self._pinyin_marks_to_numbers(pinyin),
+            }
+        else:
+            reading = await self._mandarin_g2p(guild_id, text)
+        hanzi = reading["hanzi"]
+        surface_numbered = reading["surface_numbered"]
+        audio = await self._azure_tts(self._build_mandarin_ssml(hanzi, surface_numbered))
+        if audio is None and surface_numbered is not None:
+            # Forced-tone SSML may have been rejected (odd syllable); retry
+            # letting Azure infer tones so the user still gets audio.
+            print("⚠️  Forced-tone TTS failed; retrying with inferred tones.")
+            audio = await self._azure_tts(self._build_mandarin_ssml(hanzi, None))
+        return audio, reading
+
+    # Inline directive the models can emit to attach spoken Mandarin:
+    #   [[speak:汉字]]            → bot runs G2P then synthesizes
+    #   [[speak:汉字|nǐ hǎo]]     → bot uses the given pinyin (tone marks/numbers)
+    SPEAK_MARKER_RE = re.compile(
+        r'\[\[\s*speak\s*:\s*([^\]|]+?)\s*(?:\|\s*([^\]]+?)\s*)?\]\]', re.IGNORECASE
+    )
+
+    async def _render_speak_attachments(
+        self, guild_id: int, text: str, max_files: int
+    ) -> tuple[str, list[discord.File]]:
+        """Turn inline [[speak:汉字]] / [[speak:汉字|pinyin]] markers into MP3
+        attachments. Each synthesized marker is replaced in the text by
+        '汉字 🔊'; markers beyond the per-message cap (or that fail to synthesize,
+        or when TTS is unconfigured) collapse to just the phrase text so users
+        never see raw [[speak:..]] syntax. Returns (cleaned_text, files)."""
+        strip = lambda: self.SPEAK_MARKER_RE.sub(lambda m: m.group(1).strip(), text)
+        if max_files <= 0 or not (self.azure_tts_key and self.azure_tts_region):
+            return strip(), []
+        matches = list(self.SPEAK_MARKER_RE.finditer(text))
+        if not matches:
+            return text, []
+        synth = matches[:min(max_files, self.MANDARIN_SPEAK_INLINE_MAX)]
+
+        async def one(m: re.Match) -> Optional[bytes]:
+            hanzi = m.group(1).strip()[:self.MANDARIN_TTS_MAX_CHARS]
+            py = (m.group(2) or "").strip() or None
+            audio, _ = await self._synthesize_mandarin(guild_id, hanzi, pinyin=py)
+            return audio
+        audios = await asyncio.gather(*(one(m) for m in synth))
+
+        files: list[discord.File] = []
+        out: list[str] = []
+        last = 0
+        for m, audio in zip(synth, audios):
+            out.append(text[last:m.start()])
+            hanzi = m.group(1).strip()
+            if audio is not None:
+                files.append(discord.File(io.BytesIO(audio), filename=f"speak_{len(files)+1}.mp3"))
+                out.append(f"{hanzi} 🔊")
+            else:
+                out.append(hanzi)
+            last = m.end()
+        out.append(text[last:])
+        # Markers past the cap are still raw [[speak:..]] — collapse them to text.
+        cleaned = self.SPEAK_MARKER_RE.sub(lambda m: m.group(1).strip(), ''.join(out))
+        return cleaned, files
 
     async def _handle_command(self, message: discord.Message) -> None:
         """Handle bot commands."""
@@ -4569,15 +4686,8 @@ class ClaudeBot(commands.Bot):
                 return
 
             async with message.channel.typing():
-                reading = await self._mandarin_g2p(guild_id, text)
+                audio, reading = await self._synthesize_mandarin(guild_id, text)
                 hanzi = reading["hanzi"]
-                surface_numbered = reading["surface_numbered"]
-                audio = await self._azure_tts(self._build_mandarin_ssml(hanzi, surface_numbered))
-                if audio is None and surface_numbered is not None:
-                    # Forced-tone SSML may have been rejected (odd syllable);
-                    # retry letting Azure infer tones so the user still gets audio.
-                    print("⚠️  Forced-tone TTS failed; retrying with inferred tones.")
-                    audio = await self._azure_tts(self._build_mandarin_ssml(hanzi, None))
 
             if audio is None:
                 await message.channel.send(
@@ -5157,6 +5267,7 @@ class ClaudeBot(commands.Bot):
 `!search <query>` - Web search via Claude, Deepseek, or Gemini (costs extra, ~$0.01-0.03)
 `!research <question>` - Multi-model panel + judge → one synthesised answer (~3-4× cost)
 `!speak <chinese / pinyin / phrase>` - Mandarin TTS with tones forced from pinyin → MP3 (Azure Xiaoxiao; needs AZURE_TTS_KEY)
+   (models can also voice phrases inline while teaching, via `[[speak:汉字]]`)
 
 **Multi-model (Hydra / MAGI):**
 `!claude <message>` / `!opus <message>` / `!balthasar <message>` - Force Claude to respond
