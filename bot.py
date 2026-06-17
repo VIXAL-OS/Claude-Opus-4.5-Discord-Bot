@@ -180,7 +180,7 @@ Common pitfalls to avoid in your LaTeX (these silently produce wrong-looking ren
 - Greek letters and operators always need a backslash: `\theta`, `\sigma`, `\sum`, `\int`, `\frac`. Bare `theta` will render as four italic letters.
 - Re-read your equations before sending; a stray missing `_` or `\,` is the difference between a clean render and a confusing one.
 
-**Speech (Mandarin TTS)**: You can attach spoken Mandarin audio inline while teaching — just write `!speak 汉字` (the command word followed immediately by the Chinese characters). The bot voices it with Azure's Xiaoxiao voice (tones forced correct via SSML), attaches an MP3, and rewrites the marker as "汉字 (spoken `pīnyīn` · dict. `pīnyīn`) 🔊" — it computes and appends the correct, sandhi-aware pinyin (both the spoken form and the dictionary form) for you. So you do NOT need to hand-write the pinyin next to a phrase you're speaking — let the bot be the source of truth; this avoids tone-mark mistakes. Up to ~8 clips per message, e.g. a tone contrast: !speak 妈, !speak 麻, !speak 马, !speak 骂. If you ever need to override the pronunciation, use `[[speak: 汉字 | nǐ hǎo]]` to pin exact pinyin (tone marks or numbers). Mandarin only.
+**Speech (Mandarin TTS)**: You can attach spoken Mandarin audio inline while teaching — just write `!speak 汉字` (the command word followed immediately by the Chinese characters). The bot voices it with Azure's Xiaoxiao voice (tones forced correct via SSML), attaches an MP3, and rewrites the marker as "汉字 (spoken `pīnyīn` · dict. `pīnyīn`) 🔊" — it computes and appends the correct, sandhi-aware pinyin (both the spoken form and the dictionary form) for you. So you do NOT need to hand-write the pinyin next to a phrase you're speaking — let the bot be the source of truth; this avoids tone-mark mistakes. Write the literal `!speak` before EACH phrase you want spoken, every single time — the "🔊" you see in the result is added by the bot AFTER it processes your command, so don't reproduce that look from memory and expect audio. (As a safety net, a phrase written immediately followed by 🔊 is also spoken — but `!speak 汉字` is the real command.) Up to ~8 clips per message, e.g. a tone contrast: !speak 妈, !speak 麻, !speak 马, !speak 骂. If you ever need to override the pronunciation, use `[[speak: 汉字 | nǐ hǎo]]` to pin exact pinyin (tone marks or numbers). Mandarin only.
 
 **Images**: You can see images that users upload.
 
@@ -4317,6 +4317,15 @@ class ClaudeBot(commands.Bot):
         r'!speak[ \t]+([一-鿿㐀-䶿　-〿＀-￯]+)',
         re.IGNORECASE,
     )
+    # Models tend to imitate the bot's *rendered output* ("汉字 🔊") instead of
+    # re-issuing the command, which silently produces no audio (the model is
+    # copying what it sees in history). Treat that rendered form — a CJK run,
+    # an optional pinyin paren, then the speaker emoji — as a request too, so
+    # the model can't get it wrong either way. The model's own paren pinyin is
+    # dropped here so the bot re-derives the authoritative version.
+    EMOJI_SPEAK_RE = re.compile(
+        r'([一-鿿㐀-䶿　-〿＀-￯]+)(?:[ \t]*\([^)\n]*\))?[ \t]*🔊'
+    )
 
     @staticmethod
     def _inline_pinyin_annot(reading: dict) -> str:
@@ -4340,7 +4349,8 @@ class ClaudeBot(commands.Bot):
         '汉字 🔊'; markers beyond the per-message cap (or that fail to synthesize,
         or when TTS is unconfigured) collapse to just the phrase text so users
         never see raw [[speak:..]] syntax. Returns (cleaned_text, files)."""
-        text = self.BANG_SPEAK_RE.sub(r'[[speak:\1]]', text)  # !speak 汉字 → [[speak:汉字]]
+        text = self.BANG_SPEAK_RE.sub(r'[[speak:\1]]', text)   # !speak 汉字 → [[speak:汉字]]
+        text = self.EMOJI_SPEAK_RE.sub(r'[[speak:\1]]', text)  # 汉字 🔊 (imitated output) → marker
         strip = lambda: self.SPEAK_MARKER_RE.sub(lambda m: m.group(1).strip(), text)
         if max_files <= 0 or not (self.azure_tts_key and self.azure_tts_region):
             return strip(), []
