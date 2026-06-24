@@ -138,9 +138,9 @@ or users can call on you directly with commands like !claude, !deepseek, or !gem
 (The crew sometimes uses the MAGI aliases !balthasar = Claude, !melchior = Deepseek,
 !caspar = Gemini, after the Eva fancast.)
 
-Your responses get labeled (e.g., **[Claude]**, **[Deepseek]**, or **[Gemini]**) so
+Your responses get labeled (e.g., **[Claude]**, **[Deepseek]**, **[Qwen]**, etc.) so
 everyone can tell who said what. The labeling is handled automatically by the bot — do NOT
-include [Claude], [Deepseek], or [Gemini] tags in your own responses. Just write your
+include ANY model-name tag (such as [Claude] — or your own name) at the start of your responses. Just write your
 response normally and the system adds the label for you. When you see labeled messages
 from the other models in conversation history, those are genuinely from them — your
 collaborators, not copies of you. The three of you share a memory system, so you'll all
@@ -495,6 +495,15 @@ GRID_GCO2_PER_KWH = float(os.getenv("GRID_GCO2_PER_KWH", "400"))
 # with MODEL_LIFETIME_TOKENS in .env; AMORTIZE_TRAINING=0 hides the line.
 MODEL_LIFETIME_TOKENS = float(os.getenv("MODEL_LIFETIME_TOKENS", "1e14"))
 AMORTIZE_TRAINING = os.getenv("AMORTIZE_TRAINING", "1") not in ("0", "false", "False", "")
+
+# Alternation of model display-names (provider.name values) that can show up as
+# echoed "[Name]" labels in model output. The response pipeline strips any of
+# these a model prepends BEFORE the bot adds its own authoritative label, and
+# history parsing uses it to recognize who said what. A prompt instruction alone
+# never fully stopped the echo — this strip is the real fix. ⚠️ KEEP IN SYNC
+# with provider.name when adding a head (else its echo leaks through, the
+# "[Qwen] [Qwen]" double-label bug).
+MODEL_LABEL_NAMES = "Claude|Deepseek|Gemini|Mistral|Qwen|GLM"
 
 
 CLAUDE_PROVIDER = ModelProvider(
@@ -1205,7 +1214,7 @@ class ConversationManager:
                         # Strip model labels from referenced bot messages too
                         # (skip webhook proxies — those carry user content, not our labels)
                         if _is_real_bot(ref_msg):
-                            ref_text = re.sub(r'^(\*\*\[(?:Claude|Deepseek|Gemini)\]\*\*\s*)+', '', ref_text)
+                            ref_text = re.sub(rf'^(\*\*\[(?:{MODEL_LABEL_NAMES})\]\*\*\s*)+', '', ref_text)
                         ref_author = "bot" if _is_real_bot(ref_msg) else ref_msg.author.display_name
                         content.append({
                             "type": "text",
@@ -1226,7 +1235,7 @@ class ConversationManager:
                 if _is_real_bot(msg):
                     # First, extract which model this is from (check bold first, then plain)
                     model_label = None
-                    label_match = re.match(r'^(?:\*\*\[(Claude|Deepseek|Gemini)\]\*\*\s*|\[(Claude|Deepseek|Gemini)\]\s*)+', text)
+                    label_match = re.match(rf'^(?:\*\*\[({MODEL_LABEL_NAMES})\]\*\*\s*|\[({MODEL_LABEL_NAMES})\]\s*)+', text)
                     if label_match:
                         # Get the last model name captured (from either group)
                         model_label = label_match.group(1) or label_match.group(2)
@@ -2123,7 +2132,7 @@ class ClaudeBot(commands.Bot):
             # Strip any label the model echoed (handles old [Name] and the new
             # [Name · effort] format Claude may have started echoing).
             response = re.sub(
-                r'^(?:\*\*\[(?:Claude|Deepseek|Gemini)(?:\s·\s\w+)?\]\*\*\s*|\[(?:Claude|Deepseek|Gemini)(?:\s·\s\w+)?\]\s*)+',
+                rf'^(?:\*\*\[(?:{MODEL_LABEL_NAMES})(?:\s·\s\w+)?\]\*\*\s*|\[(?:{MODEL_LABEL_NAMES})(?:\s·\s\w+)?\]\s*)+',
                 '',
                 response,
             )
