@@ -1036,6 +1036,13 @@ class ReadingMaterial:
     # cache_control on the system block, which doesn't need a stored handle.
     cache_handles: dict[str, str] = field(default_factory=dict)
     cache_expires_at: dict[str, datetime] = field(default_factory=dict)
+    # Bookclub recaps: per-chapter "previously on" summaries (1-indexed chapter
+    # number → text), generated once by a cheap model and cached here. Injected
+    # into scoped threads so a context-limited model that only sees a LATER
+    # chapter still knows what came before. recap_text is the assembled prefix
+    # for a *scoped* slice (the chapters before its start); None on the full work.
+    chapter_recaps: dict[int, str] = field(default_factory=dict)
+    recap_text: Optional[str] = None
 
     @property
     def estimated_tokens(self) -> int:
@@ -1057,6 +1064,8 @@ class ReadingMaterial:
             "cache_expires_at": {
                 k: v.isoformat() for k, v in self.cache_expires_at.items()
             },
+            "chapter_recaps": {str(k): v for k, v in self.chapter_recaps.items()},
+            "recap_text": self.recap_text,
         }
 
     @classmethod
@@ -1074,6 +1083,10 @@ class ReadingMaterial:
                 k: datetime.fromisoformat(v)
                 for k, v in data.get("cache_expires_at", {}).items()
             },
+            chapter_recaps={
+                int(k): v for k, v in data.get("chapter_recaps", {}).items()
+            },
+            recap_text=data.get("recap_text"),
         )
 
 
@@ -2838,8 +2851,18 @@ class ClaudeBot(commands.Bot):
         the live system text. The framing tells the model to treat the text
         as primary source for any bookclub discussion.
         """
+        recap = ""
+        if material.recap_text:
+            recap = (
+                f"### Story so far\n\n"
+                f"You're scoped to a later part of the work and can't see the earlier "
+                f"chapters directly. Here's what happened before, so you can follow the "
+                f"discussion:\n\n"
+                f"{material.recap_text}\n\n"
+            )
         return (
             f"## Reading Material: {material.title}\n\n"
+            f"{recap}"
             f"This text has been loaded for bookclub discussion in this channel "
             f"(source: {material.url}). You have full access to the work below — "
             f"reference specific passages, characters, plot points, and structural "
@@ -2849,6 +2872,71 @@ class ClaudeBot(commands.Bot):
             f"{material.text}\n\n"
             f"--- END WORK ---"
         )
+
+    # --- Bookclub chapter recaps (the "previously on" for scoped threads) ----
+    RECAP_SYSTEM = (
+        "You are writing a spoiler-bounded 'previously on' recap of ONE chapter of a "
+        "longer work, for a reader about to jump into a LATER chapter who needs to know "
+        "what came before. Summarize only THIS chapter's key events, character beats, and "
+        "revelations in 2-3 tight sentences. No preamble, no 'in this chapter' — just the "
+        "recap prose. Don't speculate beyond the text."
+    )
+
+    async def _generate_chapter_recap(
+        self, guild_id: int, parent_material: "ReadingMaterial", chapter_num: int
+    ) -> Optional[str]:
+        """Summarize a single chapter into a 2-3 sentence recap via the cheapest
+        capable model (Deepseek → Claude → Gemini). Returns None on failure."""
+        provider = next(
+            (p for p in (self.deepseek_provider, self.claude_provider, self.gemini_provider)
+             if p.enabled),
+            None,
+        )
+        if provider is None:
+            return None
+        chapter = self._slice_material_to_chapters(parent_material, chapter_num, chapter_num)
+        messages = [{"role": "user", "content": chapter.text}]
+        try:
+            out = await self._panel_complete(provider, guild_id, messages, self.RECAP_SYSTEM)
+        except Exception as e:
+            print(f"⚠️  Chapter {chapter_num} recap failed: {e}")
+            return None
+        if self._is_provider_error(provider, out):
+            return None
+        return out.strip()
+
+    async def _ensure_chapter_recaps(
+        self, guild_id: int, parent_material: "ReadingMaterial", up_to_chapter: int
+    ) -> None:
+        """Generate + cache any missing chapter recaps for chapters 1..up_to_chapter
+        on the parent material. Missing recaps are generated in parallel and
+        persist, so a chapter is only ever summarized once."""
+        missing = [
+            ch for ch in range(1, up_to_chapter + 1)
+            if ch not in parent_material.chapter_recaps
+        ]
+        if not missing:
+            return
+        results = await asyncio.gather(
+            *(self._generate_chapter_recap(guild_id, parent_material, ch) for ch in missing)
+        )
+        for ch, recap in zip(missing, results):
+            if recap:
+                parent_material.chapter_recaps[ch] = recap
+        self.manager.mark_dirty()
+
+    @staticmethod
+    def _format_recap_prefix(
+        parent_material: "ReadingMaterial", before_chapter: int
+    ) -> Optional[str]:
+        """Assemble the 'previously on' text from cached recaps of chapters
+        1..before_chapter-1. None if there are no recaps to show."""
+        lines = [
+            f"- **Ch {ch}:** {parent_material.chapter_recaps[ch]}"
+            for ch in range(1, before_chapter)
+            if ch in parent_material.chapter_recaps
+        ]
+        return "\n".join(lines) if lines else None
 
     async def _create_gemini_cache(
         self,
@@ -5866,6 +5954,24 @@ class ClaudeBot(commands.Bot):
             scoped = self._slice_material_to_chapters(
                 parent_material, start_ch, end_ch
             )
+
+            # Auto-recap: scoped past chapter 1 → give context-limited models a
+            # "previously on" of the earlier chapters they can't see. Recaps are
+            # generated once (cheapest model) and cached on the parent material.
+            if start_ch > 1:
+                missing = sum(
+                    1 for ch in range(1, start_ch)
+                    if ch not in parent_material.chapter_recaps
+                )
+                if missing:
+                    await message.channel.send(
+                        f"📝 Summarizing chapters 1–{start_ch - 1} for the scoped models "
+                        f"({missing} new recap{'s' if missing != 1 else ''})…"
+                    )
+                async with message.channel.typing():
+                    await self._ensure_chapter_recaps(guild_id, parent_material, start_ch - 1)
+                scoped.recap_text = self._format_recap_prefix(parent_material, start_ch)
+
             await self._set_reading_material(message.channel.id, scoped)
             self.manager.mark_dirty()
             await self.manager.save_memories_async(providers=self.providers)
@@ -5877,10 +5983,28 @@ class ClaudeBot(commands.Bot):
             tier_note = ""
             if scoped.estimated_tokens < 200_000:
                 tier_note = " (under Gemini's ≤200k tier — cheaper per turn)"
+            # Who can actually READ the scoped text vs. who's on vibes only?
+            needed = scoped.estimated_tokens + 50_000
+            readers = [p.name for p in self.providers if p.enabled and p.max_context_tokens >= needed]
+            vibers = [p.name for p in self.providers if p.enabled and p.max_context_tokens < needed]
+            fit_lines = (
+                f"  📖 Reads the text: {', '.join(readers) if readers else '(none — too big!)'}\n"
+            )
+            if vibers:
+                fit_lines += (
+                    f"  💬 On vibes only (sees the discussion, not the text): "
+                    f"{', '.join(vibers)}\n"
+                )
+            recap_line = (
+                f"  📝 Scoped models get a recap of chapters 1–{start_ch - 1}.\n"
+                if scoped.recap_text else ""
+            )
             await message.channel.send(
                 f"📖 This thread is now scoped to **{range_desc}**\n"
                 f"  ~{scoped.estimated_tokens:,} tokens, "
                 f"{scoped.word_count:,} words{tier_note}\n"
+                f"{fit_lines}"
+                f"{recap_line}"
                 f"  Models in this thread only see the scoped text — no spoilers from later chapters.\n"
                 f"  `!unscope` to drop the scope; `!unload` (in parent) to drop the whole work."
             )

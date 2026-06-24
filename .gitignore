@@ -3,3 +3,8 @@ memories.json
 __pycache__/
 config.json
 .claude/
+
+# Bookclub source texts loaded via !load_text — copyrighted fics/works.
+# NEVER commit these (a 3 MB AO3 HTML slipped in once). Keep them local only.
+*.html
+Almost_Nowhere.html
