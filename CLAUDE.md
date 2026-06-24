@@ -76,7 +76,7 @@ self-contained — you don't need it to pick up the remaining work below.
 | 1 — Mistral/Qwen/GLM on Fireworks | ✅ done (with routing deviation) | — |
 | 2 — Gemini Developer-API default | ✅ already the default (operator: keep billing on) | — |
 | 2 — Gemini **Vertex** backend | ❌ not built | Optional / lab-only (residency/SLA) |
-| 3 — DeepSeek backend toggle (`api`/`fireworks`/`self_hosted`) | ❌ not built (stays `api`) | Med — lab route |
+| 3 — Provider backend toggles: DeepSeek (`api`/`fireworks`/`self_hosted`) **+ Mistral** (`api`/`together`/`self_hosted`) | ❌ not built (both hardcoded to `api`) | Med — lab route |
 | 4 — Slack platform abstraction | ❌ not built | **High — the big one** |
 | 5 — Hermes delegation bridge | ❌ not built | Optional / lab-only |
 
@@ -95,16 +95,30 @@ EU/regional residency, IAM/VPC, SLA, or compliance: add `_generate_gemini_vertex
 cache handles** (`cachedContents` ≠ Vertex `CachedContent` — never reuse an id across backends).
 Auth is ADC (`GOOGLE_APPLICATION_CREDENTIALS` service-account JSON) — the usual failure point.
 
-#### Phase 3 — DeepSeek backend toggle — *TODO (lab route)*
-DeepSeek stays on its China `api` for the Discord bot (Sarah's call — cheap, and "the Chinese can
-have the shitposts"). To add the toggle: `providers.deepseek.backend = api | fireworks | self_hosted`,
-swapping base_url/key/model only (all OpenAI-compatible — no new generator).
+#### Phase 3 — Provider backend toggles (DeepSeek + Mistral) — *TODO (lab route)*
+Both DeepSeek and Mistral are currently **hardcoded to their `api` backend**; the spec wants a
+config toggle. Cheapest kind of change — swap base_url/key/model only (all OpenAI-compatible, no
+new generator) + adjust per-backend cost/grid.
+
+**DeepSeek** stays on its China `api` for the Discord bot (Sarah's call — cheap, and "the Chinese can
+have the shitposts"). To add the toggle: `providers.deepseek.backend = api | fireworks | self_hosted`.
 - `fireworks` → `accounts/fireworks/models/deepseek-v4-pro`, shares `FIREWORKS_API_KEY`, keep
   per-token cost at Fireworks rates (~1.74/3.48), server cache at 50%. Update its
   `grid_gco2_per_kwh` to ~400 (US) when on this backend.
 - `self_hosted` → local vLLM/Ollama base_url; set `supports_server_cache=False`; add a `local`
   cost mode in `_record_*_usage()` (skip per-token $, label the turn `local`); V4-Flash or 4-bit
   for single-GPU.
+
+**Mistral** is hardcoded to `api.mistral.ai` (set up this way because Mistral Large 3 isn't on
+Fireworks serverless — `mistral-large-3-fp8` 404s "not deployed", catalog/on-demand only). Same
+toggle shape: `providers.mistral.backend = api | together | self_hosted`.
+- `api` (current) → `api.mistral.ai`, `MISTRAL_API_KEY`, model `mistral-large-latest`. EU-resident
+  + France ~nuclear grid (`grid_gco2_per_kwh=20`). **Best default for the Discord bot — keep it.**
+- `together` → Together AI serverless (US) *does* host Mistral Large 3 — use for US residency / one
+  fewer bill; set `grid_gco2_per_kwh≈400` + Together's rates. (Fireworks only has it on-demand —
+  i.e. rent a dedicated GPU — not worth it for a chat bot.)
+- `self_hosted` → Apache-2.0 weights, but Large 3 is 675B (multi-GPU). For single-GPU, self-host a
+  smaller Mistral (Ministral 3B/8B/14B, Magistral Small 24B); reuse DeepSeek's `local` cost mode.
 
 #### Phase 4 — Slack platform abstraction — *TODO, the big remaining chunk*
 Introduce a `ChatPlatform` protocol; make `ClaudeBot`/`ConversationManager` depend on it instead
