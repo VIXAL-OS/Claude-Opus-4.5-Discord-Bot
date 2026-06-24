@@ -1,18 +1,18 @@
 # Hydra Discord Bot (Opus-Deipseek)
 
-A multi-model Discord bot powered by **Claude Opus 4.8**, **DeepSeek V4-Pro**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts). Three open-weight heads — **Mistral Large 3**, **Qwen 3.7**, and **GLM 5.2** — join via a single Fireworks AI endpoint (US jurisdiction, zero-data-retention, one key) when `FIREWORKS_API_KEY` is set.
+A multi-model Discord bot powered by **Claude Opus 4.8**, **DeepSeek V4-Pro**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts). Three open-weight heads join too: **Qwen 3.7** and **GLM 5.2** via a single Fireworks AI endpoint (US, zero-data-retention) when `FIREWORKS_API_KEY` is set, and **Mistral Large 3** via its own EU API (`api.mistral.ai`, France's ~nuclear grid) when `MISTRAL_API_KEY` is set.
 
 Affectionately maps to the EVA *MAGI* trinity, with the open-weight heads as the pilots you deploy:
 - **Claude / Balthasar** — careful, thorough, vision, native Anthropic web search, multi-tool orchestration
 - **DeepSeek / Melchior** — fast, cheap, CJK-strong, Tavily-backed search, automatic server-side prompt caching
 - **Gemini / Caspar** — abstract reasoning, long-context synthesis, vision, native Google Search grounding
-- **Mistral / Mari** — French & European-language specialist (the `!french` tutor), Apache-licensed, on Fireworks (US/ZDR)
-- **Qwen / Rei** — cheap, strong coding & math; auto-routed for routine code/math
-- **GLM / Asuka** — agentic/tool-use open head; override-only via `!glm` / `!asuka`
+- **Mistral / Mari** — French & European-language specialist (the `!french` tutor), on its own EU API (low-carbon French grid)
+- **Qwen / Rei** — cheap, strong coding & math on Fireworks (US/ZDR); auto-routed for routine code/math
+- **GLM / Asuka** — agentic/tool-use open head on Fireworks (US/ZDR); override-only via `!glm` / `!asuka`
 
 ## Features
 
-- 🐉 **Multi-model (Hydra)** — Claude + DeepSeek + Gemini (the MAGI trinity), plus optional Mistral + Qwen + GLM on one Fireworks endpoint, with automatic routing
+- 🐉 **Multi-model (Hydra)** — Claude + DeepSeek + Gemini (the MAGI trinity), plus optional Qwen + GLM (Fireworks) and Mistral (its own EU API), with automatic routing
 - 📚 **Bookclub mode** — pin long texts to a channel; discuss across all three models with per-thread chapter scoping
 - 🧵 **Thread-based conversations** — keeps channels clean
 - 📷 **Image understanding** — Claude and Gemini both see images
@@ -210,7 +210,8 @@ AO3 sheds anonymous traffic under load with HTTP 403 "Shields are up!" — affec
 - **DeepSeek** ([platform.deepseek.com](https://platform.deepseek.com/)) — required or optional
 - **Gemini** ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)) — required or optional; AI Studio key, not Vertex
 - **Tavily** ([tavily.com](https://tavily.com/)) — optional, enables DeepSeek web search (free 1,000 searches/month)
-- **Fireworks** ([fireworks.ai](https://fireworks.ai/)) — optional, one key serves Mistral + Qwen + GLM on US zero-retention infra (prepaid as of July 2026 — set auto-reload so calls don't fail at $0)
+- **Fireworks** ([fireworks.ai](https://fireworks.ai/)) — optional, one key serves Qwen + GLM on US zero-retention infra (prepaid as of July 2026 — set auto-reload so calls don't fail at $0)
+- **Mistral** ([console.mistral.ai](https://console.mistral.ai/)) — optional, enables Mistral (Mari) via `api.mistral.ai` (EU-resident; Mistral Large isn't on Fireworks serverless)
 - **Azure Speech** ([portal.azure.com](https://portal.azure.com/)) — optional, powers `!speak` (Mandarin) and `!french` (French) TTS (free tier ~0.5M chars/month)
 - **AO3 cookie** — optional, bypasses shields-up for bookclub mode (see [Bookclub Mode](#bookclub-mode))
 
@@ -232,7 +233,8 @@ ANTHROPIC_API_KEY=your_anthropic_key      # Optional if Gemini or DeepSeek only
 DEEPSEEK_API_KEY=your_deepseek_key        # Optional
 GEMINI_API_KEY=your_gemini_key            # Optional
 TAVILY_API_KEY=your_tavily_key            # Optional
-FIREWORKS_API_KEY=your_fireworks_key      # Optional, enables Mistral + Qwen + GLM (one key, US/ZDR)
+FIREWORKS_API_KEY=your_fireworks_key      # Optional, enables Qwen + GLM (US/ZDR)
+MISTRAL_API_KEY=your_mistral_key          # Optional, enables Mistral (Mari) — api.mistral.ai (EU)
 AZURE_TTS_KEY=your_azure_speech_key       # Optional, !speak (Mandarin) + !french (French) TTS
 AZURE_TTS_REGION=eastus                    # Optional, Azure Speech resource region
 AO3_COOKIE=                               # Optional, for bookclub mode
@@ -252,7 +254,7 @@ AO3_COOKIE=                               # Optional, for bookclub mode
 python bot.py
 ```
 
-The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemini, Mistral, Qwen, GLM} depending on which API keys are present. `FIREWORKS_API_KEY` gates Mistral/Qwen/GLM together; its absence disables exactly those three and leaves the original trio untouched.
+The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemini, Mistral, Qwen, GLM} depending on which API keys are present. `FIREWORKS_API_KEY` gates Qwen + GLM; `MISTRAL_API_KEY` gates Mistral (its own EU API). Each missing key disables exactly its provider(s) and leaves the rest untouched.
 
 ## Cost Comparison
 
@@ -261,13 +263,13 @@ The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemin
 | Claude Opus 4.8 | $5/M | $0.50/M (10%) | $25/M | ~$0.02-0.05 | ~$0.16/turn after cache |
 | Gemini 3.1 Pro | $2-4/M (tiered ≤/>200k) | $0.50-1.00/M (25%) | $12-18/M | ~$0.01-0.02 | ~$0.40/turn after cache |
 | DeepSeek V4 Pro | $0.435/M | $0.003625/M (~99%) | $0.87/M | ~$0.0005-0.002 | ~$0.005/turn after cache |
-| Mistral Large 3 (Fireworks) | $0.90/M | $0.45/M (50%) | $3.00/M | ~$0.002-0.006 | — |
+| Mistral Large 3 (own API) | $2.00/M | — | $6.00/M | ~$0.004-0.012 | — |
 | Qwen 3.7 Plus (Fireworks) | $0.50/M | $0.25/M (50%) | $3.00/M | ~$0.002-0.005 | — |
 | GLM 5.2 (Fireworks) | $1.40/M | $0.70/M (50%) | $4.40/M | ~$0.003-0.008 | — |
 
-The three Fireworks rows are estimates — verify on the [Fireworks pricing page](https://fireworks.ai/pricing); serverless can run ~2-4× a model-maker's own API (the US-residency + ZDR + one-bill premium). Fireworks discounts cached input by 50% by default.
+These three rows are estimates — verify on the [Fireworks pricing page](https://fireworks.ai/pricing) (Qwen/GLM) and [console.mistral.ai](https://console.mistral.ai/) (Mistral). Fireworks serverless can run ~2-4× a model-maker's own API (the US-residency + ZDR premium) and discounts cached input by 50%.
 
-DeepSeek handles routine chat at ~10-30× less cost. Gemini specializes in long-context synthesis and novel reasoning. Claude handles complex tasks that justify the premium. Qwen catches routine code/math cheaply; Mistral is the French/EU specialist. Use `!cost` to see a real-time breakdown including cache hit rates and a rough per-provider energy/CO₂ estimate (each provider's grid carbon intensity follows the *endpoint*, not the brand — Mistral-on-Fireworks is US grid, not French nuclear).
+DeepSeek handles routine chat at ~10-30× less cost. Gemini specializes in long-context synthesis and novel reasoning. Claude handles complex tasks that justify the premium. Qwen catches routine code/math cheaply; Mistral is the French/EU specialist. Use `!cost` to see a real-time breakdown including cache hit rates and a rough per-provider energy/CO₂ estimate (grid carbon intensity follows the *endpoint*, not the brand — Mistral on its own EU API runs on France's ~nuclear grid (~20 g/kWh), while the Fireworks heads are US (~400)).
 
 Caching is the difference between $5/turn and $0.50/turn for Claude bookclub mode, so it matters. The bot tracks cached and uncached tokens separately and reports the hit rate per provider.
 

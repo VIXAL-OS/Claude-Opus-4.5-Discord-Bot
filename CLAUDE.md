@@ -1,8 +1,8 @@
 # CLAUDE.md — Hydra (Opus-Deipseek)
 
 Single-file (`bot.py`) multi-model Discord bot. EVA/MAGI-themed heuristic router over
-**Claude (Balthasar) · DeepSeek (Melchior) · Gemini (Caspar)** plus the Fireworks
-open-weight heads **Mistral (Mari) · Qwen (Rei) · GLM (Asuka)**. Two-tier memory,
+**Claude (Balthasar) · DeepSeek (Melchior) · Gemini (Caspar)** plus open-weight heads
+**Qwen (Rei) · GLM (Asuka)** on Fireworks and **Mistral (Mari)** on its own EU API. Two-tier memory,
 prompt caching, bookclub mode, Mandarin (`!speak`) + French (`!french`) TTS,
 research panel (`!research`), and cost + carbon tracking.
 
@@ -19,17 +19,20 @@ self-contained — you don't need it to pick up the remaining work below.
 
 ## Editing rules (load-bearing — read before touching bot.py)
 - **Graceful degradation:** a missing API key disables ONLY that provider. `FIREWORKS_API_KEY`
-  gates Mistral+Qwen+GLM together; absent → those three off, the original trio untouched.
+  gates Qwen+GLM together; **Mistral has its own `MISTRAL_API_KEY`** (`api.mistral.ai`) — its
+  flagship isn't on Fireworks serverless (404s "not deployed"). Absent keys disable exactly
+  those providers; the original trio is untouched.
 - **`provider.name` is the canonical routing key.** `_select_model`, `_estimate_confidence`,
   `panel_members`, cost, and persistence all branch on it. NEVER rename it. Display names and
   command aliases are a separate theme layer on top (see naming below).
-- **Dispatch** routes on `provider.name in self.openai_compatible_clients`. The three Fireworks
-  heads share one `self.fireworks_client`. Claude uses the anthropic SDK; Gemini bookclub uses
-  the native `cachedContents` path; everything else is the OpenAI-compatible shim
-  (`_generate_openai_compatible_response`).
-- **Fireworks slugs drift** — verify in the live library. Verified 2026-06:
-  `mistral-large-3-fp8`, `qwen3p7-plus`, `glm-5p2`, `deepseek-v4-pro` (all under
-  `accounts/fireworks/models/`).
+- **Dispatch** routes on `provider.name in self.openai_compatible_clients`. Qwen+GLM share
+  `self.fireworks_client`; Mistral uses `self.mistral_client` (`api.mistral.ai`). Claude uses the
+  anthropic SDK; Gemini bookclub uses the native `cachedContents` path; everything else is the
+  OpenAI-compatible shim (`_generate_openai_compatible_response`).
+- **Model slugs drift** — verify in the live libraries. Fireworks (verified 2026-06):
+  `qwen3p7-plus`, `glm-5p2`, `deepseek-v4-pro` (under `accounts/fireworks/models/`). Mistral on
+  its own API uses `mistral-large-latest`. ⚠️ Mistral Large 3 is NOT on Fireworks serverless
+  (`mistral-large-3-fp8` / `mistral-large-3` both 404 "not deployed") — hence the own-API route.
 - New-provider **pricing + energy constants are estimates** flagged `VERIFY` in comments —
   confirm against the Fireworks pricing page before trusting `!cost` $ figures.
 
@@ -45,9 +48,11 @@ self-contained — you don't need it to pick up the remaining work below.
 ## Status — 2026-06-24
 
 ### ✅ Built this session (live; validated offline, needs live-key smoke tests)
-- **Phase 1 — Mistral/Qwen/GLM on Fireworks.** One endpoint + one key, gated on
-  `FIREWORKS_API_KEY`, graceful degradation, EVA aliases, per-provider system-prompt personas,
-  in `!cost` and the `!research all` panel. Cached input = 0.5×input (Fireworks 50% discount).
+- **Phase 1 — Qwen/GLM on Fireworks, Mistral on `api.mistral.ai`.** Qwen+GLM share one
+  Fireworks key (cached input = 0.5×input); Mistral is on its own EU API (`MISTRAL_API_KEY`)
+  because Mistral Large 3 isn't on Fireworks serverless — a happy accident: EU-resident + France
+  ~nuclear grid (grid≈20 in `!cost`). Graceful degradation, EVA aliases, per-provider personas,
+  in `!cost` and the `!research all` panel.
 - **Routing — intentional deviation from the spec.** The spec said new heads "override-only."
   Per Sarah's call that cheap models should earn routing: **Qwen is in the auto-router as the
   cheap coder/mathematician** (wins routine code/math, hands complex/careful work back to
@@ -125,9 +130,9 @@ prompts to self-hosted only. Optional cron delivery into the lab channel. Hydra 
 fully with Hermes absent.
 
 ### Cross-cutting follow-ups
-- Verify Fireworks **pricing** for `mistral-large-3-fp8` / `qwen3p7-plus` / `glm-5p2` (current
-  values are estimates) and the **energy** constants (`est_wh_per_1k_tokens`, `train_tco2e` are
-  order-of-magnitude).
+- Verify **pricing**: Fireworks for `qwen3p7-plus` / `glm-5p2`, and `console.mistral.ai` for
+  `mistral-large-latest` (current values are estimates). The **energy** constants
+  (`est_wh_per_1k_tokens`, `train_tco2e`) are order-of-magnitude.
 - Live smoke tests still owed: `!mari`/`!rei`/`!asuka` round-trips, `!french bonjour` (Azure
   fr-FR synth) and `!french how do you say …` (Mistral G2P), inline `[[french:..]]`.
 - Operator: keep Fireworks prepaid balance topped up (auto-reload) and Gemini billing current.

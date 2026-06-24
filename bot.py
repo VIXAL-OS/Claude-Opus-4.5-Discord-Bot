@@ -592,16 +592,20 @@ GEMINI_PROVIDER = ModelProvider(
 # only — see _estimate_confidence. Vision off for safety (Claude/Gemini see).
 MISTRAL_PROVIDER = ModelProvider(
     name="Mistral",
-    model_id="accounts/fireworks/models/mistral-large-3-fp8",
-    input_cost_per_million=0.90,         # VERIFY on Fireworks pricing page
-    output_cost_per_million=3.00,
-    cached_input_cost_per_million=0.45,  # 50% of input (Fireworks default)
-    max_context_tokens=256_000,
+    # On Mistral's OWN API (api.mistral.ai), NOT Fireworks — Mistral Large 3 is
+    # catalog/on-demand-only on Fireworks (serverless 404s "not deployed").
+    # Upside: EU-resident + France ~nuclear grid (the low-carbon win). Needs
+    # MISTRAL_API_KEY. Model alias `mistral-large-latest` tracks the newest Large.
+    model_id="mistral-large-latest",
+    input_cost_per_million=2.0,          # VERIFY at console.mistral.ai (Mistral Large pricing)
+    output_cost_per_million=6.0,
+    cached_input_cost_per_million=2.0,   # Mistral API cache rate varies; assume no discount (shim doesn't extract cache hits)
+    max_context_tokens=128_000,
     supports_vision=False,
     supports_web_search=False,
     search_backend="tavily",
     est_wh_per_1k_tokens=0.35,  # 675B/41B MoE — light per token
-    grid_gco2_per_kwh=400.0,    # Fireworks US fleet (NOT France — that win needs api.mistral.ai)
+    grid_gco2_per_kwh=20.0,     # France grid (~20 g) — Mistral's own EU infra, the low-carbon win
     train_tco2e=2200.0,         # Mistral Large-2 LCA (Carbone 4); France-grid-embodied → genuinely low-carbon train
 )
 
@@ -1593,14 +1597,13 @@ class ClaudeBot(commands.Bot):
             self.gemini_provider.enabled = False
             print("⚪ Gemini not configured (GEMINI_API_KEY missing)")
 
-        # Fireworks AI (OpenAI-compatible, optional). ONE endpoint + ONE key
-        # serves all three open-weight heads — Mistral (Mari), Qwen (Rei), GLM
-        # (Asuka) — on US, zero-data-retention infra. They share fireworks_client
-        # and dispatch through the existing OpenAI-compatible generator. Absent
-        # key disables exactly these three; the original trio is untouched.
-        self._fireworks_providers = (
-            self.mistral_provider, self.qwen_provider, self.glm_provider,
-        )
+        # Fireworks AI (OpenAI-compatible, optional). ONE endpoint + ONE key for
+        # Qwen (Rei) + GLM (Asuka) on US, zero-data-retention infra — they share
+        # fireworks_client and dispatch through the existing OpenAI-compatible
+        # generator. (Mistral is NOT here: Mistral Large 3 isn't on Fireworks
+        # serverless — it has its own gate just below.) Absent key disables
+        # exactly Qwen+GLM; everything else is untouched.
+        self._fireworks_providers = (self.qwen_provider, self.glm_provider)
         fireworks_key = os.getenv("FIREWORKS_API_KEY")
         if fireworks_key:
             from openai import OpenAI
@@ -1610,12 +1613,30 @@ class ClaudeBot(commands.Bot):
             )
             for prov in self._fireworks_providers:
                 prov.enabled = True
-            print("🟢 Fireworks enabled (Mistral/Mari · Qwen/Rei · GLM/Asuka — US/ZDR)")
+            print("🟢 Fireworks enabled (Qwen/Rei · GLM/Asuka — US/ZDR)")
         else:
             self.fireworks_client = None
             for prov in self._fireworks_providers:
                 prov.enabled = False
-            print("⚪ Fireworks not configured (FIREWORKS_API_KEY missing — Mistral/Qwen/GLM disabled)")
+            print("⚪ Fireworks not configured (FIREWORKS_API_KEY missing — Qwen/GLM disabled)")
+
+        # Mistral (Mari) on its OWN API (api.mistral.ai, OpenAI-compatible). Its
+        # flagship isn't on Fireworks serverless, and its own endpoint is the
+        # better home anyway: EU-resident + France's ~nuclear grid (low-carbon).
+        # Separate MISTRAL_API_KEY. Absent → just Mari disabled.
+        mistral_key = os.getenv("MISTRAL_API_KEY")
+        if mistral_key:
+            from openai import OpenAI
+            self.mistral_client = OpenAI(
+                api_key=mistral_key,
+                base_url="https://api.mistral.ai/v1",
+            )
+            self.mistral_provider.enabled = True
+            print(f"🟢 Mistral enabled (Mari — api.mistral.ai/EU; model: {self.mistral_provider.model_id})")
+        else:
+            self.mistral_client = None
+            self.mistral_provider.enabled = False
+            print("⚪ Mistral not configured (MISTRAL_API_KEY missing — Mari disabled)")
 
         # Tavily search client (optional - enables web search for Deepseek).
         # Gemini uses Google's native grounding (no Tavily needed); see
@@ -1656,9 +1677,10 @@ class ClaudeBot(commands.Bot):
         self.openai_compatible_clients: dict[str, object] = {
             self.deepseek_provider.name: self.deepseek_client,
             self.gemini_provider.name: self.gemini_client,
-            # All three Fireworks heads share one client (None when no key — but
-            # they're also disabled then, so _select_model never dispatches them).
-            self.mistral_provider.name: self.fireworks_client,
+            # Qwen + GLM share the Fireworks client; Mistral uses its own EU
+            # client. (None when the relevant key is absent — but the provider is
+            # disabled then, so _select_model never dispatches it.)
+            self.mistral_provider.name: self.mistral_client,
             self.qwen_provider.name: self.fireworks_client,
             self.glm_provider.name: self.fireworks_client,
         }
@@ -2364,7 +2386,9 @@ class ClaudeBot(commands.Bot):
             identity_details = (
                 "Your collaborators **[Claude]** (careful/thorough), **[Gemini]** (abstract "
                 "reasoning), and **[Deepseek]** (fast, CJK-strong) are different models, not "
-                "you. You can't see images; you can search via Tavily. You shine at French and "
+                "you. The bot auto-prefixes your reply with **[Mistral]** — answer directly, "
+                "never prepend your own name tag. You can't see images; you can search via "
+                "Tavily. You shine at French and "
                 "other European languages, multilingual nuance, and clean reasoning.\n\n"
                 "**French language specialty**: you're French-native (a Paris lab), so when "
                 "French comes up you're the resident tutor — translate it for the group and, "
@@ -2379,17 +2403,19 @@ class ClaudeBot(commands.Bot):
             identity = f"Qwen (model: {provider.model_id}), an AI assistant made by Alibaba"
             identity_details = (
                 "Your collaborators **[Claude]**, **[Gemini]**, and **[Deepseek]** are "
-                "different models, not you. You can't see images; you can search via Tavily. "
-                "You shine at coding and math at low cost. Respond in English, in flowing prose "
-                "(not listicles) — this is Discord chat. Minimize blank lines."
+                "different models, not you. The bot auto-prefixes your reply with **[Qwen]** — "
+                "answer directly, never prepend your own name tag. You can't see images; you can "
+                "search via Tavily. You shine at coding and math at low cost. Respond in English, "
+                "in flowing prose (not listicles) — this is Discord chat. Minimize blank lines."
             )
         elif provider.name == "GLM":
             identity = f"GLM (model: {provider.model_id}), an AI assistant made by Zhipu AI"
             identity_details = (
                 "Your collaborators **[Claude]**, **[Gemini]**, and **[Deepseek]** are "
-                "different models, not you. You can't see images; you can search via Tavily. "
-                "You shine at agentic, tool-using, and coding tasks. Respond in English, in "
-                "flowing prose (not listicles) — this is Discord chat. Minimize blank lines."
+                "different models, not you. The bot auto-prefixes your reply with **[GLM]** — "
+                "answer directly, never prepend your own name tag. You can't see images; you can "
+                "search via Tavily. You shine at agentic, tool-using, and coding tasks. Respond "
+                "in English, in flowing prose (not listicles) — this is Discord chat. Minimize blank lines."
             )
         else:
             identity = f"{provider.name} (model: {provider.model_id}), an AI assistant"
