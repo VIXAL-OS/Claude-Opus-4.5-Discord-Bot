@@ -1966,6 +1966,9 @@ class ClaudeBot(commands.Bot):
     async def setup_hook(self) -> None:
         """Called when bot is ready."""
         self.manager.load_memories(providers=self.providers)
+        # Belt-and-suspenders: sweep orphaned Gemini caches before we start
+        # handling messages (race-free here — nothing is creating caches yet).
+        await self._reconcile_gemini_caches()
         # Start background save task
         self._save_task = self.loop.create_task(self._periodic_save())
     
@@ -3029,6 +3032,63 @@ class ClaudeBot(commands.Bot):
         if old is not None and old is not material:
             await self._drop_gemini_cache(old)
         self.manager.reading_materials[key] = material
+
+    async def _reconcile_gemini_caches(self) -> None:
+        """Startup sweep: delete every live Gemini cache NOT referenced by a
+        current reading material. The belt-and-suspenders backstop to the
+        per-teardown deletes — catches orphans from a crash, an archived thread
+        we couldn't resolve at !unload, or older code. Runs in setup_hook BEFORE
+        the bot processes messages, so it can't race a cache mid-creation.
+        ⚠️ Safe ONLY because this bot is the sole user of the Gemini key — it
+        would delete a co-tenant's caches otherwise. Best-effort; never raises."""
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            return
+        # Cache handles we must KEEP (referenced by a loaded work / scoped thread).
+        referenced = {
+            m.cache_handles.get("Gemini")
+            for m in self.manager.reading_materials.values()
+        }
+        referenced.discard(None)
+        base = "https://generativelanguage.googleapis.com/v1beta"
+        headers = {"x-goog-api-key": gemini_key}
+        live: list[str] = []
+        try:
+            async with aiohttp.ClientSession() as session:
+                page_token = None
+                for _ in range(20):  # page cap — backstop against a runaway loop
+                    url = f"{base}/cachedContents?pageSize=100"
+                    if page_token:
+                        url += f"&pageToken={page_token}"
+                    async with session.get(url, headers=headers, timeout=60) as resp:
+                        if resp.status != 200:
+                            print(f"⚠️  Gemini cache reconcile: list HTTP {resp.status} — skipping sweep")
+                            return
+                        data = await resp.json()
+                    live.extend(
+                        c["name"] for c in data.get("cachedContents", []) if c.get("name")
+                    )
+                    page_token = data.get("nextPageToken")
+                    if not page_token:
+                        break
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            print(f"⚠️  Gemini cache reconcile: list failed ({e}) — skipping sweep")
+            return
+        except Exception as e:
+            print(f"⚠️  Gemini cache reconcile: unexpected error ({e}) — skipping sweep")
+            return
+        if not live:
+            return
+        orphans = [n for n in live if n not in referenced]
+        if not orphans:
+            print(f"🧹 Gemini cache reconcile: {len(live)} live, all referenced — clean.")
+            return
+        print(
+            f"🧹 Gemini cache reconcile: {len(live)} live, {len(live) - len(orphans)} kept, "
+            f"{len(orphans)} orphaned → deleting…"
+        )
+        for name in orphans:
+            await self._delete_gemini_cache(name)  # logs each deletion
 
     URL_PATTERN = re.compile(r'https?://[^\s\)\]<>\"\'`]+[^\s\.\,\)\]<>\"\'`:]')
     URL_EXTRACT_MAX = 3
