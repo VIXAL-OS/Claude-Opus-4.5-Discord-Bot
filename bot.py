@@ -3608,9 +3608,10 @@ class ClaudeBot(commands.Bot):
             or "CachedContent" in err_text
             or "CACHE" in err_text.upper()
         ):
-            print(f"⚠️  Gemini cache {cache_name} rejected; clearing handle and retrying inline")
+            print(f"⚠️  Gemini cache {cache_name} rejected; deleting it + retrying inline")
             reading_material.cache_handles.pop("Gemini", None)
             reading_material.cache_expires_at.pop("Gemini", None)
+            await self._delete_gemini_cache(cache_name)  # don't orphan the rejected cache
             self.manager.mark_dirty()
             # Rebuild body without cache reference
             inline_system = (
@@ -5663,13 +5664,33 @@ class ClaudeBot(commands.Bot):
             if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
                 channel_id = message.channel.parent_id
             material = self.manager.reading_materials.pop(channel_id, None)
-            if material is None:
+            # Cascade: drop any chapter-scoped materials pinned to this channel's
+            # threads too. Each !scope made its OWN Gemini cache keyed by the
+            # thread id; without this they orphan and keep billing storage until
+            # their TTL. (Snapshot items so we can mutate the dict while looping.
+            # Archived/uncached threads aren't resolvable here — those fall back
+            # to TTL expiry, which is bounded.)
+            scoped = []
+            for key, mat in list(self.manager.reading_materials.items()):
+                ch = self.get_channel(key)
+                if isinstance(ch, discord.Thread) and ch.parent_id == channel_id:
+                    scoped.append((key, mat))
+            for key, mat in scoped:
+                self.manager.reading_materials.pop(key, None)
+                await self._drop_gemini_cache(mat)  # stop scoped-thread cache billing
+            if material is None and not scoped:
                 await message.channel.send("Nothing loaded in this channel.")
             else:
-                await self._drop_gemini_cache(material)  # stop cache storage billing
+                if material is not None:
+                    await self._drop_gemini_cache(material)  # stop cache storage billing
                 self.manager.mark_dirty()
                 await self.manager.save_memories_async(providers=self.providers)
-                await message.channel.send(f"📤 Unloaded **{material.title}**.")
+                title = f"**{material.title}**" if material is not None else "the scoped threads"
+                tail = (
+                    f" (+{len(scoped)} scoped-thread cache{'s' if len(scoped) != 1 else ''})"
+                    if scoped else ""
+                )
+                await message.channel.send(f"📤 Unloaded {title}{tail}.")
 
         elif cmd == "!reading":
             # Lightweight info command — shows what's loaded without the
