@@ -1,15 +1,18 @@
 # Hydra Discord Bot (Opus-Deipseek)
 
-A multi-model Discord bot powered by **Claude Opus 4.8**, **DeepSeek V4-Pro**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts) across all three.
+A multi-model Discord bot powered by **Claude Opus 4.8**, **DeepSeek V4-Pro**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts). Three open-weight heads — **Mistral Large 3**, **Qwen 3.7**, and **GLM 5.2** — join via a single Fireworks AI endpoint (US jurisdiction, zero-data-retention, one key) when `FIREWORKS_API_KEY` is set.
 
-Affectionately maps to the EVA *MAGI* trinity:
+Affectionately maps to the EVA *MAGI* trinity, with the open-weight heads as the pilots you deploy:
 - **Claude / Balthasar** — careful, thorough, vision, native Anthropic web search, multi-tool orchestration
 - **DeepSeek / Melchior** — fast, cheap, CJK-strong, Tavily-backed search, automatic server-side prompt caching
 - **Gemini / Caspar** — abstract reasoning, long-context synthesis, vision, native Google Search grounding
+- **Mistral / Mari** — French & European-language specialist (the `!french` tutor), Apache-licensed, on Fireworks (US/ZDR)
+- **Qwen / Rei** — cheap, strong coding & math; auto-routed for routine code/math
+- **GLM / Asuka** — agentic/tool-use open head; override-only via `!glm` / `!asuka`
 
 ## Features
 
-- 🐉 **Multi-model (Hydra)** — Claude + DeepSeek + Gemini with automatic routing
+- 🐉 **Multi-model (Hydra)** — Claude + DeepSeek + Gemini (the MAGI trinity), plus optional Mistral + Qwen + GLM on one Fireworks endpoint, with automatic routing
 - 📚 **Bookclub mode** — pin long texts to a channel; discuss across all three models with per-thread chapter scoping
 - 🧵 **Thread-based conversations** — keeps channels clean
 - 📷 **Image understanding** — Claude and Gemini both see images
@@ -20,12 +23,14 @@ Affectionately maps to the EVA *MAGI* trinity:
 - 🧠 **Two-tier memory** — working notes (auto-decay) + long-term (permanent)
 - 😀 **Emoji reactions** — bot reacts to your messages
 - 📎 **File attachments** — long code becomes downloadable files
-- 💰 **Cache-aware cost tracking** — per-model usage, cache hit rates, true cost breakdown
-- 🀄 **Chinese language specialist** — DeepSeek translates and teaches CJK
+- 💰 **Cache-aware cost tracking** — per-model usage, cache hit rates, true cost breakdown, plus a rough per-provider energy/CO₂ estimate (grid intensity follows the endpoint, not the brand)
+- 🧪 **Research panel** — `!research` convenes a multi-model panel + judge into one synthesized answer; `!research all` adds the open-weight heads for max diversity
+- 🀄 **Chinese tutor** — DeepSeek translates and teaches CJK; `!speak` voices Mandarin with forced tones (Azure Xiaoxiao)
+- 🇫🇷 **French tutor** — Mistral teaches French; `!french` voices it in a natural fr-FR voice with IPA + liaison notes (Azure Denise)
 
 ## The Hydra System
 
-Three AI models share one Discord bot, taking turns "fronting" like a plural system:
+The MAGI trinity shares one Discord bot, taking turns "fronting" like a plural system (the three Fireworks heads join the rotation when configured):
 
 ```
        User message arrives
@@ -37,14 +42,17 @@ Three AI models share one Discord bot, taking turns "fronting" like a plural sys
 **[Claude]** **[Gemini]** **[Deepseek]**
 ```
 
-**How routing works (three-way argmax with cost tiebreaks):**
-- Images → Claude or Gemini (DeepSeek is text-only)
+**How routing works (argmax over enabled models with cost tiebreaks):**
+- Images → Claude or Gemini (the others are text-only here)
 - CJK text → DeepSeek (deeper Chinese training data)
 - Novel reasoning / abstract patterns / long-context synthesis → Gemini (ARC-AGI-2 strength)
 - Complex code / multi-tool orchestration / careful epistemics → Claude
+- Routine code / math → Qwen (frontier coding/math at Fireworks prices; complex/careful work still goes to Claude)
+- French-language intent → Mistral
 - Short factual / casual chat → DeepSeek (50-100× cheaper)
-- Ties → cheaper model wins (DeepSeek > Gemini > Claude on cost)
-- Users override with `!claude` / `!opus` / `!balthasar`, `!deepseek` / `!melchior`, `!gemini` / `!caspar`
+- Ties → cheaper model wins
+- GLM stays **override-only** (its agentic niche isn't what the chat router does)
+- Users override with `!claude`/`!opus`/`!balthasar`, `!deepseek`/`!melchior`, `!gemini`/`!caspar`, `!mistral`/`!mari`, `!qwen`/`!rei`, `!glm`/`!asuka`
 - Per-channel preferences via `!prefer`
 
 **Models know who they are** — each gets a tailored system prompt with its identity, capabilities, why it was selected, and can see labeled messages from the other two in conversation history.
@@ -67,15 +75,28 @@ Three AI models share one Discord bot, taking turns "fronting" like a plural sys
 | `!claude <msg>` / `!opus <msg>` / `!balthasar <msg>` | Force Claude to respond |
 | `!deepseek <msg>` / `!melchior <msg>` | Force DeepSeek to respond |
 | `!gemini <msg>` / `!caspar <msg>` | Force Gemini to respond |
+| `!mistral <msg>` / `!mari <msg>` | Force Mistral — French/EU specialist (needs `FIREWORKS_API_KEY`) |
+| `!qwen <msg>` / `!rei <msg>` | Force Qwen — cheap coder/mathematician (needs `FIREWORKS_API_KEY`) |
+| `!glm <msg>` / `!asuka <msg>` | Force GLM — agentic open head (needs `FIREWORKS_API_KEY`) |
 | `!think <msg>` | Use extended thinking (deeper reasoning, slower & costlier) |
 | `!think:<level> <msg>` | Force a specific Opus effort level (`low`/`medium`/`high`/`xhigh`/`max`) |
 | `!models` | Show available models and usage stats |
-| `!prefer [claude\|deepseek\|gemini\|auto]` | Set model preference for this channel |
+| `!prefer [claude\|deepseek\|gemini\|mistral\|qwen\|glm\|auto]` | Set model preference for this channel |
 | `!calibration` | Show confidence calibration stats |
+| `!research <question>` | Multi-model panel + judge → one synthesized answer (~3-4× cost) |
+| `!research all <question>` | Full roster (adds Mistral/Qwen/GLM when configured) for max diversity |
 
 Prefixes can stack in any order: `!think !claude <msg>` forces Claude with thinking on. Thinking auto-enables on `!claude`/`!opus` when prompts look hard (cues like "derive", "why does X", "step by step", LaTeX, large code blocks, stack traces) and picks an Opus effort level (`high`/`xhigh`/`max`) from the same signals. For DeepSeek and Gemini, thinking is opt-in only via `!think`. Reasoning content is cached per Discord message so multi-turn thinking conversations work across providers.
 
 React with 👍❤️🔥✅😂💖💯 (positive) or 👎❌😕 (negative) to bot responses to improve model selection over time.
+
+### Language tutors (text-to-speech)
+| Command | Description |
+|---------|-------------|
+| `!speak <chinese / pinyin / phrase>` | Mandarin TTS with tones forced from pinyin → MP3 (Azure Xiaoxiao) |
+| `!french <french / english phrase>` | French TTS in a natural fr-FR voice (Azure Denise) + IPA & liaison note → MP3 |
+
+Both need `AZURE_TTS_KEY` / `AZURE_TTS_REGION` (Azure's free tier covers ~0.5M chars/month). Models can also voice phrases inline while teaching — `!speak 汉字` for Mandarin, `[[french: la phrase]]` for French — and the bot computes the authoritative pinyin / IPA so the models never hand-write it. DeepSeek is the Chinese-native frontend; Mistral is the French-native one. Mandarin **forces** exact tones via SSML; French **infers** pronunciation (the fr-FR voice already nails liaison, nasals, and silent letters) and shows the IPA for the learner.
 
 ### Memory
 | Command | Description |
@@ -189,6 +210,8 @@ AO3 sheds anonymous traffic under load with HTTP 403 "Shields are up!" — affec
 - **DeepSeek** ([platform.deepseek.com](https://platform.deepseek.com/)) — required or optional
 - **Gemini** ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)) — required or optional; AI Studio key, not Vertex
 - **Tavily** ([tavily.com](https://tavily.com/)) — optional, enables DeepSeek web search (free 1,000 searches/month)
+- **Fireworks** ([fireworks.ai](https://fireworks.ai/)) — optional, one key serves Mistral + Qwen + GLM on US zero-retention infra (prepaid as of July 2026 — set auto-reload so calls don't fail at $0)
+- **Azure Speech** ([portal.azure.com](https://portal.azure.com/)) — optional, powers `!speak` (Mandarin) and `!french` (French) TTS (free tier ~0.5M chars/month)
 - **AO3 cookie** — optional, bypasses shields-up for bookclub mode (see [Bookclub Mode](#bookclub-mode))
 
 At least one of Anthropic / DeepSeek / Gemini API keys is required.
@@ -209,7 +232,8 @@ ANTHROPIC_API_KEY=your_anthropic_key      # Optional if Gemini or DeepSeek only
 DEEPSEEK_API_KEY=your_deepseek_key        # Optional
 GEMINI_API_KEY=your_gemini_key            # Optional
 TAVILY_API_KEY=your_tavily_key            # Optional
-AZURE_TTS_KEY=your_azure_speech_key       # Optional, Mandarin !speak (forced tones)
+FIREWORKS_API_KEY=your_fireworks_key      # Optional, enables Mistral + Qwen + GLM (one key, US/ZDR)
+AZURE_TTS_KEY=your_azure_speech_key       # Optional, !speak (Mandarin) + !french (French) TTS
 AZURE_TTS_REGION=eastus                    # Optional, Azure Speech resource region
 AO3_COOKIE=                               # Optional, for bookclub mode
 ```
@@ -228,7 +252,7 @@ AO3_COOKIE=                               # Optional, for bookclub mode
 python bot.py
 ```
 
-The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemini} depending on which API keys are present.
+The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemini, Mistral, Qwen, GLM} depending on which API keys are present. `FIREWORKS_API_KEY` gates Mistral/Qwen/GLM together; its absence disables exactly those three and leaves the original trio untouched.
 
 ## Cost Comparison
 
@@ -237,18 +261,24 @@ The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemin
 | Claude Opus 4.8 | $5/M | $0.50/M (10%) | $25/M | ~$0.02-0.05 | ~$0.16/turn after cache |
 | Gemini 3.1 Pro | $2-4/M (tiered ≤/>200k) | $0.50-1.00/M (25%) | $12-18/M | ~$0.01-0.02 | ~$0.40/turn after cache |
 | DeepSeek V4 Pro | $0.435/M | $0.003625/M (~99%) | $0.87/M | ~$0.0005-0.002 | ~$0.005/turn after cache |
+| Mistral Large 3 (Fireworks) | $0.90/M | $0.45/M (50%) | $3.00/M | ~$0.002-0.006 | — |
+| Qwen 3.7 Plus (Fireworks) | $0.50/M | $0.25/M (50%) | $3.00/M | ~$0.002-0.005 | — |
+| GLM 5.2 (Fireworks) | $1.40/M | $0.70/M (50%) | $4.40/M | ~$0.003-0.008 | — |
 
-DeepSeek handles routine chat at ~10-30× less cost. Gemini specializes in long-context synthesis and novel reasoning. Claude handles complex tasks that justify the premium. Use `!cost` to see real-time breakdown including cache hit rates.
+The three Fireworks rows are estimates — verify on the [Fireworks pricing page](https://fireworks.ai/pricing); serverless can run ~2-4× a model-maker's own API (the US-residency + ZDR + one-bill premium). Fireworks discounts cached input by 50% by default.
+
+DeepSeek handles routine chat at ~10-30× less cost. Gemini specializes in long-context synthesis and novel reasoning. Claude handles complex tasks that justify the premium. Qwen catches routine code/math cheaply; Mistral is the French/EU specialist. Use `!cost` to see a real-time breakdown including cache hit rates and a rough per-provider energy/CO₂ estimate (each provider's grid carbon intensity follows the *endpoint*, not the brand — Mistral-on-Fireworks is US grid, not French nuclear).
 
 Caching is the difference between $5/turn and $0.50/turn for Claude bookclub mode, so it matters. The bot tracks cached and uncached tokens separately and reports the hit rate per provider.
 
 ## Architecture
 
 ```
-bot.py (single file, ~4600 lines)
+bot.py (single file, ~5900 lines)
 ├── BotConfig                 - per-bot settings (context budget, message fetch limit)
 ├── ModelProvider             - per-model config: pricing (with cached + tiered rates),
-│                              context window, search backend, runtime stats
+│                              context window, search backend, runtime stats,
+│                              rough energy/CO₂ estimate (Wh + per-provider grid + training)
 ├── SearchResult              - text + structured citations + grounded-answer flag
 ├── ReadingMaterial           - bookclub mode: pinned text, chapter breaks,
 │                              per-provider cache handles, 24h TTL tracking
@@ -260,7 +290,8 @@ bot.py (single file, ~4600 lines)
 └── ClaudeBot                 - main bot class
     ├── _select_model()                  - heuristic routing (no LLM call)
     ├── _estimate_confidence()           - per-model scoring with CJK detection
-    ├── _generate_response()             - dispatches to Claude/DeepSeek/Gemini
+    ├── _generate_response()             - dispatches to Claude/DeepSeek/Gemini +
+    │                                      Mistral/Qwen/GLM (Fireworks, shared client)
     ├── _generate_openai_compatible_response()
     │                                    - DeepSeek + Gemini (non-bookclub) shim path
     ├── _generate_gemini_native_response()
