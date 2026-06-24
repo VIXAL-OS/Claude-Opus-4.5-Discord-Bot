@@ -182,6 +182,8 @@ Common pitfalls to avoid in your LaTeX (these silently produce wrong-looking ren
 
 **Speech (Mandarin TTS)**: You can attach spoken Mandarin audio inline while teaching — just write `!speak 汉字` (the command word followed immediately by the Chinese characters). The bot voices it with Azure's Xiaoxiao voice (tones forced correct via SSML), attaches an MP3, and rewrites the marker as "汉字 (spoken `pīnyīn` · dict. `pīnyīn`) 🔊" — it computes and appends the correct, sandhi-aware pinyin (both the spoken form and the dictionary form) for you. So you do NOT need to hand-write the pinyin next to a phrase you're speaking — let the bot be the source of truth; this avoids tone-mark mistakes. Write the literal `!speak` before EACH phrase you want spoken, every single time — the "🔊" you see in the result is added by the bot AFTER it processes your command, so don't reproduce that look from memory and expect audio. (As a safety net, a phrase written immediately followed by 🔊 is also spoken — but `!speak 汉字` is the real command.) Up to ~8 clips per message, e.g. a tone contrast: !speak 妈, !speak 麻, !speak 马, !speak 骂. If you ever need to override the pronunciation, use `[[speak: 汉字 | nǐ hǎo]]` to pin exact pinyin (tone marks or numbers). Mandarin only.
 
+**Speech (French TTS)**: You can also attach spoken French inline while teaching — write `[[french: votre phrase ici]]` (English in is fine too; the bot translates to French). The bot speaks it in a natural Azure fr-FR voice (Denise) and rewrites the marker as "phrase (`IPA` — liaison note) 🔊", computing the IPA and a one-line pronunciation note for you — so DON'T hand-write IPA; let the bot be the source of truth. Up to ~8 clips per message. Unlike Mandarin (where tones are forced), French pronunciation is inferred by the native voice, so just give the words. Mistral is the resident French specialist.
+
 **Images**: You can see images that users upload.
 
 **Thread awareness**: You can see other recent threads in this channel. Use this for context about what the team has been working on, but DON'T write notes about other threads - that context is fetched fresh each time.
@@ -288,6 +290,34 @@ class ModelProvider:
     # adding a key here and a matching entry in ClaudeBot.search_backends.
     search_backend: Optional[str] = None
 
+    # --- !cost energy/CO₂ gauge (order-of-magnitude, NOT a measurement) -------
+    # est_wh_per_1k_tokens: rough watt-hours per 1k tokens for a NON-reasoning
+    # turn. Anchored to measured frontier inference (~0.3–0.6 Wh/query, median
+    # 0.31; MoE/low-active-param models land lower) — arXiv 2505.09598. Per-token
+    # metering already captures most of the reasoning blow-up: a !think turn just
+    # emits far more tokens, so the measured ~70–100× per-*query* hit on R1-class
+    # models is mostly token count, leaving only a residual ~3–5× per-token
+    # premium we don't model. Relative ranking is the signal, not the absolute.
+    est_wh_per_1k_tokens: float = 0.5
+    # grid_gco2_per_kwh: carbon intensity of the grid/fleet THIS provider's
+    # endpoint actually runs on (gCO₂e/kWh). Per-provider because it's the
+    # well-documented, decision-relevant axis: France/EU nuclear ≈ 20, US average
+    # ≈ 400, Google (66% 24/7-CFE) ≈ 130, AWS (RECs + clean anchors) ≈ 250, a
+    # no-CFE US serverless fleet ≈ US avg, China grid ≈ 580. Tied to the
+    # *endpoint*, not the brand: Mistral-on-Fireworks is US (~400), NOT French
+    # nuclear — you'd only get the ~20 by calling api.mistral.ai directly.
+    # None → fall back to the global GRID_GCO2_PER_KWH.
+    grid_gco2_per_kwh: Optional[float] = None
+    # train_tco2e: one-time TRAINING carbon (tonnes CO₂e), embodied at the
+    # *training* grid (France ~clean for Mistral; a China province for
+    # Qwen/GLM/DeepSeek; US for Claude/Gemini) — NOT the inference grid above.
+    # Amortized over MODEL_LIFETIME_TOKENS into a separate !cost line. None →
+    # omit. Published anchors are rare (Mistral Large-2 LCA = 2200 t); the rest
+    # are order-of-magnitude estimates. Amortized share is small for widely-
+    # served models (~10–15% of lifetime per Mistral's LCA), so the wide error
+    # bars don't swamp the firmer inference gauge.
+    train_tco2e: Optional[float] = None
+
     # Runtime stats — bottom-tier (or all, if untiered)
     total_input_tokens: int = 0          # uncached input only
     total_output_tokens: int = 0
@@ -361,6 +391,46 @@ class ModelProvider:
             cached_cost += (self.total_cached_input_tokens_above_tier / 1_000_000) * above_cache_rate
         return input_cost + output_cost + cached_cost
 
+    def get_energy_wh(self) -> float:
+        """Order-of-magnitude inference-energy estimate in watt-hours: every
+        token this provider has processed × its per-1k-token Wh proxy. A
+        relative gauge for !cost, not a measurement (see est_wh_per_1k_tokens)."""
+        total_tokens = (
+            self.total_input_tokens
+            + self.total_cached_input_tokens
+            + self.total_output_tokens
+            + self.total_input_tokens_above_tier
+            + self.total_cached_input_tokens_above_tier
+            + self.total_output_tokens_above_tier
+        )
+        return total_tokens / 1000.0 * self.est_wh_per_1k_tokens
+
+    def get_co2_g(self, fallback_grid_gco2_per_kwh: float) -> float:
+        """Rough CO₂e grams: this provider's energy × the carbon intensity of
+        the fleet its endpoint runs on (its own grid_gco2_per_kwh, else the
+        passed global fallback). The per-provider grid is where the real signal
+        lives — the same tokens on French nuclear vs a US gas fleet differ ~20×."""
+        grid = self.grid_gco2_per_kwh
+        if grid is None:
+            grid = fallback_grid_gco2_per_kwh
+        return self.get_energy_wh() / 1000.0 * grid
+
+    def get_amortized_train_co2_g(self, lifetime_tokens: float) -> float:
+        """Rough amortized TRAINING CO₂e (grams) attributable to the tokens this
+        provider has served: total training carbon spread over an assumed model
+        lifespan. Squishy — the lifetime token count is the dominant unknown —
+        so it's surfaced as its own !cost line, never folded into the firmer
+        inference number. 0 when train_tco2e is unknown."""
+        if not self.train_tco2e or lifetime_tokens <= 0:
+            return 0.0
+        served = (
+            self.total_input_tokens + self.total_cached_input_tokens
+            + self.total_output_tokens + self.total_input_tokens_above_tier
+            + self.total_cached_input_tokens_above_tier
+            + self.total_output_tokens_above_tier
+        )
+        return self.train_tco2e * 1_000_000.0 * (served / lifetime_tokens)
+
     def to_stats_dict(self) -> dict:
         return {
             "input_tokens": self.total_input_tokens,
@@ -409,6 +479,24 @@ class SearchResult:
 # same method shape, instantiate it in __init__, key it in self.search_backends.
 
 
+# Fallback grid carbon intensity (g CO₂e per kWh) for any provider that doesn't
+# set its own grid_gco2_per_kwh. Default ≈ the US average grid (~384 g in 2024;
+# IEA puts 2025–26 at ~400–435) — override with GRID_GCO2_PER_KWH in .env. Each
+# provider overrides this with the intensity of the fleet its endpoint really
+# runs on (see ModelProvider.grid_gco2_per_kwh). A transparent, tunable
+# assumption — the !cost line is an order-of-magnitude *relative* gauge, not a
+# precise footprint, and we never route on it.
+GRID_GCO2_PER_KWH = float(os.getenv("GRID_GCO2_PER_KWH", "400"))
+
+# Amortization horizon for embodied TRAINING carbon (see ModelProvider.train_
+# tco2e). The dominant unknown — a frontier model serves ~10^13–10^15 tokens
+# over its ~1–2-yr life. Default 1e14 (~100T) is calibrated so Mistral's public
+# LCA reproduces (~2200 t training ≈ 10–15% of its lifetime footprint). Override
+# with MODEL_LIFETIME_TOKENS in .env; AMORTIZE_TRAINING=0 hides the line.
+MODEL_LIFETIME_TOKENS = float(os.getenv("MODEL_LIFETIME_TOKENS", "1e14"))
+AMORTIZE_TRAINING = os.getenv("AMORTIZE_TRAINING", "1") not in ("0", "false", "False", "")
+
+
 CLAUDE_PROVIDER = ModelProvider(
     name="Claude",
     model_id="claude-opus-4-8",
@@ -421,6 +509,9 @@ CLAUDE_PROVIDER = ModelProvider(
     max_context_tokens=1_000_000,  # 1M GA'd for Opus 4.6+ in March 2026
     supports_vision=True,
     supports_web_search=True,
+    est_wh_per_1k_tokens=0.6,  # large frontier model, but Anthropic ranks high on per-query efficiency
+    grid_gco2_per_kwh=250.0,   # AWS fleet: RECs + clean anchors (e.g. the PA nuclear Anthropic capacity)
+    train_tco2e=8000.0,        # undisclosed — order-of-magnitude estimate for an Opus-class US train
 )
 
 DEEPSEEK_PROVIDER = ModelProvider(
@@ -442,6 +533,9 @@ DEEPSEEK_PROVIDER = ModelProvider(
     disables_thinking_by_default=True,
     # Deepseek has no native web search; route through Tavily.
     search_backend="tavily",
+    est_wh_per_1k_tokens=0.3,  # sparse MoE (~37B active) — light per token
+    grid_gco2_per_kwh=550.0,   # DeepSeek China API (east-CN grid; province-dependent — Sichuan hydro ~112, Inner Mongolia coal higher). fireworks backend → ~400; self-host → your grid
+    train_tco2e=1000.0,        # ~1.4 GWh for V3 (2.78M GPU-hrs); V4 est. — very training-efficient
 )
 
 GEMINI_PROVIDER = ModelProvider(
@@ -460,6 +554,9 @@ GEMINI_PROVIDER = ModelProvider(
     # Verify exact numbers on the pricing page — these are best-known estimates.
     cached_input_cost_per_million=0.5,
     cached_input_cost_per_million_above_tier=1.0,
+    est_wh_per_1k_tokens=0.5,  # large Pro model
+    grid_gco2_per_kwh=130.0,   # Google fleet: 66% 24/7 carbon-free (some regions ≥80%) — cleanest US hyperscaler
+    train_tco2e=3000.0,        # undisclosed — large model but on Google's clean training fleet → est.
     # 1M context standard for Gemini Pro line. Bookclub-mode chat (when a
     # reading material is loaded) routes through _generate_gemini_native_response
     # instead of the OpenAI shim, so we can reference cachedContent — Google's
@@ -479,6 +576,63 @@ GEMINI_PROVIDER = ModelProvider(
     disables_thinking_by_default=False,
     # Native Google Search grounding via aiohttp to the native endpoint.
     search_backend="google_native",
+)
+
+
+# --- Open-weight heads, all served through ONE Fireworks endpoint + ONE key ---
+# US, zero-data-retention infrastructure. EVA pilots (the cheap units you
+# deploy): Mistral=Mari, Qwen=Rei, GLM=Asuka. They ride the existing
+# OpenAI-compatible generator — no new generator, just registry entries differing
+# by model slug (verified in the live Fireworks library 2026-06). Inference grid
+# is Fireworks-US (~400) for ALL of them — it follows the ENDPOINT, not the brand
+# (Mistral-on-Fireworks is NOT French nuclear; that ~20 g win needs
+# api.mistral.ai). Pricing is $/Mtok; cached input = 0.5 × input (Fireworks 50%
+# cache discount). Routing: Qwen earns the auto-router as the cheap
+# coder/mathematician, Mistral gets a narrow French nudge, GLM stays override-
+# only — see _estimate_confidence. Vision off for safety (Claude/Gemini see).
+MISTRAL_PROVIDER = ModelProvider(
+    name="Mistral",
+    model_id="accounts/fireworks/models/mistral-large-3-fp8",
+    input_cost_per_million=0.90,         # VERIFY on Fireworks pricing page
+    output_cost_per_million=3.00,
+    cached_input_cost_per_million=0.45,  # 50% of input (Fireworks default)
+    max_context_tokens=256_000,
+    supports_vision=False,
+    supports_web_search=False,
+    search_backend="tavily",
+    est_wh_per_1k_tokens=0.35,  # 675B/41B MoE — light per token
+    grid_gco2_per_kwh=400.0,    # Fireworks US fleet (NOT France — that win needs api.mistral.ai)
+    train_tco2e=2200.0,         # Mistral Large-2 LCA (Carbone 4); France-grid-embodied → genuinely low-carbon train
+)
+
+QWEN_PROVIDER = ModelProvider(
+    name="Qwen",
+    model_id="accounts/fireworks/models/qwen3p7-plus",
+    input_cost_per_million=0.50,         # VERIFY on Fireworks pricing page
+    output_cost_per_million=3.00,
+    cached_input_cost_per_million=0.25,
+    max_context_tokens=256_000,
+    supports_vision=False,
+    supports_web_search=False,
+    search_backend="tavily",
+    est_wh_per_1k_tokens=0.35,  # MoE — light per token
+    grid_gco2_per_kwh=400.0,    # Fireworks US fleet (trained on Alibaba's cleaner CN fleet → embodied in train_tco2e)
+    train_tco2e=1500.0,         # estimate — Alibaba targets 100% clean by 2030 (Zhangjiakou wind / Ulanqab)
+)
+
+GLM_PROVIDER = ModelProvider(
+    name="GLM",
+    model_id="accounts/fireworks/models/glm-5p2",
+    input_cost_per_million=1.40,         # VERIFY on Fireworks pricing page
+    output_cost_per_million=4.40,
+    cached_input_cost_per_million=0.70,
+    max_context_tokens=200_000,
+    supports_vision=False,
+    supports_web_search=False,
+    search_backend="tavily",
+    est_wh_per_1k_tokens=0.45,  # 744B — larger
+    grid_gco2_per_kwh=400.0,    # Fireworks US fleet
+    train_tco2e=2000.0,         # estimate — GLM-5 (744B) trains end-to-end on Huawei Ascend; CN province grid
 )
 
 
@@ -1221,6 +1375,9 @@ class ConversationManager:
         lines = ["💰 **Cost Summary**"]
         grand_total = 0.0
         storage_total = 0.0
+        energy_wh_total = 0.0
+        co2_g_total = 0.0
+        train_co2_g_total = 0.0
 
         for p in providers:
             storage_est = p.total_cache_storage_cost_est
@@ -1229,6 +1386,11 @@ class ConversationManager:
             cost = p.get_cost()
             grand_total += cost
             storage_total += storage_est
+            energy_wh = p.get_energy_wh()
+            energy_wh_total += energy_wh
+            co2_g = p.get_co2_g(GRID_GCO2_PER_KWH)
+            co2_g_total += co2_g
+            train_co2_g_total += p.get_amortized_train_co2_g(MODEL_LIFETIME_TOKENS)
 
             # Sum uncached + cached across both pricing tiers
             uncached_in = p.total_input_tokens + p.total_input_tokens_above_tier
@@ -1252,6 +1414,12 @@ class ConversationManager:
                     f"      ⏳ + ~${storage_est:.4f} est. Gemini cache storage "
                     f"(time-based, separate from tokens)"
                 )
+            if energy_wh > 0:
+                grid = p.grid_gco2_per_kwh if p.grid_gco2_per_kwh is not None else GRID_GCO2_PER_KWH
+                lines.append(
+                    f"      🌱 ≈ {energy_wh:.1f} Wh ≈ {co2_g:.0f} g CO₂e "
+                    f"(grid ≈ {grid:.0f} g/kWh)"
+                )
 
         if grand_total == 0 and storage_total == 0:
             return "💰 No API calls made yet."
@@ -1264,6 +1432,18 @@ class ConversationManager:
             )
         else:
             lines.append(f"\n  **Total**: ${grand_total:.4f}")
+        if energy_wh_total > 0:
+            lines.append(
+                f"  **Energy (est)**: ≈ {energy_wh_total:.1f} Wh ≈ {co2_g_total:.0f} g CO₂e — "
+                f"order-of-magnitude only; per-provider grid intensity, non-reasoning baseline "
+                f"(tune Wh/grid in code/.env)."
+            )
+        if AMORTIZE_TRAINING and train_co2_g_total > 0:
+            lines.append(
+                f"  **+ amortized training (rough)**: ≈ {train_co2_g_total:.0f} g CO₂e — "
+                f"embodied training carbon over a ~{MODEL_LIFETIME_TOKENS / 1e12:.0f}T-token "
+                f"lifespan (squishiest estimate here; AMORTIZE_TRAINING=0 to hide)."
+            )
         return "\n".join(lines)
     
     def save_memories(self, filepath: str = "memories.json", providers: list[ModelProvider] = None) -> None:
@@ -1362,6 +1542,10 @@ class ClaudeBot(commands.Bot):
         self.claude_provider = CLAUDE_PROVIDER
         self.deepseek_provider = DEEPSEEK_PROVIDER
         self.gemini_provider = GEMINI_PROVIDER
+        # Open-weight heads on Fireworks (enabled below iff FIREWORKS_API_KEY).
+        self.mistral_provider = MISTRAL_PROVIDER
+        self.qwen_provider = QWEN_PROVIDER
+        self.glm_provider = GLM_PROVIDER
 
         # Anthropic client. max_retries=4 (default 2) absorbs more transient
         # 5xx blips silently — important for bookclub mode where cache-creation
@@ -1409,6 +1593,30 @@ class ClaudeBot(commands.Bot):
             self.gemini_provider.enabled = False
             print("⚪ Gemini not configured (GEMINI_API_KEY missing)")
 
+        # Fireworks AI (OpenAI-compatible, optional). ONE endpoint + ONE key
+        # serves all three open-weight heads — Mistral (Mari), Qwen (Rei), GLM
+        # (Asuka) — on US, zero-data-retention infra. They share fireworks_client
+        # and dispatch through the existing OpenAI-compatible generator. Absent
+        # key disables exactly these three; the original trio is untouched.
+        self._fireworks_providers = (
+            self.mistral_provider, self.qwen_provider, self.glm_provider,
+        )
+        fireworks_key = os.getenv("FIREWORKS_API_KEY")
+        if fireworks_key:
+            from openai import OpenAI
+            self.fireworks_client = OpenAI(
+                api_key=fireworks_key,
+                base_url="https://api.fireworks.ai/inference/v1",
+            )
+            for prov in self._fireworks_providers:
+                prov.enabled = True
+            print("🟢 Fireworks enabled (Mistral/Mari · Qwen/Rei · GLM/Asuka — US/ZDR)")
+        else:
+            self.fireworks_client = None
+            for prov in self._fireworks_providers:
+                prov.enabled = False
+            print("⚪ Fireworks not configured (FIREWORKS_API_KEY missing — Mistral/Qwen/GLM disabled)")
+
         # Tavily search client (optional - enables web search for Deepseek).
         # Gemini uses Google's native grounding (no Tavily needed); see
         # _google_native_search and GEMINI_PROVIDER.search_backend="google_native".
@@ -1438,6 +1646,9 @@ class ClaudeBot(commands.Bot):
             self.claude_provider,
             self.deepseek_provider,
             self.gemini_provider,
+            self.mistral_provider,
+            self.qwen_provider,
+            self.glm_provider,
         ]
 
         # Map provider → OpenAI-compatible client so the generic generator can
@@ -1445,6 +1656,11 @@ class ClaudeBot(commands.Bot):
         self.openai_compatible_clients: dict[str, object] = {
             self.deepseek_provider.name: self.deepseek_client,
             self.gemini_provider.name: self.gemini_client,
+            # All three Fireworks heads share one client (None when no key — but
+            # they're also disabled then, so _select_model never dispatches them).
+            self.mistral_provider.name: self.fireworks_client,
+            self.qwen_provider.name: self.fireworks_client,
+            self.glm_provider.name: self.fireworks_client,
         }
 
         # Conversation manager
@@ -1458,6 +1674,15 @@ class ClaudeBot(commands.Bot):
         # already pay for — no GPT. (Fable 5 is intentionally omitted: not
         # generally accessible yet.) Disabled members are skipped at runtime.
         self.panel_members: list[str] = ["Claude", "Gemini", "Deepseek"]
+        # `!research all` convenes the full roster — the cheap Fireworks heads
+        # (Mistral/Qwen/GLM) join for maximum decorrelated diversity. Different
+        # training data → independent errors → a better judge synthesis: a panel
+        # *rewards* the redundancy a router would punish. Filtered by `enabled`,
+        # so they're silently skipped until FIREWORKS_API_KEY turns them on —
+        # this list is forward-compatible today (no GPT, per the panel charter).
+        self.panel_members_all: list[str] = [
+            "Claude", "Gemini", "Deepseek", "Mistral", "Qwen", "GLM",
+        ]
         self.panel_judge: str = "Claude"
 
         # Reasoning cache for thinking-mode multi-turn (keyed by Discord msg.id).
@@ -1479,6 +1704,10 @@ class ClaudeBot(commands.Bot):
     CLAUDE_PREFIXES = ("!claude", "!opus", "!balthasar")
     DEEPSEEK_PREFIXES = ("!deepseek", "!melchior")
     GEMINI_PREFIXES = ("!gemini", "!caspar")
+    # Fireworks open-weight heads — EVA pilots (first-name aliases).
+    MISTRAL_PREFIXES = ("!mistral", "!mari")
+    QWEN_PREFIXES = ("!qwen", "!rei")
+    GLM_PREFIXES = ("!glm", "!asuka")
     CLAUDE_THINKING_EFFORT = "high"  # low | medium | high | xhigh | max
     CLAUDE_THINKING_MAX_TOKENS = 16000
 
@@ -1625,6 +1854,9 @@ class ClaudeBot(commands.Bot):
             + self.CLAUDE_PREFIXES
             + self.DEEPSEEK_PREFIXES
             + self.GEMINI_PREFIXES
+            + self.MISTRAL_PREFIXES
+            + self.QWEN_PREFIXES
+            + self.GLM_PREFIXES
         )
         while True:
             stripped = content.strip()
@@ -1666,6 +1898,12 @@ class ClaudeBot(commands.Bot):
                     flags.add("deepseek")
                 elif prefix in self.GEMINI_PREFIXES:
                     flags.add("gemini")
+                elif prefix in self.MISTRAL_PREFIXES:
+                    flags.add("mistral")
+                elif prefix in self.QWEN_PREFIXES:
+                    flags.add("qwen")
+                elif prefix in self.GLM_PREFIXES:
+                    flags.add("glm")
                 content = rest
                 matched = True
                 break
@@ -1776,6 +2014,15 @@ class ClaudeBot(commands.Bot):
         if "gemini" in flags and not self.gemini_provider.enabled:
             await message.channel.send("❌ Gemini is not configured (no API key).")
             return
+        if "mistral" in flags and not self.mistral_provider.enabled:
+            await message.channel.send("❌ Mistral (Mari) isn't configured (no FIREWORKS_API_KEY).")
+            return
+        if "qwen" in flags and not self.qwen_provider.enabled:
+            await message.channel.send("❌ Qwen (Rei) isn't configured (no FIREWORKS_API_KEY).")
+            return
+        if "glm" in flags and not self.glm_provider.enabled:
+            await message.channel.send("❌ GLM (Asuka) isn't configured (no FIREWORKS_API_KEY).")
+            return
 
         forced_provider = None
         routing_reason = ""
@@ -1788,6 +2035,15 @@ class ClaudeBot(commands.Bot):
         elif "gemini" in flags:
             forced_provider = self.gemini_provider
             routing_reason = "User directly invoked Gemini with !gemini/!caspar."
+        elif "mistral" in flags:
+            forced_provider = self.mistral_provider
+            routing_reason = "User directly invoked Mistral (Mari) with !mistral/!mari."
+        elif "qwen" in flags:
+            forced_provider = self.qwen_provider
+            routing_reason = "User directly invoked Qwen (Rei) with !qwen/!rei."
+        elif "glm" in flags:
+            forced_provider = self.glm_provider
+            routing_reason = "User directly invoked GLM (Asuka) with !glm/!asuka."
 
         if flags:
             message.content = peeled_content
@@ -1878,6 +2134,12 @@ class ClaudeBot(commands.Bot):
             message.guild.id, response, max_files=10 - len(files)
         )
         files.extend(speak_files)
+
+        # Same for inline [[french:...]] markers → French TTS attachments.
+        response, french_files = await self._render_french_attachments(
+            message.guild.id, response, max_files=10 - len(files)
+        )
+        files.extend(french_files)
 
         # Send response (handle Discord's 2000 char limit)
         sent_msg = await self._send_response(thread, response, files)
@@ -2096,6 +2358,38 @@ class ClaudeBot(commands.Bot):
                 "bullet points, numbered lists, tables, and headers unless the user "
                 "specifically asks for structured output. Keep it conversational — this "
                 "is Discord chat, not a slide deck. Minimize blank lines between paragraphs."
+            )
+        elif provider.name == "Mistral":
+            identity = f"Mistral (model: {provider.model_id}), an AI assistant made by Mistral AI (Paris)"
+            identity_details = (
+                "Your collaborators **[Claude]** (careful/thorough), **[Gemini]** (abstract "
+                "reasoning), and **[Deepseek]** (fast, CJK-strong) are different models, not "
+                "you. You can't see images; you can search via Tavily. You shine at French and "
+                "other European languages, multilingual nuance, and clean reasoning.\n\n"
+                "**French language specialty**: you're French-native (a Paris lab), so when "
+                "French comes up you're the resident tutor — translate it for the group and, "
+                "when it's fun or useful, give bite-sized lessons (a liaison, a silent letter, "
+                "a nasal vowel, an idiom that doesn't translate literally). To attach audio, "
+                "write `[[french: la phrase]]`; the bot voices it (Azure fr-FR) and appends the "
+                "IPA + a pronunciation note for you — you don't hand-write the IPA.\n\n"
+                "**Important: always respond in English** (use French inline for examples), and "
+                "write in flowing prose, not listicles — this is Discord chat. Minimize blank lines."
+            )
+        elif provider.name == "Qwen":
+            identity = f"Qwen (model: {provider.model_id}), an AI assistant made by Alibaba"
+            identity_details = (
+                "Your collaborators **[Claude]**, **[Gemini]**, and **[Deepseek]** are "
+                "different models, not you. You can't see images; you can search via Tavily. "
+                "You shine at coding and math at low cost. Respond in English, in flowing prose "
+                "(not listicles) — this is Discord chat. Minimize blank lines."
+            )
+        elif provider.name == "GLM":
+            identity = f"GLM (model: {provider.model_id}), an AI assistant made by Zhipu AI"
+            identity_details = (
+                "Your collaborators **[Claude]**, **[Gemini]**, and **[Deepseek]** are "
+                "different models, not you. You can't see images; you can search via Tavily. "
+                "You shine at agentic, tool-using, and coding tasks. Respond in English, in "
+                "flowing prose (not listicles) — this is Discord chat. Minimize blank lines."
             )
         else:
             identity = f"{provider.name} (model: {provider.model_id}), an AI assistant"
@@ -2859,6 +3153,46 @@ class ClaudeBot(commands.Bot):
             # Mid-tier cost — cheaper than Claude, pricier than Deepseek.
             # Smaller cost penalty than Claude, no bonus like Deepseek.
             score -= 0.08
+
+        elif provider.name == "Mistral":
+            # Mistral (Mari) — strongest open model on French/European languages.
+            # French isn't script-detectable (Latin), so trigger on intent, not
+            # text; otherwise stay out of the tuned core router. Cheap on Fireworks.
+            if any(kw in text_lower for kw in (
+                'french', 'français', 'francais', 'en français',
+                'translate to french', 'how do you say', 'conjugat', 'liaison',
+            )):
+                score += 0.35
+            else:
+                score -= 0.15
+            score += 0.1
+
+        elif provider.name == "Qwen":
+            # Qwen (Rei) — frontier code/math at Fireworks prices. Competes ONLY
+            # in its lane (routine code/math that doesn't need Opus); stays out of
+            # general chat so it can't muscle Deepseek off routine replies.
+            in_lane = '```' in message_text or any(kw in text_lower for kw in (
+                'code', 'debug', 'refactor', 'implement', 'function', 'regex',
+                'math', 'solve', 'equation', 'integral', 'derivative', 'proof',
+            ))
+            if in_lane:
+                score += 0.2
+                score += 0.15  # cheap — credited only in-lane
+                if '```' in message_text:
+                    score += 0.1
+                # hand careful/complex/long work back to Claude
+                if word_count > 120 or any(kw in text_lower for kw in (
+                    'review', 'architecture', 'design', 'tradeoff', 'nuance',
+                )):
+                    score -= 0.4
+            else:
+                score -= 0.2
+
+        elif provider.name == "GLM":
+            # GLM (Asuka) — its agentic/tool-use niche isn't what this chat bot
+            # does, and a second cheap coder would just split Qwen's vote.
+            # Override-only via !glm/!asuka: keep it out of the auto-router.
+            score -= 0.5
 
         return max(0.0, min(1.0, score))
 
@@ -4382,6 +4716,170 @@ class ClaudeBot(commands.Bot):
         cleaned = self.SPEAK_MARKER_RE.sub(lambda m: m.group(1).strip(), ''.join(out))
         return cleaned, files
 
+    # --- French text-to-speech (language-teaching mode) --------------------
+    # The INVERSE of the Mandarin path. Azure's fr-FR neural voices already
+    # pronounce liaison, élision, nasal vowels and silent letters correctly, so
+    # we do NOT force phonemes — we send the plain French text and let the voice
+    # infer (the opposite default from zh-CN, where tones must be pinned, because
+    # Azure guesses them wrong). The LLM frontend (Mistral-preferred — the
+    # French-native analog of Deepseek-for-Chinese) returns the French text, an
+    # IPA transcription, and a one-line liaison/pronunciation note. IPA is the
+    # learner's "pinyin" — DISPLAY only, never fed to the synth.
+    FRENCH_TTS_VOICE = "fr-FR-DeniseNeural"  # clear, standard diction for learners (Vivienne = more natural alt)
+    FRENCH_TTS_MAX_CHARS = 300
+    FRENCH_SPEAK_INLINE_MAX = 8  # max inline french clips synthesized per message
+
+    @classmethod
+    def _parse_french_g2p(cls, out: str, fallback_text: str) -> dict:
+        """Parse the three-line G2P reply into {text, ipa, note}. Tolerant of
+        casing / stray markdown. Empty `out` yields the all-fallback shape."""
+        def grab(label: str, s: str) -> Optional[str]:
+            m = re.match(rf'(?i)^{label}\s*[:：]\s*(.+)$', s)
+            return m.group(1).strip().strip('*`').strip() if m else None
+        text: Optional[str] = None
+        ipa: Optional[str] = None
+        note: Optional[str] = None
+        for line in out.splitlines():
+            s = line.strip().lstrip('*`> ').strip()
+            for label in ("TEXT", "IPA", "NOTE"):
+                v = grab(label, s)
+                if v is not None:
+                    if label == "TEXT":
+                        text = v
+                    elif label == "IPA":
+                        ipa = v
+                    else:
+                        note = v
+                    break
+        if not text:
+            text = fallback_text
+        if note in ("—", "-", ""):
+            note = None
+        return {"text": text, "ipa": ipa, "note": note}
+
+    async def _french_g2p(self, guild_id: int, text: str) -> dict:
+        """LLM frontend for French: turn input (French text, or an English phrase
+        to translate) into {text, ipa, note}. Prefers Mistral (French-native —
+        the analog of Deepseek for Chinese), then Claude/Gemini/Deepseek. Lands
+        in !cost via the normal generation path."""
+        provider = next(
+            (p for p in (self.mistral_provider, self.claude_provider,
+                         self.gemini_provider, self.deepseek_provider)
+             if p.enabled),
+            None,
+        )
+        if provider is None:
+            return self._parse_french_g2p("", fallback_text=text)
+        system = (
+            "You are the pronunciation frontend for a French text-to-speech engine and an "
+            "IPA tutor. Convert the user's input to natural French. The input may be French "
+            "text, or an English phrase to translate. Reply with EXACTLY these three lines "
+            "and nothing else — no extra commentary:\n"
+            "TEXT: <the French text only, correct accents and punctuation>\n"
+            "IPA: <the phrase in IPA, as actually spoken with liaison and élision applied>\n"
+            "NOTE: <ONE short English line on the single trickiest pronunciation point — a "
+            "liaison, a silent letter, or a nasal vowel — or '—' if nothing notable>\n"
+            "For the input 'the friends' you output exactly:\n"
+            "TEXT: les amis\n"
+            "IPA: le.z‿a.mi\n"
+            "NOTE: liaison — the silent 's' in 'les' links as /z/ into 'amis'"
+        )
+        messages = [{"role": "user", "content": text}]
+        try:
+            out = await self._panel_complete(provider, guild_id, messages, system)
+        except Exception as e:
+            print(f"⚠️  French G2P failed: {e}")
+            return self._parse_french_g2p("", fallback_text=text)
+        if self._is_provider_error(provider, out):
+            return self._parse_french_g2p("", fallback_text=text)
+        return self._parse_french_g2p(out, fallback_text=text)
+
+    @classmethod
+    def _build_french_ssml(cls, text: str) -> str:
+        """Wrap French text in fr-FR SSML for Azure. Unlike the Mandarin path we
+        do NOT force phonemes — the fr-FR neural voice handles liaison / nasals /
+        silent letters natively, so plain text gives the most natural result."""
+        return (
+            '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+            'xml:lang="fr-FR">'
+            f'<voice name="{cls.FRENCH_TTS_VOICE}">{_html.escape(text)}</voice>'
+            '</speak>'
+        )
+
+    async def _synthesize_french(
+        self, guild_id: int, text: str, ipa: Optional[str] = None
+    ) -> tuple[Optional[bytes], dict]:
+        """Synthesize one French phrase → (mp3_bytes_or_None, reading_dict). If
+        ipa is supplied (from an inline [[french:texte|ipa]] marker) we skip the
+        G2P LLM call and use it for display; the audio is always the plain French
+        text through the native fr-FR voice. Shared by !french and the inline
+        [[french:..]] renderer."""
+        if ipa:
+            reading = {"text": text, "ipa": ipa, "note": None}
+        else:
+            reading = await self._french_g2p(guild_id, text)
+        audio = await self._azure_tts(self._build_french_ssml(reading["text"]))
+        return audio, reading
+
+    # Inline directive the models can emit to attach spoken French:
+    #   [[french:texte]]            → bot runs G2P then synthesizes
+    #   [[french:texte|le.z‿a.mi]]  → bot uses the given IPA for display
+    FRENCH_MARKER_RE = re.compile(
+        r'\[\[\s*french\s*:\s*([^\]|]+?)\s*(?:\|\s*([^\]]+?)\s*)?\]\]', re.IGNORECASE
+    )
+
+    @staticmethod
+    def _inline_french_annot(reading: dict) -> str:
+        """Compact annotation for an inline French clip: the IPA (the learner's
+        'pinyin') plus the liaison/pronunciation note when present. Empty when
+        neither is available — the bot, not the model's typing, owns the IPA."""
+        ipa = reading.get("ipa")
+        note = reading.get("note")
+        if ipa and note:
+            return f" (`{ipa}` — {note})"
+        if ipa:
+            return f" (`{ipa}`)"
+        if note:
+            return f" ({note})"
+        return ""
+
+    async def _render_french_attachments(
+        self, guild_id: int, text: str, max_files: int
+    ) -> tuple[str, list[discord.File]]:
+        """Turn inline [[french:texte]] markers into MP3 attachments, mirroring
+        _render_speak_attachments. Each synthesized marker becomes
+        'texte (`ipa`) 🔊'; markers past the cap / failures / unconfigured TTS
+        collapse to the bare phrase. Returns (cleaned_text, files)."""
+        strip = lambda: self.FRENCH_MARKER_RE.sub(lambda m: m.group(1).strip(), text)
+        if max_files <= 0 or not (self.azure_tts_key and self.azure_tts_region):
+            return strip(), []
+        matches = list(self.FRENCH_MARKER_RE.finditer(text))
+        if not matches:
+            return text, []
+        synth = matches[:min(max_files, self.FRENCH_SPEAK_INLINE_MAX)]
+
+        async def one(m: re.Match) -> tuple[Optional[bytes], dict]:
+            phrase = m.group(1).strip()[:self.FRENCH_TTS_MAX_CHARS]
+            ipa = (m.group(2) or "").strip() or None
+            return await self._synthesize_french(guild_id, phrase, ipa=ipa)
+        results = await asyncio.gather(*(one(m) for m in synth))
+
+        files: list[discord.File] = []
+        out: list[str] = []
+        last = 0
+        for m, (audio, reading) in zip(synth, results):
+            out.append(text[last:m.start()])
+            phrase = m.group(1).strip()
+            if audio is not None:
+                files.append(discord.File(io.BytesIO(audio), filename=f"french_{len(files)+1}.mp3"))
+                out.append(f"{phrase}{self._inline_french_annot(reading)} 🔊")
+            else:
+                out.append(phrase)
+            last = m.end()
+        out.append(text[last:])
+        cleaned = self.FRENCH_MARKER_RE.sub(lambda m: m.group(1).strip(), ''.join(out))
+        return cleaned, files
+
     async def _handle_command(self, message: discord.Message) -> None:
         """Handle bot commands."""
         content = message.content.strip()
@@ -4542,6 +5040,9 @@ class ClaudeBot(commands.Bot):
                 "claude": self.claude_provider,
                 "deepseek": self.deepseek_provider,
                 "gemini": self.gemini_provider,
+                "mistral": self.mistral_provider,
+                "qwen": self.qwen_provider,
+                "glm": self.glm_provider,
             }
             searcher: Optional[ModelProvider] = None
             if ch_pref in pref_map and pref_map[ch_pref] in eligible:
@@ -4620,21 +5121,36 @@ class ClaudeBot(commands.Bot):
             # synthesises one answer. Reuses existing per-provider generation (so
             # cost lands in !cost) and each member's own web search.
             query = content[len(cmd):].strip()
+            # `!research all <q>` convenes the full roster (adds the cheap
+            # Fireworks heads for diversity); plain `!research <q>` stays the
+            # lean core trio. Strip a leading "all" token before the question.
+            # (Edge: a question that literally starts with the word "all" will
+            # trip this — reword or use the core panel; cheap to special-case
+            # later if it bites.)
+            use_all = False
+            all_match = re.match(r'(?is)all\b\s*(.*)', query)
+            if all_match and all_match.group(1).strip():
+                use_all = True
+                query = all_match.group(1).strip()
             if not query:
                 await message.channel.send(
-                    "Usage: `!research <question>`\n"
+                    "Usage: `!research <question>`  ·  `!research all <question>`\n"
                     "Convenes a multi-model panel — each model answers independently, then a "
                     "judge synthesises them into one answer.\n"
+                    "• `!research` — lean core panel (Claude · Gemini · Deepseek).\n"
+                    "• `!research all` — full roster, adding the cheap Fireworks heads "
+                    "(Mistral/Qwen/GLM) for max diversity once they're configured.\n"
                     "⚠️ Runs several models (each may web-search) per call — roughly 3–4× the "
-                    "cost and latency of a normal reply."
+                    "cost and latency of a normal reply (more with `all`)."
                 )
                 return
 
-            members = [p for p in self.providers if p.enabled and p.name in self.panel_members]
+            roster = self.panel_members_all if use_all else self.panel_members
+            members = [p for p in self.providers if p.enabled and p.name in roster]
             if len(members) < 2:
                 enabled_names = ", ".join(p.name for p in self.providers if p.enabled) or "none"
                 await message.channel.send(
-                    f"❌ The research panel needs ≥2 enabled providers from {self.panel_members}. "
+                    f"❌ The research panel needs ≥2 enabled providers from {roster}. "
                     f"Currently enabled: {enabled_names}."
                 )
                 return
@@ -4644,8 +5160,8 @@ class ClaudeBot(commands.Bot):
             )
 
             await message.channel.send(
-                f"🧪 Convening panel: {', '.join(p.name for p in members)} → "
-                f"**{judge.name}** judging…"
+                f"🧪 Convening {'FULL ' if use_all else ''}panel: "
+                f"{', '.join(p.name for p in members)} → **{judge.name}** judging…"
             )
 
             # Shared prompt for every member: thread history with the last user
@@ -4741,6 +5257,55 @@ class ClaudeBot(commands.Bot):
             await message.channel.send(
                 caption,
                 file=discord.File(io.BytesIO(audio), filename="speak.mp3"),
+            )
+
+        elif cmd == "!french":
+            # French text-to-speech for language-teaching mode. The LLM (Mistral-
+            # preferred, French-native) is the text→IPA frontend; UNLIKE !speak we
+            # let Azure's fr-FR voice infer pronunciation (it handles liaison /
+            # nasals / silent letters natively) and show the IPA + a liaison note
+            # for the learner. See _french_g2p / _build_french_ssml / _synthesize_french.
+            text = content[len(cmd):].strip()
+            if not text:
+                await message.channel.send(
+                    "Usage: `!french <french text / english phrase to say>`\n"
+                    "Speaks it in natural French (Azure fr-FR Denise) and shows the IPA "
+                    "+ a liaison/pronunciation note.\n"
+                    "Examples: `!french bonjour`, `!french les amis`, `!french how do you say I love you`"
+                )
+                return
+            if not (self.azure_tts_key and self.azure_tts_region):
+                await message.channel.send(
+                    "❌ French TTS isn't configured. Set `AZURE_TTS_KEY` and `AZURE_TTS_REGION` "
+                    "(e.g. `eastus`) in `.env` — Azure's free tier covers 0.5M chars/month."
+                )
+                return
+            if len(text) > self.FRENCH_TTS_MAX_CHARS:
+                await message.channel.send(
+                    f"❌ That's a bit long for a clip (>{self.FRENCH_TTS_MAX_CHARS} chars). "
+                    "Try a shorter phrase."
+                )
+                return
+
+            async with message.channel.typing():
+                audio, reading = await self._synthesize_french(guild_id, text)
+
+            if audio is None:
+                await message.channel.send(
+                    "❌ TTS synthesis failed — check the logs and that `AZURE_TTS_KEY` / "
+                    "`AZURE_TTS_REGION` are valid."
+                )
+                return
+
+            # Caption: French text + IPA + liaison note (the learner's takeaways).
+            caption = f"🔊 **{reading['text']}**"
+            if reading.get("ipa"):
+                caption += f"\n**IPA:** `{reading['ipa']}`"
+            if reading.get("note"):
+                caption += f"\n*{reading['note']}*"
+            await message.channel.send(
+                caption,
+                file=discord.File(io.BytesIO(audio), filename="french.mp3"),
             )
 
         elif cmd == "!summarize":
@@ -5297,13 +5862,19 @@ class ClaudeBot(commands.Bot):
 `!threads` - Show other recent threads in this channel
 `!search <query>` - Web search via Claude, Deepseek, or Gemini (costs extra, ~$0.01-0.03)
 `!research <question>` - Multi-model panel + judge → one synthesised answer (~3-4× cost)
+`!research all <question>` - Full roster (adds Mistral/Qwen/GLM when configured) for max diversity
 `!speak <chinese / pinyin / phrase>` - Mandarin TTS with tones forced from pinyin → MP3 (Azure Xiaoxiao; needs AZURE_TTS_KEY)
    (models can also voice phrases inline while teaching, via `!speak 汉字`)
+`!french <french / english phrase>` - French TTS in natural fr-FR (Azure Denise) + IPA & liaison note → MP3 (needs AZURE_TTS_KEY)
+   (models can also voice French inline while teaching, via `[[french: la phrase]]`)
 
 **Multi-model (Hydra / MAGI):**
 `!claude <message>` / `!opus <message>` / `!balthasar <message>` - Force Claude to respond
 `!deepseek <message>` / `!melchior <message>` - Force Deepseek to respond
 `!gemini <message>` / `!caspar <message>` - Force Gemini to respond
+`!mistral` / `!mari <message>` - Force Mistral (Mari) — French/EU specialist (needs FIREWORKS_API_KEY)
+`!qwen` / `!rei <message>` - Force Qwen (Rei) — cheap coder/mathematician (needs FIREWORKS_API_KEY)
+`!glm` / `!asuka <message>` - Force GLM (Asuka) — agentic open head (needs FIREWORKS_API_KEY)
 `!think <message>` - Use extended thinking (deeper reasoning, slower & costlier)
 `!think:<level> <message>` - Force a specific effort level (low|medium|high|xhigh|max)
 `!models` - Show available models and their usage stats
