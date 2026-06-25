@@ -5,7 +5,7 @@
 > [`../CLAUDE.md`](../CLAUDE.md) — it tracks which phases are done, deviations, and remaining work.
 
 **Audience:** Claude Code (or any agent) executing this refactor.
-**Source repo:** `VIXAL-OS/Opus-Deipseek` — a single-file (`bot.py`, ~4,600 lines) multi-model Discord bot (Claude Opus 4.8 + DeepSeek V4-Pro + Gemini 3.1 Pro), MAGI-themed, with heuristic routing, two-tier memory, prompt caching, bookclub mode, and cost tracking.
+**Source repo:** `VIXAL-OS/Opus-Deipseek` — a single-file (`bot.py`, ~6,800 lines) multi-model Discord bot (Claude Opus 4.8 · DeepSeek V4-Pro · Gemini 3.1 Pro core; Mistral · Qwen · GLM heads added in Phase 1), MAGI-themed, with heuristic routing, two-tier memory, prompt caching, bookclub mode, and cost tracking.
 **Status of this doc:** implementation-ready. Work the phases in order; each is independently shippable and testable.
 
 **Rev 2 changes (this version):**
@@ -22,7 +22,7 @@ Add four **core** capabilities to Hydra, all **config-toggleable** (default conf
 2. **Gemini backend** — the existing **Developer API** path is the default and is **no-train when billing is enabled on the Google account** (an account setting, *not* a code toggle — free AI Studio and the paid Developer API are the same endpoint/SDK/caching path; billing is the only difference and it's what flips training off). **Vertex** is an **optional** backend for when you additionally need EU/regional **data residency, IAM/VPC, SLA, or compliance** — i.e., the patentable/lab tier. Not needed for everyday no-train use.
 3. **DeepSeek backend toggle** — `api | fireworks | self_hosted`. `api` is DeepSeek's own API (China). **`fireworks`** routes the open DeepSeek weights through Fireworks (US, ZDR, server-side cache, no hardware) — the recommended middle option for the lab route. `self_hosted` points at a local OpenAI-compatible server (vLLM / Ollama / SGLang) for maximal isolation (no egress at all).
 4. **Slack support** — a platform abstraction so the same core runs on Discord *or* Slack, with all current features (threads, reactions, files, prefix/slash commands, bookclub).
-5. **(Optional — lab research variant) Hermes Agent layer** — for the funds-strapped, sensitive-data lab deployment, delegate long-horizon and scheduled research workflows to a co-located, model-agnostic [Hermes Agent](https://hermes-agent.org/) instance pointed at the **same** hardened endpoints (Fireworks US/ZDR, self-hosted DeepSeek, or Vertex). Adds self-improving skills, persistent project memory, scheduled automations, and parallel subagents. Entirely skippable for the default chat-only deployment. See §9 and Phase 5.
+5. **(Optional — lab research variant) Hermes Agent layer** — for the funds-strapped, sensitive-data lab deployment, delegate long-horizon and scheduled research workflows to a co-located, model-agnostic [Hermes Agent](https://hermes-agent.org/) instance pointed at the **same** hardened endpoints (Fireworks US/ZDR, self-hosted DeepSeek, or Vertex). Adds self-improving skills, persistent project memory, scheduled automations, and parallel subagents. Entirely skippable for the default chat-only deployment. See §10 and Phase 5.
 
 ## 2. Non-goals / constraints
 - Do **not** rewrite the routing heuristics, memory semantics, or bookclub logic — preserve behavior; only change *where models live* and *what platform the I/O speaks to*.
@@ -221,6 +221,8 @@ Tokens: `SLACK_BOT_TOKEN` (`xoxb-…`), `SLACK_APP_TOKEN` (`xapp-…`, Socket Mo
 
 `.env` additions: `FIREWORKS_API_KEY` (covers Mistral + Qwen + GLM + Fireworks-DeepSeek), `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`. **Optional, only if `gemini.backend=="vertex"`:** `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `GOOGLE_APPLICATION_CREDENTIALS`. Existing keys (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, Claude, Tavily) unchanged. **No `MISTRAL_API_KEY` / `QWEN_API_KEY` needed** on the consolidated path.
 
+Simulator-mode fields are additive and default off, so the schema above is unchanged for instruct-only deployments: `completions_mode` (bool) per provider, the base sampler knobs (`min_p`, `top_a`, `repetition_penalty`, `stop`), and the optional `persona_name` / per-channel `ambient` toggle. See §9.
+
 ---
 
 ## 6. Implementation phases
@@ -247,8 +249,16 @@ Extract `DiscordAdapter`; add `ChatPlatform`; build `SlackAdapter` (Socket Mode)
 *Acceptance:* same bot runs on Slack with threads (`thread_ts`), 👍/👎 calibration via `reaction_added`, file uploads, `/claude`-style commands, and full bookclub flow; Discord still works from the same codebase; memory is per-workspace and doesn't collide across platforms.
 
 **Phase 5 — (Optional, lab variant) Hermes delegation bridge.**
-Stand up a co-located Hermes agent pointed at the hardened endpoints (Fireworks US/ZDR, self-hosted DeepSeek, or Vertex); add the delegation hand-off (command → local Hermes → result back to channel) and, optionally, cron delivery. Do not merge codebases. See §9.
+Stand up a co-located Hermes agent pointed at the hardened endpoints (Fireworks US/ZDR, self-hosted DeepSeek, or Vertex); add the delegation hand-off (command → local Hermes → result back to channel) and, optionally, cron delivery. Do not merge codebases. See §10.
 *Acceptance:* a `/research`-class command runs a multi-step Hermes task against hardened/no-egress models and posts the result in-channel with **no sensitive prompt leaving the lab**; a scheduled Hermes job can post to the lab channel; Hydra still runs fully with Hermes absent.
+
+**Phase 6 — (Optional) Ephemeral big-model co-op.**
+Build the lifecycle controller + `ephemeral` provider kind + a completions/transcript mode (borrowed from Nexari) + session metering. See §11. Independent of Phases 1–5; only needed if you want a model nobody hosts per-token (e.g. 405B base).
+*Acceptance:* `!session start 405b-base` provisions an 8×H100 node, loads the model, and flips the provider WARM; `!base <prompt>` returns a completion via the transcript path with base sampler params; `!session cost` shows live box-hours and the per-participant split; a hard idle timeout **and** a provider-side TTL each independently tear the box down; with no session active, `!base` reports the model cold and the rest of Hydra is unaffected.
+
+**Phase 7 — (Optional, but higher-want than Hermes) Simulator mode.**
+Add `completions_mode` + the transcript formatter + base sampler knobs (§9), sharing the existing search and cost-tracking layers. Independent of Phases 4–6; needs only a completions-capable endpoint (a small self-hosted base model is enough — no 405B required). Optionally layer ambient turn-taking and webhook personas later.
+*Acceptance:* with `completions_mode=true` on any base/completions endpoint, `!sim <prompt>` (or a designated channel) returns a transcript continuation with base sampler params; the turn is logged to `!cost` (tokens + carbon) and can be fed web-search context; instruct providers and `_select_model` are unchanged; ambient turn-taking and personas remain off unless explicitly enabled.
 
 ---
 
@@ -275,15 +285,53 @@ Stand up a co-located Hermes agent pointed at the hardened endpoints (Fireworks 
 - `_record_*_usage()`: keep per-token for `api`/`fireworks`; add `local` cost mode for self-hosted DeepSeek (Phase 3). Apply Fireworks 50% cache discount.
 - `ConversationManager` + `ClaudeBot`: depend on `ChatPlatform`; extract `DiscordAdapter`; add `SlackAdapter` (Phase 4).
 - Persistence keys in `memories.json`: namespace by `(platform, team/guild, channel)` (Phase 4).
+- Simulator mode (Phase 7): add `completions_mode` (+ base sampler fields) to `ModelProvider`; new `_generate_simulator_response()`, `_format_transcript()`, `_parse_transcript_turn()`; one dispatch branch in `_generate_response()`. Reuses `_maybe_search` / search backends and `_record_*_usage` unchanged. See §9.
 
 ---
 
-## 9. Optional — Hermes Agent integration (lab research variant)
+## 9. Simulator mode — a generation mode (priority over Hermes; works with or without 405B)
+This is a **generation mode**, not a second bot, and it's the feature you want most after Slack. Hydra has one mode today: instruct/chat. Simulator mode adds a second — **transcript completion** — behind the same dispatch, so the bot can talk to *base* models (and instruct models prompted in completion style) while keeping everything that makes Hydra Hydra. Explicitly **unlike Nexari, it is not tool-less or cost-blind**: a simulator turn still logs tokens (and carbon) and can still be fed web search.
+
+**It does not require 405B.** Simulator mode needs only a **completions-capable endpoint**, which can be (a) a small base model self-hosted on a gaming rig or the CRC (Ministral/Magistral-class, or any GGUF base), (b) an instruct model that also exposes `/completions` or is prompted in completion style, or (c) the rented 405B box from §11. You can **build, ship, and test simulator mode today against a cheap small base model** with zero dependency on the expensive ephemeral hosting — 405B is the *maximal* backend, not a prerequisite.
+
+### 9.1 Two modes behind one dispatch
+Add a single flag and one branch; the instruct path is untouched.
+- `ModelProvider.completions_mode: bool = False` — `False` → current chat path (default); `True` → transcript path (this section). Mirrors Nexari's `instruct_tuned`, inverted.
+- One branch in `_generate_response()` beside the `sdk_type` cases: if `provider.completions_mode`, call `_generate_simulator_response(...)`; otherwise the existing dispatch.
+- Both modes return the **same tuple** `(text, reactions, reasoning)` so message-splitting, posting, and LaTeX→PNG downstream are unchanged.
+
+### 9.2 What's shared — do NOT fork these
+The two cross-cutting layers stay identical across both modes:
+- **Web search / grounding** (Tavily, native Anthropic, Google). The only difference is *where* the result lands: instruct appends a message/tool result; simulator folds the retrieved snippets into the **transcript/system preamble**. Same `SearchBackend` plumbing, same `_maybe_search` call.
+- **Per-token + carbon cost tracking.** A completions response still carries `.usage`, so `_record_*_usage` (and your `grid_gco2_per_kwh` accounting) works unchanged. A base/sim turn shows up in `!cost` exactly like a chat turn.
+
+### 9.3 Transcript-completion mechanics (lift Nexari's `irc` path)
+A base model doesn't take chat messages; it continues a transcript. Add a thin completions path:
+- Call the provider's `/completions` endpoint, not `/chat/completions`. **Because Hydra already holds OpenAI-compatible `client` objects, this is just `client.completions.create(...)` — no raw `aiohttp` needed** (Nexari used `aiohttp` only because it had no client).
+- Format channel history as a transcript (IRC-/script-style log) in `_format_transcript()`, optionally with a `force_speaker`, the search preamble, and any pinned bookclub material; continue it; cut on `stop` sequences (e.g. `["\n\n\n"]` or a speaker-tag regex) in `_parse_transcript_turn()`.
+- Expose the base-model sampler knobs the instruct path ignores: `temperature`, `top_p`, `top_k`, `min_p`, `top_a`, `repetition_penalty`, `frequency/presence_penalty`, `stop`.
+
+This is exactly what `au-to-pi-lot/nexari` does for 405B base via its `irc` formatter and a raw `/completions` call — port that formatter and the sampler plumbing rather than reinventing them.
+
+### 9.4 Optional layers (each independently toggleable, off by default)
+The spectrum — adopt only as far as you want; the cost/search/persistence spine is identical the whole way down:
+1. **Transcript completion** (9.3) — talk to a base model, still cost-tracked + searchable. *This is the whole feature for most uses.*
+2. **Ambient turn-taking** — a designated sim model predicts the *next speaker* (Nexari's `get_next_participant`) instead of `_select_model`'s argmax. Opt-in **per channel**. Rate-limit it (Nexari's per-channel queue + lock) so it can't loop.
+3. **Webhook personas** — post under per-agent name/avatar (Nexari's webhook output) instead of the single MAGI/ISAIC identity.
+
+So: **Hydra-as-is** (instruct + argmax + single identity) → **+ transcript mode** (base models, cost-tracked + searchable) → **+ ambient + personas** (full Nexari-style simulator). Build only the first rung to get ~95% of the value; the rest are there if you want the loom.
+
+### 9.5 Phase 7 acceptance (see also §6)
+With `completions_mode=true` on any completions endpoint (a small self-hosted base model suffices — no 405B), `!sim <prompt>` (or a designated channel) returns a transcript continuation using the base sampler params; the turn logs to `!cost` with tokens **and** carbon and can be fed web-search context; instruct providers and `_select_model` are unchanged; ambient turn-taking and personas stay off unless explicitly enabled.
+
+---
+
+## 10. Optional — Hermes Agent integration (lab research variant)
 §§1–8 turn Hydra into a configurable, hardenable multi-provider chat bot. This section is **optional and lab-specific**: it adds a research-automation layer for the funds-strapped, sensitive-data lab deployment (hardened / no-train models, potentially patentable work). Skip it for the default chat deployment; adopt it when researchers need long-horizon workflows, scheduled jobs, and reusable skills rather than turn-by-turn chat.
 
 [Hermes Agent](https://hermes-agent.org/) is Nous Research's open-source (MIT), model-agnostic agent harness — not a coding CLI but a long-running personal-assistant/automation harness with a built-in self-improving skill loop. It is adopted **alongside** Hydra, never merged into it.
 
-### 9.1 Why Hermes for the lab (capability → need)
+### 10.1 Why Hermes for the lab (capability → need)
 | Hermes capability | Lab need it serves |
 |---|---|
 | Local-first + model-agnostic (any OpenAI-compatible endpoint) | Point it at the **same hardened endpoints** from the Hydra registry — Fireworks (US/ZDR), self-hosted DeepSeek, or Vertex — so sensitive prompts stay on no-train/no-egress infra |
@@ -295,7 +343,7 @@ Stand up a co-located Hermes agent pointed at the hardened endpoints (Fireworks 
 | MCP support | Connect lab data sources / tools |
 | Trajectory export + RL-data generation | Optional bridge if the lab ever fine-tunes a domain model (e.g., a neuro-literature model) |
 
-### 9.2 Integration architecture
+### 10.2 Integration architecture
 **Pattern: Hydra stays the chat front-end + provider router (§§1–8); Hermes is a co-located agentic engine; a thin bridge delegates heavy/long-horizon/scheduled tasks to Hermes and surfaces results back in the channel.** Do **not** merge the codebases.
 
 Three seams (adopt per need):
@@ -303,11 +351,47 @@ Three seams (adopt per need):
 2. **Scheduled delivery (cron).** Use Hermes's built-in cron + platform delivery to run scheduled lab jobs and post results directly into the lab channel. Register Hydra's channel as the delivery target (or relay through it).
 3. **Shared skills/memory (optional).** Adopt the agentskills.io skill format so skills are portable between Hermes and any Hydra-side tooling; key Hermes memory per project so BandR context persists.
 
-### 9.3 Boundaries & constraints
+### 10.3 Boundaries & constraints
 - **Two systems, one bridge.** Hydra = front-end/router (the §§1–8 work). Hermes = separate co-located service. The integration is a thin delegation/delivery bridge, not a fork or a rewrite of either.
 - **Provider-egress discipline (critical for sensitive work).** Hermes defaults can route to Nous Portal / OpenRouter. For the lab variant, **force Hermes onto the same hardened endpoints as the Hydra registry** — Fireworks (US, ZDR), self-hosted DeepSeek (no egress), or Vertex (residency) — and gate any genuinely patentable prompt to **self-hosted only**, since that's the one tier where nothing leaves the building. Treat Hermes's endpoint config as part of the data-security surface, not a convenience setting. Note: Fireworks US/ZDR is the right default for *most* lab work (no hardware, US, no-retention); reserve self-hosted for the prompts you can't let touch any third party at all.
 - **Cost containment.** The self-improvement loop and parallel subagents can burn tokens. Cap subagent parallelism, keep the cheap-model tier (Fireworks DeepSeek V4-Flash, Qwen Plus) for routine sub-tasks, lean on `execute_code` pipeline-collapsing to cut round-trips, and remember Fireworks prepaid auto-reload is your hard spend cap.
 - **Optional and isolated.** None of this touches the default (chat-only) Hydra. It is the research-variant add-on; the bot must run fully with Hermes absent.
 
-### 9.4 Phase 5 acceptance (see also §6)
+### 10.4 Phase 5 acceptance (see also §6)
 A `/research`-class command runs a multi-step Hermes task against hardened endpoints (Fireworks US/ZDR or self-hosted), streams progress, and posts the result in-channel; **patentable prompts egress to no third party** (self-hosted tier); a scheduled Hermes job can post into the lab channel; the default Hydra deployment still runs with Hermes absent.
+
+---
+
+## 11. Optional — ephemeral big-model hosting (the "405B base co-op")
+§§1–10 assume always-on endpoints (cloud APIs, Fireworks, or a persistent self-hosted server). This section is the opposite pattern: **spin a rented multi-GPU box up on demand or on a schedule, serve one big model nobody hosts per-token anymore (e.g. Llama-3.1-405B *base*), expose it as a Hydra provider, meter it, and split the hourly cost across whoever's in the session.** It's the "weekend hosting co-op" for models the market has abandoned. Entirely optional; skip it unless you specifically want a model only a rented cluster can run.
+
+This section is purely the **rental lifecycle + cost-splitting**; the *how do I talk to a base model* mechanics live in **§9 (simulator mode)** — the rented box just serves a base model that simulator mode drives. So §9 stands alone without this section, and this section depends on §9. The other thing that makes this its own section (rather than a backend toggle) is that the box has a **lifecycle**: cold → warm → torn down, which the always-on registry doesn't model.
+
+### 11.1 Components (keep the controller out of `bot.py`)
+- **Lifecycle controller** — a separate small service that owns the rented box: provisions it, health-checks it, tears it down, and exposes one stable gateway URL to Hydra. Hydra never talks to the cloud provider directly; it talks to the controller's gateway, which 503s when cold and proxies to vLLM when warm.
+- **Provider kind `ephemeral`** in the registry (§4.1) — `sdk_type: "openai_compatible"`, `completions_mode: true` (it serves a base model — see §9), `base_url` = controller gateway, plus lifecycle metadata (`gpu_spec`, `idle_timeout`, `schedule`, `billing_mode`). Default **override-only** (`routing_tags: []`), reachable by an explicit command (`!base` / `!405`), never in the argmax — it isn't always up, and you don't want the auto-router picking a cold box.
+
+### 11.2 Lifecycle state machine
+`COLD → SPINNING_UP → WARM → DRAINING → COLD`
+- **Triggers up:** on-demand (`!session start 405b-base`) or cron (`schedule: "Sat 18:00–23:00 America/New_York"`).
+- **SPINNING_UP:** controller calls the GPU provider's API (RunPod / Lambda / CoreWeave) to launch a node from a prebuilt vLLM image, then polls `/health` until the OpenAI-compatible endpoint answers. FP8 405B fits a single 8×H100 node (640 GB); BF16 wants ~2× that. Cold start is **minutes**, dominated by pulling ~400–800 GB of weights — pre-bake them onto a network volume or image snapshot so you're not re-downloading every session.
+- **WARM:** gateway proxies completions to vLLM; usage is metered (11.3).
+- **DRAINING → COLD:** torn down by a hard idle timeout, a max-session cap, **or** the cron window closing. See the dead-man's-switch in 11.4 — that's the part that protects your wallet.
+
+### 11.3 Metering & cost-splitting
+The controller keeps a per-session ledger with two numbers: **box-time** (wall-clock the node is WARM × $/hr of the instance) and **per-user usage** (tokens or request count, attributed by Discord user id). Pick a `billing_mode`:
+- `per_hour_split` — divide the session's box-hours across participants, evenly or weighted by usage share. Simplest; matches the "co-op" framing.
+- `per_token_markup` — charge a per-token rate set high enough to cover box-hours + expected idle; you (or the lab) front the cluster and reconcile later. Smoother for users, riskier for whoever fronts it.
+
+Surface it in `!session cost` (live: box-hours so far, $/participant, idle time) and a post-session summary. The per-provider token accounting in `ModelProvider` is the wrong tool here — box-time isn't per-token — so give `ephemeral` a `cost_mode: "session"` that bypasses token pricing and reads the controller's ledger.
+
+### 11.4 Wallet guardrails (do these first)
+The thread's whole point is that the economics are unforgiving; a forgotten 8×H100 at ~$25/hr is ~$600/day. Non-negotiable:
+- **Hard idle timeout** — N minutes with no requests → auto-drain. The single most important setting.
+- **Max session duration** — absolute cap regardless of activity.
+- **Provider-side TTL / dead-man's-switch** — set the instance to self-terminate on a TTL *at the cloud provider*, so a crashed controller can't leak a running box. Belt and suspenders.
+- **Minimum-participants gate (optional)** — don't spin up (or drain early) if fewer than K people are actually using it, so one person doesn't silently eat a full cluster.
+- **Spend ceiling** — per-session and per-month dollar caps the controller refuses to exceed.
+
+### 11.5 Security note
+The rented box is single-tenant (better than shared serverless), but it's still third-party cloud hardware — same tier as the Fireworks / GPU-rental options in §4 and §10, *not* the airgapped-CRC tier. Fine for base-model creative play; for genuinely patentable prompts, stay on self-hosted / CRC.

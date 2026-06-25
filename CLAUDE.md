@@ -64,6 +64,13 @@ self-contained — you don't need it to pick up the remaining work below.
   backend + DeepSeek `fireworks`/`self_hosted` + Mistral `together`/`self_hosted` are code-complete
   with a `local` cost mode; the non-default backends ⚠️ owe live smoke tests. See the table +
   per-phase sections above.
+- **Bookclub Gemini cache cost controls (2026-06-24).** Context-cache storage bills per token-hour
+  for the whole TTL (~$11.6 for a 452k-token fic at the old fixed 24h), so: TTL is now a **6h
+  sliding window** (`GEMINI_CACHE_TTL_HOURS` env knob; `_refresh_gemini_cache` PATCHes the expiry
+  forward once past halfway → active discussion never expires mid-conversation, idle dies ~6h after
+  last use), and **`!uncache`** drops just the Gemini cache while keeping the book loaded for all
+  models (vs `!unload`, which removes the shared `ReadingMaterial` for everyone). Idle caches also
+  self-expire, so day-to-day neither is needed.
 - **Phase 1 — Qwen/GLM on Fireworks, Mistral on `api.mistral.ai`.** Qwen+GLM share one
   Fireworks key (cached input = 0.5×input); Mistral is on its own EU API (`MISTRAL_API_KEY`)
   because Mistral Large 3 isn't on Fireworks serverless — a happy accident: EU-resident + France
