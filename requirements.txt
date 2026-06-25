@@ -6,3 +6,10 @@ python-dotenv>=1.0.0
 aiohttp>=3.9.0
 matplotlib>=3.7.0
 beautifulsoup4>=4.12.0  # bookclub mode HTML parsing (AO3 fetcher + !load_text HTML attachments)
+
+# OPTIONAL — only for the Gemini `vertex` backend (Phase 2, lab/enterprise tier:
+# data residency / IAM / SLA). Lazy-imported, so the bot runs fine without it;
+# install + configure GCP ADC (GOOGLE_APPLICATION_CREDENTIALS) only if you set
+# providers.gemini.backend = "vertex". The default developer_api backend needs
+# nothing here.
+# google-cloud-aiplatform>=1.71.0

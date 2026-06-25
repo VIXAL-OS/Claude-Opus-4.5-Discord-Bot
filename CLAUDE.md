@@ -18,17 +18,27 @@ self-contained — you don't need it to pick up the remaining work below.
   prefix `PYTHONIOENCODING=utf-8` when printing bot output (emoji/CJK/IPA).
 
 ## Editing rules (load-bearing — read before touching bot.py)
-- **Graceful degradation:** a missing API key disables ONLY that provider. `FIREWORKS_API_KEY`
-  gates Qwen+GLM together; **Mistral has its own `MISTRAL_API_KEY`** (`api.mistral.ai`) — its
-  flagship isn't on Fireworks serverless (404s "not deployed"). Absent keys disable exactly
-  those providers; the original trio is untouched.
+- **Graceful degradation:** a missing API key disables ONLY that provider. The gating key follows
+  the *active backend* (`provider.api_key_env`): by default `FIREWORKS_API_KEY` gates Qwen+GLM
+  together and **Mistral has its own `MISTRAL_API_KEY`** (`api.mistral.ai`) — its flagship isn't on
+  Fireworks serverless (404s "not deployed"). `self_hosted`/`vertex` backends have no key and aren't
+  key-gated (operator owns the local server / GCP ADC). Absent keys disable exactly those providers.
+- **Config-driven registry (Phase 0).** `ProviderRegistry.from_config()` (built once in `__init__`
+  from `config.json`'s optional `providers` block) wires every provider's client + backend. The 6
+  `ModelProvider(...)` constants are the code-side default spec (pricing/energy/quirks +
+  `sdk_type`/`api_key_env`/`base_url`/`backend`/`backends`); config supplies operator overrides
+  (`enabled`/`backend`/`model`/`routing_tags`) + the `platform` toggle. **No `providers` block ⇒
+  byte-for-byte the old behavior.** `routing_tags` is present but INERT (routing stays in
+  `_estimate_confidence`).
 - **`provider.name` is the canonical routing key.** `_select_model`, `_estimate_confidence`,
-  `panel_members`, cost, and persistence all branch on it. NEVER rename it. Display names and
+  `panel_members`, cost, and persistence all branch on it. NEVER rename it. (`provider.id` — the
+  lowercase config key — is separate; it keys `config.json` + `self.clients`.) Display names and
   command aliases are a separate theme layer on top (see naming below).
-- **Dispatch** routes on `provider.name in self.openai_compatible_clients`. Qwen+GLM share
-  `self.fireworks_client`; Mistral uses `self.mistral_client` (`api.mistral.ai`). Claude uses the
-  anthropic SDK; Gemini bookclub uses the native `cachedContents` path; everything else is the
-  OpenAI-compatible shim (`_generate_openai_compatible_response`).
+- **Dispatch** routes on `provider.sdk_type` (`anthropic` | `openai_compatible` | `gemini`), set by
+  the registry. Claude → anthropic SDK; Gemini bookclub → native `cachedContents` (or Vertex
+  `CachedContent` when `backend="vertex"`); everything else → the OpenAI-compatible shim
+  (`_generate_openai_compatible_response`) via `self.clients[provider.id]`. Per-provider wiring lives
+  in the registry, not `__init__`.
 - **Model slugs drift** — verify in the live libraries. Fireworks (verified 2026-06):
   `qwen3p7-plus`, `glm-5p2`, `deepseek-v4-pro` (under `accounts/fireworks/models/`). Mistral on
   its own API uses `mistral-large-latest`. ⚠️ Mistral Large 3 is NOT on Fireworks serverless
@@ -47,7 +57,13 @@ self-contained — you don't need it to pick up the remaining work below.
 
 ## Status — 2026-06-24
 
-### ✅ Built this session (live; validated offline, needs live-key smoke tests)
+### ✅ Built (validated offline, needs live-key smoke tests)
+- **Phases 0 + 2 + 3 — registry + Gemini Vertex + DeepSeek/Mistral backend toggles (2026-06-24).**
+  Config-driven `ProviderRegistry` (`sdk_type` dispatch; `config.json` `providers`+`platform`),
+  behavior-preserving on the default config (24-check offline harness passes). Gemini `vertex`
+  backend + DeepSeek `fireworks`/`self_hosted` + Mistral `together`/`self_hosted` are code-complete
+  with a `local` cost mode; the non-default backends ⚠️ owe live smoke tests. See the table +
+  per-phase sections above.
 - **Phase 1 — Qwen/GLM on Fireworks, Mistral on `api.mistral.ai`.** Qwen+GLM share one
   Fireworks key (cached input = 0.5×input); Mistral is on its own EU API (`MISTRAL_API_KEY`)
   because Mistral Large 3 isn't on Fireworks serverless — a happy accident: EU-resident + France
@@ -72,33 +88,48 @@ self-contained — you don't need it to pick up the remaining work below.
 ### Remaining from the restructure spec
 | Phase | Status | Priority |
 |---|---|---|
-| 0 — Provider registry refactor (`sdk_type`, config-driven) | ❌ skipped (additive approach used instead) | Low — working code; only if config-driven providers are wanted |
+| 0 — Provider registry refactor (`sdk_type`, config-driven) | ✅ **done** — `ProviderRegistry`, config `providers`+`platform`, `sdk_type` dispatch (behavior-preserving; offline-validated) | — |
 | 1 — Mistral/Qwen/GLM on Fireworks | ✅ done (with routing deviation) | — |
 | 2 — Gemini Developer-API default | ✅ already the default (operator: keep billing on) | — |
-| 2 — Gemini **Vertex** backend | ❌ not built | Optional / lab-only (residency/SLA) |
-| 3 — Provider backend toggles: DeepSeek (`api`/`fireworks`/`self_hosted`) **+ Mistral** (`api`/`together`/`self_hosted`) | ❌ not built (both hardcoded to `api`) | Med — lab route |
+| 2 — Gemini **Vertex** backend | ✅ **code-complete** — `_generate_gemini_vertex_response` + `_ensure_gemini_vertex_cache` + backend-tagged caches; ⚠️ UNVERIFIED (needs GCP ADC) | Optional / lab-only |
+| 3 — Provider backend toggles: DeepSeek (`api`/`fireworks`/`self_hosted`) **+ Mistral** (`api`/`together`/`self_hosted`) | ✅ **code-complete** — toggles in registry + `local` cost mode; `api` modes live, `fireworks`/`self_hosted`/`together` ⚠️ UNVERIFIED | Med — lab route |
 | 4 — Slack platform abstraction | ❌ not built | **High — the big one** |
 | 5 — Hermes delegation bridge | ❌ not built | Optional / lab-only |
 
-#### Phase 0 — Provider registry refactor — *skipped, not blocking*
-We added the new providers as hardcoded `ModelProvider(...)` instances + a name-keyed
-`openai_compatible_clients` dict, NOT the spec's config-driven registry with `sdk_type` dispatch.
-The goal (new providers, graceful degradation) is met. Do this only if you want providers declared
-in `config.json` (with `routing_tags`) instead of code, or to split `bot.py` into a `hydra/`
-package. It's a refactor of working code — defer unless there's a reason.
+#### Phase 0 — Provider registry refactor — *✅ done (this session)*
+`ProviderRegistry.from_config()` (right after the provider constants in `bot.py`) builds every
+provider's client + backend from `config.json`. The 6 `ModelProvider(...)` constants stay as the
+code-side default spec (pricing/energy/quirks + `sdk_type`/`api_key_env`/`base_url`/`backend`/
+`backends`); config's optional `providers` block overrides `enabled`/`backend`/`model`/
+`routing_tags`, and a top-level `platform` field is read+stored (Slack is Phase 4). **Hybrid by
+design** — the richly-commented constants did NOT move into JSON; config is operator overrides only.
+**No `providers` block ⇒ byte-for-byte the old behavior** (offline-validated: enabled set, dispatch,
+cost, routing all unchanged). `__init__` is slimmed to bind registry results (`self.providers`,
+`self.<id>_provider`, `self.clients`, `self.openai_compatible_clients`); dispatch switches on
+`provider.sdk_type`; `pref_map`/`!prefer` are registry-built (so `!prefer qwen|glm|mistral` now work
+— the one intentional additive change). `routing_tags` exists but is INERT. Package split deferred
+to Phase 4.
 
-#### Phase 2 (Vertex) — *optional, deferred*
-Developer API is the default and already no-train **as long as billing stays enabled on the Google
-project** (operator setting, not code — Sarah is paying). Only build Vertex if the lab needs
-EU/regional residency, IAM/VPC, SLA, or compliance: add `_generate_gemini_vertex_response()` +
-`_ensure_gemini_vertex_cache()`, branch a `gemini.backend` toggle, and **backend-tag bookclub
-cache handles** (`cachedContents` ≠ Vertex `CachedContent` — never reuse an id across backends).
-Auth is ADC (`GOOGLE_APPLICATION_CREDENTIALS` service-account JSON) — the usual failure point.
+#### Phase 2 (Vertex) — *✅ code-complete, ⚠️ unverified (this session)*
+Developer API stays the default + no-train **as long as billing stays enabled on the Google project**
+(operator setting — Sarah is paying). `gemini.backend = "vertex"` now routes to
+`_generate_gemini_vertex_response()` + `_ensure_gemini_vertex_cache()` (lazy `vertexai` import;
+`google-cloud-aiplatform` is an OPTIONAL, commented dep). **Cache handles are backend-tagged**
+(`Gemini:developer_api` vs `Gemini:vertex` via `_gemini_cache_key()`) so a `cachedContents` id is
+never reused against Vertex `CachedContent`; `_drop`/`_reconcile` handle both + the legacy untagged
+key. ⚠️ **OWES A LIVE SMOKE TEST** — needs GCP ADC (`GOOGLE_APPLICATION_CREDENTIALS`) +
+`GOOGLE_CLOUD_PROJECT`; the exact vertexai SDK surface (grounding ctor, `from_cached_content`) may
+need a tweak per SDK version. `_reconcile_gemini_caches` still sweeps only developer-API caches
+(Vertex orphans rely on the per-teardown drop — `TODO(vertex-reconcile)`).
 
-#### Phase 3 — Provider backend toggles (DeepSeek + Mistral) — *TODO (lab route)*
-Both DeepSeek and Mistral are currently **hardcoded to their `api` backend**; the spec wants a
-config toggle. Cheapest kind of change — swap base_url/key/model only (all OpenAI-compatible, no
-new generator) + adjust per-backend cost/grid.
+#### Phase 3 — Provider backend toggles (DeepSeek + Mistral) — *✅ code-complete, ⚠️ unverified*
+Both toggles are built in the registry (`backends` tables on the constants; selected via
+`providers.<id>.backend`). `api` modes are live + unchanged; `fireworks`/`together`/`self_hosted`
+are wired but ⚠️ **OWE LIVE SMOKE TESTS** (Fireworks/Together keys, a local vLLM). `self_hosted`
+sets `cost_mode="local"` + `supports_server_cache=False` → `get_cost()` returns $0 and `!cost`
+labels the line "local (electricity only)" while still showing the 🌱 energy/CO₂ (tokens counted on
+the self-host grid). DeepSeek still defaults to its China `api` for the Discord bot (locked
+deviation). The per-backend reference below still applies (values flagged `VERIFY` are estimates):
 
 **DeepSeek** stays on its China `api` for the Discord bot (Sarah's call — cheap, and "the Chinese can
 have the shitposts"). To add the toggle: `providers.deepseek.backend = api | fireworks | self_hosted`.
@@ -148,5 +179,9 @@ fully with Hermes absent.
   `mistral-large-latest` (current values are estimates). The **energy** constants
   (`est_wh_per_1k_tokens`, `train_tco2e`) are order-of-magnitude.
 - Live smoke tests still owed: `!mari`/`!rei`/`!asuka` round-trips, `!french bonjour` (Azure
-  fr-FR synth) and `!french how do you say …` (Mistral G2P), inline `[[french:..]]`.
+  fr-FR synth) and `!french how do you say …` (Mistral G2P), inline `[[french:..]]`. **Plus the
+  new backends (Phase 2/3):** Gemini `vertex` (GCP ADC + `google-cloud-aiplatform`); DeepSeek
+  `fireworks` (`!deepseek`) + `self_hosted` (local vLLM → shows `local` in `!cost`); Mistral
+  `together` (Together key) + `self_hosted`. Verify the Together Mistral-Large-3 slug + Fireworks
+  DeepSeek/Together pricing (flagged `VERIFY`).
 - Operator: keep Fireworks prepaid balance topped up (auto-reload) and Gemini billing current.

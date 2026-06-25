@@ -1,9 +1,25 @@
 {
+  "platform": "discord",
   "allowed_channels": [
     123456789012345678,
     234567890123456789
   ],
   "default_model": "auto",
   "channel_preferences": {},
-  "_comment": "Get channel IDs by enabling Developer Mode in Discord settings, then right-click a channel. default_model can be 'auto', 'claude', or 'deepseek'. channel_preferences maps channel ID strings to model names."
+
+  "_comment": "Get channel IDs via Discord Developer Mode -> right-click a channel. platform is 'discord' (Slack lands in Phase 4). default_model: 'auto' or any provider id (claude/deepseek/gemini/mistral/qwen/glm). channel_preferences maps channel-ID strings to a provider id.",
+
+  "_providers_comment": "OPTIONAL. Omit the whole 'providers' block to keep default behavior (every provider enabled iff its API key is present, on its default backend). When present it OVERRIDES per-provider: 'enabled' (force off), 'backend' (toggle), 'model' (slug override), 'routing_tags' (reserved, not yet wired into routing). A per-backend sub-block (e.g. self_hosted) overrides that backend's base_url/model.",
+
+  "providers": {
+    "claude":   { "enabled": true },
+    "deepseek": { "enabled": true, "backend": "api" },
+    "gemini":   { "enabled": true, "backend": "developer_api" },
+    "mistral":  { "enabled": true, "backend": "api" },
+    "qwen":     { "enabled": true },
+    "glm":      { "enabled": true },
+
+    "_backend_options": "deepseek.backend: 'api' (China, default) | 'fireworks' (US/ZDR, shares FIREWORKS_API_KEY) | 'self_hosted'. mistral.backend: 'api' (EU api.mistral.ai, default) | 'together' (US, TOGETHER_API_KEY) | 'self_hosted'. gemini.backend: 'developer_api' (default) | 'vertex' (needs GCP ADC + google-cloud-aiplatform).",
+    "_self_hosted_example": "{ \"enabled\": true, \"backend\": \"self_hosted\", \"self_hosted\": { \"base_url\": \"http://localhost:8000/v1\", \"model\": \"deepseek-v4-flash\" } }  -> billed as 'local' (electricity only, no per-token $)."
+  }
 }

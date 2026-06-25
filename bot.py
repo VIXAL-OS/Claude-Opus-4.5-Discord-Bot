@@ -243,6 +243,39 @@ class ModelProvider:
     model_id: str                      # API model string
     input_cost_per_million: float      # $/M input tokens (≤ tier threshold)
     output_cost_per_million: float     # $/M output tokens (≤ tier threshold)
+
+    # --- Provider-registry / dispatch wiring (Phase 0) -----------------------
+    # These make providers config-driven (config.json `providers` section)
+    # instead of hardcoded in ClaudeBot.__init__. `name` stays the CANONICAL
+    # routing key (NEVER rename — CLAUDE.md rule); `id` is the lowercase config
+    # key. `sdk_type` drives dispatch in _generate_response without per-provider
+    # if-branches. ProviderRegistry.from_config() wires base_url / api key /
+    # backend from these + the config overlay.
+    id: str = ""                         # config key: "claude", "deepseek", …
+    sdk_type: str = "openai_compatible"  # "anthropic" | "openai_compatible" | "gemini"
+    api_key_env: str = ""                # env var name holding this provider's key
+    base_url: Optional[str] = None       # OpenAI-compatible endpoint (None for anthropic / gemini-native)
+    alias: Optional[str] = None          # optional command-alias label
+    display_name: Optional[str] = None   # optional human label (falls back to name)
+    # Backend toggle (Phases 2/3): `backend` is the ACTIVE backend; `backends`
+    # is a table of the NON-default backends only. The default backend's wiring
+    # lives in the fields above/below, so the default config triggers ZERO
+    # mutation (behavior-preserving); selecting a non-default backend merges
+    # backends[backend] over those fields. e.g. deepseek: "api" (default) |
+    # "fireworks" | "self_hosted"; gemini: "developer_api" (default) | "vertex".
+    backend: Optional[str] = None
+    backends: dict = field(default_factory=dict)
+    # Backend characteristics (Phase 3). supports_server_cache=False for a
+    # self-hosted endpoint (no prompt cache → cached price = input price).
+    # cost_mode="local" skips per-token $ and labels the turn electricity-only
+    # (tokens are still counted, so energy/CO₂ still report).
+    supports_server_cache: bool = True
+    cost_mode: str = "metered"           # "metered" | "local"
+    # Routing metadata target (spec §4.1). INERT this phase — routing stays in
+    # _estimate_confidence; never consulted by _select_model yet. Groundwork
+    # for a future config-driven router.
+    routing_tags: list = field(default_factory=list)
+
     max_tokens: int = 4096
     # Context window in tokens — the API limit, not our budget. Used to gate
     # whether !load can attach a reading material to this provider's calls
@@ -368,6 +401,12 @@ class ModelProvider:
 
     def get_cost(self) -> float:
         """Get total cost for this provider across all pricing tiers and cache states."""
+        # Local / self-hosted backends bill electricity, not per token, so there
+        # is no $ figure to report. Tokens are still counted, so get_energy_wh /
+        # get_co2_g still surface the carbon. See cost_mode + the "local" label
+        # in ConversationManager.get_cost_summary.
+        if self.cost_mode == "local":
+            return 0.0
         input_cost = (self.total_input_tokens / 1_000_000) * self.input_cost_per_million
         output_cost = (self.total_output_tokens / 1_000_000) * self.output_cost_per_million
         # Cached input bills at its own (much lower) rate. If no cache rate is
@@ -508,6 +547,9 @@ MODEL_LABEL_NAMES = "Claude|Deepseek|Gemini|Mistral|Qwen|GLM"
 
 CLAUDE_PROVIDER = ModelProvider(
     name="Claude",
+    id="claude",
+    sdk_type="anthropic",
+    api_key_env="ANTHROPIC_API_KEY",
     model_id="claude-opus-4-8",
     input_cost_per_million=5.0,
     output_cost_per_million=25.0,
@@ -525,6 +567,11 @@ CLAUDE_PROVIDER = ModelProvider(
 
 DEEPSEEK_PROVIDER = ModelProvider(
     name="Deepseek",
+    id="deepseek",
+    sdk_type="openai_compatible",
+    api_key_env="DEEPSEEK_API_KEY",
+    base_url="https://api.deepseek.com",
+    backend="api",
     model_id="deepseek-v4-pro",
     input_cost_per_million=0.435,
     output_cost_per_million=0.87,
@@ -545,10 +592,41 @@ DEEPSEEK_PROVIDER = ModelProvider(
     est_wh_per_1k_tokens=0.3,  # sparse MoE (~37B active) — light per token
     grid_gco2_per_kwh=550.0,   # DeepSeek China API (east-CN grid; province-dependent — Sichuan hydro ~112, Inner Mongolia coal higher). fireworks backend → ~400; self-host → your grid
     train_tco2e=1000.0,        # ~1.4 GWh for V3 (2.78M GPU-hrs); V4 est. — very training-efficient
+    # Backend toggle (Phase 3). Default "api" (above) = China api.deepseek.com.
+    # The Discord bot stays on "api" by design (CLAUDE.md locked deviation);
+    # these are the lab-route options. Selecting one overrides base_url / key /
+    # model / cost / grid. ⚠️ Fireworks pricing + grid are estimates — VERIFY.
+    backends={
+        "fireworks": {  # US, zero-data-retention, server-side cache (50%)
+            "base_url": "https://api.fireworks.ai/inference/v1",
+            "api_key_env": "FIREWORKS_API_KEY",
+            "model": "accounts/fireworks/models/deepseek-v4-pro",
+            "input_cost_per_million": 1.74,          # VERIFY Fireworks pricing
+            "output_cost_per_million": 3.48,
+            "cached_input_cost_per_million": 0.87,   # Fireworks caches input at 50%
+            "grid_gco2_per_kwh": 400.0,              # Fireworks US fleet
+            "supports_server_cache": True,
+        },
+        "self_hosted": {  # local vLLM/Ollama — no egress, electricity-only cost
+            "base_url": "http://localhost:8000/v1",  # vLLM; Ollama = :11434/v1
+            "api_key_env": None,                      # local server, no key
+            "model": "deepseek-v4-flash",             # single-GPU; full V4 is multi-GPU
+            "supports_server_cache": False,
+            "cost_mode": "local",
+            "grid_gco2_per_kwh": None,                # your grid → global GRID_GCO2_PER_KWH
+        },
+    },
 )
 
 GEMINI_PROVIDER = ModelProvider(
     name="Gemini",
+    id="gemini",
+    sdk_type="gemini",
+    api_key_env="GEMINI_API_KEY",
+    # OpenAI-compatible shim endpoint (non-bookclub chat). The native
+    # generateContent + cachedContents paths build their own URLs via aiohttp.
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    backend="developer_api",
     # Newest fanciest as of May 2026. The OpenAI shim may also accept
     # "gemini-3.1-pro" if "-preview" gets rejected — check AI Studio logs.
     model_id="gemini-3.1-pro-preview",
@@ -585,6 +663,20 @@ GEMINI_PROVIDER = ModelProvider(
     disables_thinking_by_default=False,
     # Native Google Search grounding via aiohttp to the native endpoint.
     search_backend="google_native",
+    # Backend toggle (Phase 2). Default "developer_api" (above) is no-train when
+    # billing is enabled on the Google project (operator setting, not code).
+    # "vertex" is the optional enterprise rung (residency / IAM / SLA): auth via
+    # ADC, a DIFFERENT caching surface (vertexai.caching.CachedContent), same
+    # model slug. ⚠️ code-complete but UNVERIFIED — needs GCP ADC to smoke-test.
+    backends={
+        "vertex": {
+            "project_env": "GOOGLE_CLOUD_PROJECT",
+            "location_env": "GOOGLE_CLOUD_LOCATION",
+            "location_default": "us-central1",
+            "api_key_env": None,           # vertexai SDK uses ADC, not an API key
+            "grid_gco2_per_kwh": 130.0,    # region-dependent; Google fleet default
+        },
+    },
 )
 
 
@@ -601,6 +693,11 @@ GEMINI_PROVIDER = ModelProvider(
 # only — see _estimate_confidence. Vision off for safety (Claude/Gemini see).
 MISTRAL_PROVIDER = ModelProvider(
     name="Mistral",
+    id="mistral",
+    sdk_type="openai_compatible",
+    api_key_env="MISTRAL_API_KEY",
+    base_url="https://api.mistral.ai/v1",
+    backend="api",
     # On Mistral's OWN API (api.mistral.ai), NOT Fireworks — Mistral Large 3 is
     # catalog/on-demand-only on Fireworks (serverless 404s "not deployed").
     # Upside: EU-resident + France ~nuclear grid (the low-carbon win). Needs
@@ -616,10 +713,39 @@ MISTRAL_PROVIDER = ModelProvider(
     est_wh_per_1k_tokens=0.35,  # 675B/41B MoE — light per token
     grid_gco2_per_kwh=20.0,     # France grid (~20 g) — Mistral's own EU infra, the low-carbon win
     train_tco2e=2200.0,         # Mistral Large-2 LCA (Carbone 4); France-grid-embodied → genuinely low-carbon train
+    # Backend toggle (Phase 3). Default "api" (above) = api.mistral.ai (EU,
+    # France ~nuclear grid — the low-carbon win, and Mistral Large is native).
+    # "together" = US serverless (loses the green win); "self_hosted" = local
+    # (Large 3 is 675B/multi-GPU — use a small Mistral). ⚠️ together slug +
+    # pricing are estimates — VERIFY. code-complete but UNVERIFIED.
+    backends={
+        "together": {
+            "base_url": "https://api.together.xyz/v1",
+            "api_key_env": "TOGETHER_API_KEY",
+            "model": "mistralai/Mistral-Large-3",    # VERIFY exact Together slug
+            "input_cost_per_million": 2.0,           # VERIFY Together pricing
+            "output_cost_per_million": 6.0,
+            "cached_input_cost_per_million": 2.0,
+            "grid_gco2_per_kwh": 400.0,              # Together US fleet
+            "supports_server_cache": False,
+        },
+        "self_hosted": {
+            "base_url": "http://localhost:8000/v1",
+            "api_key_env": None,
+            "model": "ministral-8b",                 # single-GPU; Large 3 is multi-GPU
+            "supports_server_cache": False,
+            "cost_mode": "local",
+            "grid_gco2_per_kwh": None,
+        },
+    },
 )
 
 QWEN_PROVIDER = ModelProvider(
     name="Qwen",
+    id="qwen",
+    sdk_type="openai_compatible",
+    api_key_env="FIREWORKS_API_KEY",
+    base_url="https://api.fireworks.ai/inference/v1",
     model_id="accounts/fireworks/models/qwen3p7-plus",
     input_cost_per_million=0.50,         # VERIFY on Fireworks pricing page
     output_cost_per_million=3.00,
@@ -635,6 +761,10 @@ QWEN_PROVIDER = ModelProvider(
 
 GLM_PROVIDER = ModelProvider(
     name="GLM",
+    id="glm",
+    sdk_type="openai_compatible",
+    api_key_env="FIREWORKS_API_KEY",
+    base_url="https://api.fireworks.ai/inference/v1",
     model_id="accounts/fireworks/models/glm-5p2",
     input_cost_per_million=1.40,         # VERIFY on Fireworks pricing page
     output_cost_per_million=4.40,
@@ -657,6 +787,181 @@ GEMINI_CACHE_TTL_SECONDS = 24 * 3600  # cache auto-expires after this
 # Rough storage rate for the heads-up estimate logged at cache creation. VERIFY
 # against current Gemini pricing — used only for a console warning, not billing.
 GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR = 1.0
+
+
+# =============================================================================
+# PROVIDER REGISTRY (Phase 0 — config-driven provider wiring)
+# =============================================================================
+
+# The 6 providers in canonical order — how !models lists them and how routing
+# iterates ties. ProviderRegistry resolves each one's backend + client from this
+# list plus the config overlay. `name` stays the routing key (CLAUDE.md); `id`
+# is the config key.
+_PROVIDER_CONSTANTS = [
+    CLAUDE_PROVIDER,
+    DEEPSEEK_PROVIDER,
+    GEMINI_PROVIDER,
+    MISTRAL_PROVIDER,
+    QWEN_PROVIDER,
+    GLM_PROVIDER,
+]
+
+# Override-dict key → ModelProvider attribute. A selected non-default backend
+# (and any config sub-block for it) may set these. Vertex-only keys
+# (project_env / location_env / location_default) are deliberately absent —
+# they're read by the Vertex generator from prov.backends["vertex"], not applied
+# as provider fields.
+_BACKEND_FIELD_MAP = {
+    "base_url": "base_url",
+    "api_key_env": "api_key_env",
+    "model": "model_id",
+    "input_cost_per_million": "input_cost_per_million",
+    "output_cost_per_million": "output_cost_per_million",
+    "cached_input_cost_per_million": "cached_input_cost_per_million",
+    "grid_gco2_per_kwh": "grid_gco2_per_kwh",
+    "supports_server_cache": "supports_server_cache",
+    "cost_mode": "cost_mode",
+}
+
+
+class ProviderRegistry:
+    """Config-driven provider wiring. Replaces the hardcoded per-provider client
+    setup that used to live in ClaudeBot.__init__.
+
+    Built once via from_config(config). For each provider constant it:
+      1. applies config["providers"][id] overrides (enabled / backend / model /
+         routing_tags + per-backend sub-configs),
+      2. resolves the ACTIVE backend in place — the *default* backend is the
+         constant's own fields, so the default config (no `providers` section)
+         mutates nothing and behavior is byte-for-byte preserved; selecting a
+         non-default backend merges backends[backend] over those fields,
+      3. gates `enabled` on key presence (graceful degradation). Backends with
+         no api_key_env (Vertex → ADC, self_hosted → local server) aren't
+         key-gated; the operator owns their availability,
+      4. creates the SDK client per (sdk_type, backend).
+
+    Exposes: .providers (ordered; all of them — the `enabled` flag gates use),
+    .by_id / .by_name, .clients (id → client), .openai_compatible_clients
+    (name → client; back-compat lookup for the dispatch path), .platform.
+    """
+
+    def __init__(self):
+        self.providers: list[ModelProvider] = []
+        self.clients: dict[str, object] = {}
+        self.openai_compatible_clients: dict[str, object] = {}
+        self.platform: str = "discord"
+
+    def by_id(self, pid: str) -> Optional[ModelProvider]:
+        for p in self.providers:
+            if p.id == pid:
+                return p
+        return None
+
+    def by_name(self, name: str) -> Optional[ModelProvider]:
+        for p in self.providers:
+            if p.name == name:
+                return p
+        return None
+
+    @classmethod
+    def from_config(cls, config: Optional[dict]) -> "ProviderRegistry":
+        reg = cls()
+        config = config or {}
+        reg.platform = config.get("platform", "discord")
+        if reg.platform not in ("discord",):
+            print(f"⚠️  platform='{reg.platform}' is not implemented yet "
+                  f"(Slack lands in Phase 4) — running as 'discord'.")
+        providers_cfg = config.get("providers", {}) or {}
+
+        for prov in _PROVIDER_CONSTANTS:
+            reg._configure_provider(prov, providers_cfg.get(prov.id, {}) or {})
+            reg.providers.append(prov)
+        return reg
+
+    def _configure_provider(self, prov: ModelProvider, pcfg: dict) -> None:
+        # 1. Backend-independent overrides.
+        if "model" in pcfg:
+            prov.model_id = pcfg["model"]
+        if "routing_tags" in pcfg:
+            prov.routing_tags = list(pcfg["routing_tags"])
+
+        # 2. Resolve the active backend. config may override it; an unknown
+        #    backend falls back to the default with a warning. The default
+        #    backend == the constant's own fields → no mutation.
+        requested = pcfg.get("backend", prov.backend)
+        if requested and requested != prov.backend:
+            if requested in prov.backends:
+                self._apply_backend(prov, requested, pcfg)
+                prov.backend = requested
+            else:
+                print(f"⚠️  {prov.name}: unknown backend '{requested}' — using "
+                      f"default '{prov.backend}' (known: {sorted(prov.backends)}).")
+
+        # 3. Key + enabled gate. Backends with no api_key_env (Vertex/self_hosted)
+        #    aren't key-gated — the operator owns ADC / the local server.
+        key = os.getenv(prov.api_key_env) if prov.api_key_env else None
+        config_enabled = pcfg.get("enabled", True)
+        if not config_enabled:
+            prov.enabled = False
+        elif not prov.api_key_env:
+            prov.enabled = True
+        else:
+            prov.enabled = bool(key)
+
+        # 4. Client (only if enabled).
+        client = self._make_client(prov, key) if prov.enabled else None
+        self.clients[prov.id] = client
+        if prov.sdk_type in ("openai_compatible", "gemini"):
+            self.openai_compatible_clients[prov.name] = client
+
+        self._print_status(prov, config_enabled)
+
+    def _apply_backend(self, prov: ModelProvider, backend: str, pcfg: dict) -> None:
+        """Merge a non-default backend's overrides onto the provider in place,
+        then a per-backend config sub-block (e.g.
+        providers.deepseek.self_hosted.base_url) so an operator can point
+        self_hosted at their own server without editing code."""
+        overrides = dict(prov.backends.get(backend, {}))
+        overrides.update(pcfg.get(backend, {}) or {})
+        for okey, attr in _BACKEND_FIELD_MAP.items():
+            if okey not in overrides:
+                continue
+            val = overrides[okey]
+            # api_key_env and grid_gco2_per_kwh are intentionally Nullable
+            # (self_hosted has no key; None grid → global fallback). Skip an
+            # explicit None elsewhere so a partial dict can't blank a default.
+            if val is None and okey not in ("api_key_env", "grid_gco2_per_kwh"):
+                continue
+            setattr(prov, attr, val)
+
+    def _make_client(self, prov: ModelProvider, key: Optional[str]):
+        if prov.sdk_type == "anthropic":
+            # max_retries=4 (default 2) absorbs more transient 5xx — matters for
+            # bookclub cache-creation calls sending ~450k tokens.
+            return anthropic.Anthropic(api_key=key, max_retries=4)
+        if prov.sdk_type == "gemini" and prov.backend == "vertex":
+            # Vertex talks via the vertexai SDK (ADC), not an OpenAI client —
+            # _generate_gemini_vertex_response lazy-inits it. Nothing to build.
+            return None
+        if prov.sdk_type in ("openai_compatible", "gemini"):
+            from openai import OpenAI
+            # self_hosted / local endpoints carry no key; the OpenAI SDK rejects
+            # an empty string, so pass a harmless placeholder.
+            return OpenAI(api_key=key or "local", base_url=prov.base_url)
+        return None
+
+    def _print_status(self, prov: ModelProvider, config_enabled: bool) -> None:
+        if prov.enabled:
+            extra = ""
+            if prov.backend and prov.backend not in ("api", "developer_api"):
+                extra += f"; backend={prov.backend}"
+            if prov.cost_mode == "local":
+                extra += "; local (no per-token $)"
+            print(f"🟢 {prov.name} enabled (model: {prov.model_id}{extra})")
+        elif not config_enabled:
+            print(f"⚪ {prov.name} disabled in config")
+        else:
+            print(f"⚪ {prov.name} not configured ({prov.api_key_env} missing)")
 
 
 # =============================================================================
@@ -1430,10 +1735,15 @@ class ConversationManager:
             if cached_in > 0:
                 cache_note = f", 🟢 {cached_in:,} cached ({hit_rate:.0f}% hit rate)"
 
+            # Self-hosted / local backends bill electricity, not per token — show
+            # that instead of a $0.0000 that reads like "free". The 🌱 energy
+            # line below still reports (tokens are counted) on the self-host grid.
+            cost_str = ("local (no per-token $ — electricity only)"
+                        if p.cost_mode == "local" else f"${cost:.4f}")
             lines.append(
                 f"  **{p.name}**: {p.total_requests} requests, "
                 f"{uncached_in:,} in + {out_tokens:,} out{cache_note} = "
-                f"${cost:.4f}"
+                f"{cost_str}"
             )
             if storage_est > 0:
                 lines.append(
@@ -1447,7 +1757,10 @@ class ConversationManager:
                     f"(grid ≈ {grid:.0f} g/kWh)"
                 )
 
-        if grand_total == 0 and storage_total == 0:
+        # energy_wh_total guards the local/self-hosted case: those bill $0 per
+        # token but still record tokens, so a non-zero energy total means real
+        # traffic happened even when grand_total is $0.
+        if grand_total == 0 and storage_total == 0 and energy_wh_total == 0:
             return "💰 No API calls made yet."
 
         if storage_total > 0:
@@ -1564,101 +1877,37 @@ class ClaudeBot(commands.Bot):
 
         super().__init__(command_prefix="!", intents=intents)
 
-        # Model providers
-        self.claude_provider = CLAUDE_PROVIDER
-        self.deepseek_provider = DEEPSEEK_PROVIDER
-        self.gemini_provider = GEMINI_PROVIDER
-        # Open-weight heads on Fireworks (enabled below iff FIREWORKS_API_KEY).
-        self.mistral_provider = MISTRAL_PROVIDER
-        self.qwen_provider = QWEN_PROVIDER
-        self.glm_provider = GLM_PROVIDER
+        # --- Providers: config-driven registry (Phase 0) --------------------
+        # Read config.json up front so the registry can apply its `providers`
+        # overlay + `platform` toggle, then wire every provider's client +
+        # backend from it. _load_config() (end of __init__) reuses this parsed
+        # dict for allowed_channels / default_model / channel_preferences.
+        # With no `providers` section (the default config) this reproduces the
+        # old hardcoded setup exactly: each provider enabled iff its key is
+        # present, on its default backend.
+        self._raw_config = self._read_config_file()
+        self.registry = ProviderRegistry.from_config(self._raw_config)
+        self.platform = self.registry.platform
 
-        # Anthropic client. max_retries=4 (default 2) absorbs more transient
-        # 5xx blips silently — important for bookclub mode where cache-creation
-        # calls send ~450k tokens and are the heaviest possible requests.
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-        if anthropic_key:
-            self.claude_client = anthropic.Anthropic(
-                api_key=anthropic_key,
-                max_retries=4,
-            )
-            self.claude_provider.enabled = True
-            print(f"🟢 Claude enabled (model: {self.claude_provider.model_id})")
-        else:
-            self.claude_client = None
-            self.claude_provider.enabled = False
-            print("⚪ Claude not configured (ANTHROPIC_API_KEY missing)")
+        # Canonical providers + per-provider convenience handles. The rest of
+        # this file references these by name; identity is preserved because the
+        # registry resolves the module-level constants in place.
+        self.providers = self.registry.providers
+        self.claude_provider = self.registry.by_id("claude")
+        self.deepseek_provider = self.registry.by_id("deepseek")
+        self.gemini_provider = self.registry.by_id("gemini")
+        self.mistral_provider = self.registry.by_id("mistral")
+        self.qwen_provider = self.registry.by_id("qwen")
+        self.glm_provider = self.registry.by_id("glm")
 
-        # Deepseek client (OpenAI-compatible, optional)
-        deepseek_key = os.getenv("DEEPSEEK_API_KEY")
-        if deepseek_key:
-            from openai import OpenAI
-            self.deepseek_client = OpenAI(
-                api_key=deepseek_key,
-                base_url="https://api.deepseek.com"
-            )
-            self.deepseek_provider.enabled = True
-            print(f"🟢 Deepseek enabled (model: {self.deepseek_provider.model_id})")
-        else:
-            self.deepseek_client = None
-            self.deepseek_provider.enabled = False
-            print("⚪ Deepseek not configured (DEEPSEEK_API_KEY missing)")
-
-        # Gemini client (OpenAI-compatible via Google's shim, optional)
-        gemini_key = os.getenv("GEMINI_API_KEY")
-        if gemini_key:
-            from openai import OpenAI
-            self.gemini_client = OpenAI(
-                api_key=gemini_key,
-                base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-            )
-            self.gemini_provider.enabled = True
-            print(f"🟢 Gemini enabled (model: {self.gemini_provider.model_id})")
-        else:
-            self.gemini_client = None
-            self.gemini_provider.enabled = False
-            print("⚪ Gemini not configured (GEMINI_API_KEY missing)")
-
-        # Fireworks AI (OpenAI-compatible, optional). ONE endpoint + ONE key for
-        # Qwen (Rei) + GLM (Asuka) on US, zero-data-retention infra — they share
-        # fireworks_client and dispatch through the existing OpenAI-compatible
-        # generator. (Mistral is NOT here: Mistral Large 3 isn't on Fireworks
-        # serverless — it has its own gate just below.) Absent key disables
-        # exactly Qwen+GLM; everything else is untouched.
-        self._fireworks_providers = (self.qwen_provider, self.glm_provider)
-        fireworks_key = os.getenv("FIREWORKS_API_KEY")
-        if fireworks_key:
-            from openai import OpenAI
-            self.fireworks_client = OpenAI(
-                api_key=fireworks_key,
-                base_url="https://api.fireworks.ai/inference/v1",
-            )
-            for prov in self._fireworks_providers:
-                prov.enabled = True
-            print("🟢 Fireworks enabled (Qwen/Rei · GLM/Asuka — US/ZDR)")
-        else:
-            self.fireworks_client = None
-            for prov in self._fireworks_providers:
-                prov.enabled = False
-            print("⚪ Fireworks not configured (FIREWORKS_API_KEY missing — Qwen/GLM disabled)")
-
-        # Mistral (Mari) on its OWN API (api.mistral.ai, OpenAI-compatible). Its
-        # flagship isn't on Fireworks serverless, and its own endpoint is the
-        # better home anyway: EU-resident + France's ~nuclear grid (low-carbon).
-        # Separate MISTRAL_API_KEY. Absent → just Mari disabled.
-        mistral_key = os.getenv("MISTRAL_API_KEY")
-        if mistral_key:
-            from openai import OpenAI
-            self.mistral_client = OpenAI(
-                api_key=mistral_key,
-                base_url="https://api.mistral.ai/v1",
-            )
-            self.mistral_provider.enabled = True
-            print(f"🟢 Mistral enabled (Mari — api.mistral.ai/EU; model: {self.mistral_provider.model_id})")
-        else:
-            self.mistral_client = None
-            self.mistral_provider.enabled = False
-            print("⚪ Mistral not configured (MISTRAL_API_KEY missing — Mari disabled)")
+        # Clients. `clients` is keyed by provider id; `claude_client` /
+        # `gemini_client` stay as named handles because their native SDK paths
+        # reference them directly. `openai_compatible_clients` (name-keyed) is
+        # the dispatch / search / panel lookup. Disabled providers map to None.
+        self.clients = self.registry.clients
+        self.openai_compatible_clients = self.registry.openai_compatible_clients
+        self.claude_client = self.clients.get("claude")
+        self.gemini_client = self.clients.get("gemini")
 
         # Tavily search client (optional - enables web search for Deepseek).
         # Gemini uses Google's native grounding (no Tavily needed); see
@@ -1683,29 +1932,8 @@ class ClaudeBot(commands.Bot):
         else:
             print("⚪ Azure TTS not configured (AZURE_TTS_KEY / AZURE_TTS_REGION missing — !speak disabled)")
 
-        # All providers list (for iteration). Order matters: this is the order
-        # !models lists them and the order three-way routing iterates ties.
-        self.providers = [
-            self.claude_provider,
-            self.deepseek_provider,
-            self.gemini_provider,
-            self.mistral_provider,
-            self.qwen_provider,
-            self.glm_provider,
-        ]
-
-        # Map provider → OpenAI-compatible client so the generic generator can
-        # dispatch without name-matching. Claude uses the anthropic SDK directly.
-        self.openai_compatible_clients: dict[str, object] = {
-            self.deepseek_provider.name: self.deepseek_client,
-            self.gemini_provider.name: self.gemini_client,
-            # Qwen + GLM share the Fireworks client; Mistral uses its own EU
-            # client. (None when the relevant key is absent — but the provider is
-            # disabled then, so _select_model never dispatches it.)
-            self.mistral_provider.name: self.mistral_client,
-            self.qwen_provider.name: self.fireworks_client,
-            self.glm_provider.name: self.fireworks_client,
-        }
+        # (self.providers + self.openai_compatible_clients are bound from the
+        # registry above — canonical order preserved in _PROVIDER_CONSTANTS.)
 
         # Conversation manager
         self.manager = ConversationManager()
@@ -1960,21 +2188,35 @@ class ClaudeBot(commands.Bot):
         """Drop internal-only keys (prefixed with _) before sending to provider APIs."""
         return [{k: v for k, v in msg.items() if not k.startswith("_")} for msg in messages]
 
-    def _load_config(self) -> None:
-        """Load configuration from config.json."""
+    def _read_config_file(self) -> dict:
+        """Read + parse config.json once, returning the raw dict ({} if missing).
+        Called early in __init__ so ProviderRegistry can apply the `providers`
+        overlay + `platform`; _load_config reuses the result for the rest."""
         try:
-            with open('config.json', 'r') as f:
-                config = json.load(f)
-                self.allowed_channels = set(config.get('allowed_channels', []))
-                CONFIG.default_model = config.get('default_model', 'auto')
-                # Load channel preferences
-                for ch_id_str, model_name in config.get('channel_preferences', {}).items():
-                    self.channel_preferences[int(ch_id_str)] = model_name
-                print(f"Loaded {len(self.allowed_channels)} allowed channels")
-                if CONFIG.default_model != "auto":
-                    print(f"   Default model: {CONFIG.default_model}")
+            with open('config.json', 'r', encoding='utf-8') as f:
+                return json.load(f) or {}
         except FileNotFoundError:
             print("⚠️  No config.json found! Create one with {'allowed_channels': [channel_ids]}")
+            return {}
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"⚠️  Could not parse config.json ({e}) — using empty config.")
+            return {}
+
+    def _load_config(self) -> None:
+        """Apply non-provider settings from the already-parsed config
+        (self._raw_config): allowed channels, default model, channel prefs.
+        Provider wiring + the platform toggle are handled earlier by
+        ProviderRegistry (see __init__)."""
+        config = getattr(self, "_raw_config", None) or {}
+        self.allowed_channels = set(config.get('allowed_channels', []))
+        CONFIG.default_model = config.get('default_model', 'auto')
+        for ch_id_str, model_name in config.get('channel_preferences', {}).items():
+            self.channel_preferences[int(ch_id_str)] = model_name
+        platform_note = (f" · platform={self.platform}"
+                         if getattr(self, "platform", "discord") != "discord" else "")
+        print(f"Loaded {len(self.allowed_channels)} allowed channels{platform_note}")
+        if CONFIG.default_model != "auto":
+            print(f"   Default model: {CONFIG.default_model}")
 
     async def setup_hook(self) -> None:
         """Called when bot is ready."""
@@ -3045,6 +3287,12 @@ class ClaudeBot(commands.Bot):
         )
         return cache_name, expires_at
 
+    def _gemini_cache_key(self) -> str:
+        """Backend-tagged key for a material's Gemini cache handle, so a
+        developer-API cachedContents id is never reused against Vertex's
+        CachedContent (different surfaces). e.g. 'Gemini:developer_api'."""
+        return f"Gemini:{self.gemini_provider.backend or 'developer_api'}"
+
     async def _ensure_gemini_cache(
         self,
         material: "ReadingMaterial",
@@ -3059,8 +3307,19 @@ class ClaudeBot(commands.Bot):
         cache cannot set those fields themselves). Returns the cache name
         (e.g. "cachedContents/abc123") or None if creation failed.
         """
-        existing = material.cache_handles.get("Gemini")
-        expires = material.cache_expires_at.get("Gemini")
+        key = self._gemini_cache_key()
+        existing = material.cache_handles.get(key)
+        expires = material.cache_expires_at.get(key)
+        # One-time migration: adopt a legacy untagged "Gemini" handle (created
+        # before backend-tagging) when on developer_api, so the upgrade doesn't
+        # orphan a live cache.
+        if existing is None and self.gemini_provider.backend == "developer_api":
+            legacy = material.cache_handles.pop("Gemini", None)
+            legacy_exp = material.cache_expires_at.pop("Gemini", None)
+            if legacy:
+                existing = material.cache_handles[key] = legacy
+                if legacy_exp is not None:
+                    expires = material.cache_expires_at[key] = legacy_exp
         if existing and expires and expires > datetime.now() + timedelta(minutes=5):
             return existing
         # Existing handle is missing/stale — best-effort delete any old cache so
@@ -3074,8 +3333,8 @@ class ClaudeBot(commands.Bot):
         if result is None:
             return None
         cache_name, expires_at = result
-        material.cache_handles["Gemini"] = cache_name
-        material.cache_expires_at["Gemini"] = expires_at
+        material.cache_handles[key] = cache_name
+        material.cache_expires_at[key] = expires_at
         self.manager.mark_dirty()  # persist the new cache handle
         return cache_name
 
@@ -3106,12 +3365,119 @@ class ClaudeBot(commands.Bot):
             return False
 
     async def _drop_gemini_cache(self, material: "ReadingMaterial") -> None:
-        """Delete a material's live Gemini cache (if any) and clear its handle."""
-        cache_name = material.cache_handles.pop("Gemini", None)
-        material.cache_expires_at.pop("Gemini", None)
-        if cache_name:
-            await self._delete_gemini_cache(cache_name)
+        """Delete a material's live Gemini cache(s) and clear the handle(s).
+        Handles any backend-tagged key ("Gemini:developer_api" / "Gemini:vertex")
+        plus the legacy untagged "Gemini", deleting each via the matching
+        backend's API."""
+        keys = [k for k in list(material.cache_handles) if k.startswith("Gemini")]
+        dropped = False
+        for k in keys:
+            cache_name = material.cache_handles.pop(k, None)
+            material.cache_expires_at.pop(k, None)
+            if not cache_name:
+                continue
+            dropped = True
+            if k.endswith(":vertex"):
+                await self._delete_gemini_vertex_cache(cache_name)
+            else:
+                await self._delete_gemini_cache(cache_name)
+        if dropped:
             self.manager.mark_dirty()
+
+    async def _delete_gemini_vertex_cache(self, cache_name: Optional[str]) -> bool:
+        """Delete a Vertex CachedContent (stops its storage billing).
+        ⚠️ UNVERIFIED — needs the vertexai SDK + ADC. Best-effort, never raises."""
+        if not cache_name:
+            return False
+
+        def _del() -> bool:
+            try:
+                from vertexai.caching import CachedContent
+                CachedContent(cached_content_name=cache_name).delete()
+                print(f"🗑️  Deleted Vertex cache {cache_name}")
+                return True
+            except Exception as e:
+                print(f"⚠️  Vertex cache delete {cache_name}: {e}")
+                return False
+
+        return await asyncio.to_thread(_del)
+
+    def _create_gemini_vertex_cache(
+        self, material: "ReadingMaterial", system_text: Optional[str],
+    ) -> Optional[tuple[str, datetime]]:
+        """Create a Vertex CachedContent for a reading material (blocking — call
+        via to_thread). ⚠️ UNVERIFIED — the vertexai SDK surface varies by
+        version. Returns (cache_resource_name, expires_at) or None."""
+        try:
+            import vertexai
+            from vertexai.generative_models import Content, Part, Tool, grounding
+            from vertexai.caching import CachedContent
+        except ImportError:
+            print("⚠️  Vertex cache: google-cloud-aiplatform not installed.")
+            return None
+        vcfg = self.gemini_provider.backends.get("vertex", {})
+        project = os.getenv(vcfg.get("project_env", "GOOGLE_CLOUD_PROJECT"))
+        location = (os.getenv(vcfg.get("location_env", "GOOGLE_CLOUD_LOCATION"))
+                    or vcfg.get("location_default", "us-central1"))
+        if not project:
+            print("⚠️  Vertex cache: GOOGLE_CLOUD_PROJECT not set.")
+            return None
+        try:
+            vertexai.init(project=project, location=location)
+            fic_intro = (
+                f"I'm going to share a work with you for a bookclub discussion. "
+                f"It's titled '{material.title}' (source: {material.url}). "
+                f"Here is the full text — please read it; I'll ask questions "
+                f"about it afterwards.\n\n"
+            )
+            contents = [Content(role="user", parts=[Part.from_text(fic_intro + material.text)])]
+            search_tool = Tool.from_google_search_retrieval(grounding.GoogleSearchRetrieval())
+            cache = CachedContent.create(
+                model_name=self.gemini_provider.model_id,
+                system_instruction=system_text,
+                contents=contents,
+                tools=[search_tool],
+                ttl=timedelta(seconds=GEMINI_CACHE_TTL_SECONDS),
+            )
+        except Exception as e:
+            print(f"⚠️  Vertex cache creation failed: {e}")
+            return None
+        expires_at = datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
+        cached_tokens = material.estimated_tokens
+        self.gemini_provider.record_usage(cached_tokens, 0)
+        self.gemini_provider.total_requests += 1
+        storage_est = (
+            (cached_tokens / 1_000_000)
+            * GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR
+            * (GEMINI_CACHE_TTL_SECONDS / 3600)
+        )
+        self.gemini_provider.total_cache_storage_cost_est += storage_est
+        print(f"🟢 Created Vertex cache {cache.name} "
+              f"(~{cached_tokens:,} tok, expires {expires_at:%Y-%m-%d %H:%M})")
+        return cache.name, expires_at
+
+    async def _ensure_gemini_vertex_cache(
+        self, material: "ReadingMaterial", system_text: Optional[str] = None,
+    ) -> Optional[str]:
+        """Get/create a Vertex CachedContent handle (backend-tagged
+        'Gemini:vertex'). ⚠️ UNVERIFIED. Returns the cache resource name or None."""
+        key = self._gemini_cache_key()
+        existing = material.cache_handles.get(key)
+        expires = material.cache_expires_at.get(key)
+        if existing and expires and expires > datetime.now() + timedelta(minutes=5):
+            return existing
+        if existing:
+            await self._delete_gemini_vertex_cache(existing)
+        result = await asyncio.to_thread(
+            self._create_gemini_vertex_cache, material, system_text
+        )
+        if result is None:
+            return None
+        cache_name, expires_at = result
+        material.cache_handles[key] = cache_name
+        material.cache_expires_at[key] = expires_at
+        self.manager.mark_dirty()
+        return cache_name
 
     async def _set_reading_material(self, key: int, material: "ReadingMaterial") -> None:
         """Pin a reading material to a channel/thread key, first dropping any prior
@@ -3132,10 +3498,13 @@ class ClaudeBot(commands.Bot):
         gemini_key = os.getenv("GEMINI_API_KEY")
         if not gemini_key:
             return
-        # Cache handles we must KEEP (referenced by a loaded work / scoped thread).
+        # Cache handles we must KEEP (referenced by a loaded work / scoped
+        # thread) — across any backend-tagged key + the legacy untagged one.
         referenced = {
-            m.cache_handles.get("Gemini")
+            v
             for m in self.manager.reading_materials.values()
+            for k, v in m.cache_handles.items()
+            if k.startswith("Gemini")
         }
         referenced.discard(None)
         base = "https://generativelanguage.googleapis.com/v1beta"
@@ -3422,11 +3791,10 @@ class ClaudeBot(commands.Bot):
         channel_id = message.channel.id
         parent_id = getattr(message.channel, 'parent_id', None)
         pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id)
-        pref_map = {
-            "claude": self.claude_provider,
-            "deepseek": self.deepseek_provider,
-            "gemini": self.gemini_provider,
-        }
+        # Registry-driven: every provider id is a valid pref. The canonical
+        # three resolve identically to before; qwen/glm/mistral are now
+        # selectable too (additive — only matters if someone sets them).
+        pref_map = {p.id: p for p in self.providers}
         if pref in pref_map and pref_map[pref] in enabled:
             chosen = pref_map[pref]
             return chosen, f"User set channel preference to {chosen.name} (!prefer {pref}).{vision_routing_note}"
@@ -3757,7 +4125,10 @@ class ClaudeBot(commands.Bot):
             or "CACHE" in err_text.upper()
         ):
             print(f"⚠️  Gemini cache {cache_name} rejected; deleting it + retrying inline")
-            reading_material.cache_handles.pop("Gemini", None)
+            _gk = self._gemini_cache_key()
+            reading_material.cache_handles.pop(_gk, None)
+            reading_material.cache_expires_at.pop(_gk, None)
+            reading_material.cache_handles.pop("Gemini", None)  # legacy untagged
             reading_material.cache_expires_at.pop("Gemini", None)
             await self._delete_gemini_cache(cache_name)  # don't orphan the rejected cache
             self.manager.mark_dirty()
@@ -3831,6 +4202,117 @@ class ClaudeBot(commands.Bot):
         response_text = re.sub(r'\n\n+(\*\*[^*]+\*\*:)', r'\n\1', response_text)
         response_text = re.sub(r'  +', ' ', response_text)
 
+        return response_text, reactions, ""
+
+    async def _generate_gemini_vertex_response(
+        self,
+        guild_id: int,
+        messages: list[dict],
+        system: str,
+        thinking: bool = False,
+        reading_material: Optional["ReadingMaterial"] = None,
+    ) -> tuple[str, list[str], str]:
+        """Generate a Gemini response via Vertex AI (the `vertex` backend).
+
+        ⚠️ CODE-COMPLETE BUT UNVERIFIED — needs GCP ADC
+        (GOOGLE_APPLICATION_CREDENTIALS) + GOOGLE_CLOUD_PROJECT to smoke-test,
+        and the exact vertexai SDK surface (grounding tool constructor,
+        from_cached_content) can vary by SDK version. Mirrors
+        _generate_gemini_native_response on Vertex's surface: GenerativeModel +
+        vertexai.caching.CachedContent (NOT the developer-API cachedContents) +
+        Google Search grounding. Returns (text, reactions, "").
+        """
+        try:
+            import vertexai
+            from vertexai.generative_models import GenerativeModel, Tool, grounding
+            from vertexai.caching import CachedContent
+        except ImportError:
+            return ("Gemini Vertex Error: google-cloud-aiplatform not installed "
+                    "(`pip install google-cloud-aiplatform`).", [], "")
+
+        vcfg = self.gemini_provider.backends.get("vertex", {})
+        project = os.getenv(vcfg.get("project_env", "GOOGLE_CLOUD_PROJECT"))
+        location = (os.getenv(vcfg.get("location_env", "GOOGLE_CLOUD_LOCATION"))
+                    or vcfg.get("location_default", "us-central1"))
+        if not project:
+            return ("Gemini Vertex Error: GOOGLE_CLOUD_PROJECT not set "
+                    "(project + ADC required for the vertex backend).", [], "")
+
+        # Bake the fic into a Vertex cache (system + search + work) when a reading
+        # material is loaded; otherwise inline system + search on the call.
+        cache_name: Optional[str] = None
+        if reading_material is not None:
+            cache_name = await self._ensure_gemini_vertex_cache(
+                reading_material, system_text=system
+            )
+
+        def _call():
+            vertexai.init(project=project, location=location)
+            non_system = [m for m in messages if m.get("role") != "system"]
+            contents = self._convert_messages_to_gemini_format(
+                self._strip_internal_keys(non_system)
+            )
+            gen_config = {"max_output_tokens": self.gemini_provider.max_tokens}
+            if cache_name:
+                cached = CachedContent(cached_content_name=cache_name)
+                model = GenerativeModel.from_cached_content(cached_content=cached)
+            else:
+                if reading_material is not None:
+                    inline_system = (
+                        self._build_reading_material_system_block(reading_material)
+                        + "\n\n" + system
+                    )
+                else:
+                    inline_system = system
+                search_tool = Tool.from_google_search_retrieval(
+                    grounding.GoogleSearchRetrieval()
+                )
+                model = GenerativeModel(
+                    self.gemini_provider.model_id,
+                    system_instruction=[inline_system],
+                    tools=[search_tool],
+                )
+            return model.generate_content(contents, generation_config=gen_config)
+
+        try:
+            resp = await asyncio.to_thread(_call)
+        except Exception as e:
+            return (f"Gemini Vertex Error: {type(e).__name__}: {e}", [], "")
+
+        try:
+            response_text = (resp.text or "").strip()
+        except Exception:
+            response_text = ""
+        if not response_text:
+            return ("Gemini Vertex Error: empty response", [], "")
+
+        # Usage (cache-aware), mirroring the native path.
+        um = getattr(resp, "usage_metadata", None)
+        if um is not None:
+            prompt_tokens = getattr(um, "prompt_token_count", 0) or 0
+            output_tokens = getattr(um, "candidates_token_count", 0) or 0
+            cached_tokens = getattr(um, "cached_content_token_count", 0) or 0
+            uncached_input = max(0, prompt_tokens - cached_tokens)
+            self.gemini_provider.record_usage(
+                uncached_input, output_tokens, cached_input_tokens=cached_tokens
+            )
+            self.gemini_provider.total_requests += 1
+
+        # Process notes + reactions + formatting (same as the other generators).
+        note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
+        for match in re.finditer(note_pattern, response_text):
+            self.manager.memories[guild_id].working.add(
+                match.group(1).strip(), match.group(2).strip()
+            )
+        response_text = re.sub(note_pattern, '', response_text)
+        reactions: list[str] = []
+        for match in re.finditer(r'\[react:\s*([^\]]+)\]', response_text):
+            reactions.append(match.group(1).strip())
+        response_text = re.sub(r'\[react:\s*([^\]]+)\]', '', response_text).strip()
+        response_text = re.sub(r'\n\s*\n\s*\n', '\n\n', response_text)
+        response_text = re.sub(r'\n\n+(#+\s)', r'\n\1', response_text)
+        response_text = re.sub(r'\n\n+(\*\*[^*]+\*\*:)', r'\n\1', response_text)
+        response_text = re.sub(r'  +', ' ', response_text)
         return response_text, reactions, ""
 
     async def _generate_response(
@@ -3957,31 +4439,42 @@ class ClaudeBot(commands.Bot):
             if provider.max_context_tokens < needed:
                 reading_material = None  # silently drop for this provider
 
-        # Dispatch to the appropriate model.
-        #
-        # - Gemini + reading material → native generateContent path (only one
-        #   that can reference cachedContent). Includes inline google_search
-        #   grounding for organic web lookups during discussion.
-        # - Gemini without reading material → OpenAI shim (simpler, uniform
-        #   with Deepseek; we don't need the native features for normal chat).
-        # - Deepseek → OpenAI shim. Reading material gets inline-injected;
-        #   DeepSeek's automatic server-side prefix caching makes that ~free.
-        # - Claude → native Anthropic SDK with its own tool/thinking machinery.
-        if provider is self.gemini_provider and reading_material is not None:
-            return await self._generate_gemini_native_response(
-                guild_id, messages, system,
+        # Dispatch on sdk_type (Phase 0 registry). Behavior is preserved:
+        # - gemini + vertex backend → native Vertex path (Phase 2; handles
+        #   reading material + grounding internally).
+        # - gemini + reading material (developer_api) → native generateContent
+        #   path (only one that can reference cachedContent + google_search).
+        # - gemini without reading material → OpenAI shim (uniform with Deepseek).
+        # - openai_compatible (deepseek/mistral/qwen/glm, incl. fireworks /
+        #   self_hosted DeepSeek backends) → OpenAI shim. Reading material is
+        #   inline-injected; DeepSeek's server-side prefix cache makes that ~free.
+        # - anthropic (Claude) → native SDK with its own tool/thinking machinery.
+        if provider.sdk_type == "gemini":
+            if provider.backend == "vertex":
+                return await self._generate_gemini_vertex_response(
+                    guild_id, messages, system,
+                    thinking=thinking,
+                    reading_material=reading_material,
+                )
+            if reading_material is not None:
+                return await self._generate_gemini_native_response(
+                    guild_id, messages, system,
+                    thinking=thinking,
+                    reading_material=reading_material,
+                )
+            return await self._generate_openai_compatible_response(
+                self.clients[provider.id], provider, guild_id, messages, system,
                 thinking=thinking,
                 reading_material=reading_material,
             )
-        if provider.name in self.openai_compatible_clients:
-            client = self.openai_compatible_clients[provider.name]
+        if provider.sdk_type == "openai_compatible":
             return await self._generate_openai_compatible_response(
-                client, provider, guild_id, messages, system,
+                self.clients[provider.id], provider, guild_id, messages, system,
                 thinking=thinking,
                 reading_material=reading_material,
             )
 
-        # Claude path (default) — delegated to _generate_claude_response so the
+        # Claude path (anthropic) — delegated to _generate_claude_response so the
         # research panel and judge can reuse Claude with the same tool / thinking
         # / cache machinery. The implementation lives in that method below.
         return await self._generate_claude_response(
@@ -5220,14 +5713,7 @@ class ClaudeBot(commands.Bot):
             channel_id = message.channel.id
             parent_id = getattr(message.channel, 'parent_id', None)
             ch_pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id)
-            pref_map = {
-                "claude": self.claude_provider,
-                "deepseek": self.deepseek_provider,
-                "gemini": self.gemini_provider,
-                "mistral": self.mistral_provider,
-                "qwen": self.qwen_provider,
-                "glm": self.glm_provider,
-            }
+            pref_map = {p.id: p for p in self.providers}
             searcher: Optional[ModelProvider] = None
             if ch_pref in pref_map and pref_map[ch_pref] in eligible:
                 searcher = pref_map[ch_pref]
@@ -6048,10 +6534,13 @@ class ClaudeBot(commands.Bot):
             await self._send_response(message.channel, "\n".join(lines))
 
         elif cmd == "!prefer":
+            # Registry-driven: any provider id (or "auto") is a valid pref.
+            usage = ("Usage: `!prefer ["
+                     + "|".join([p.id for p in self.providers] + ["auto"]) + "]`")
             if len(parts) >= 2:
                 pref = parts[1].lower()
-                if pref not in ("claude", "deepseek", "gemini", "auto"):
-                    await message.channel.send("Usage: `!prefer [claude|deepseek|gemini|auto]`")
+                if pref != "auto" and self.registry.by_id(pref) is None:
+                    await message.channel.send(usage)
                     return
                 channel_id = message.channel.id
                 # Use parent channel for threads
@@ -6060,23 +6549,18 @@ class ClaudeBot(commands.Bot):
                 if pref == "auto":
                     self.channel_preferences.pop(channel_id, None)
                     await message.channel.send("✅ This channel will use **automatic** model selection.")
-                elif pref == "deepseek" and not self.deepseek_provider.enabled:
-                    await message.channel.send("❌ Deepseek is not configured (no API key).")
-                elif pref == "claude" and not self.claude_provider.enabled:
-                    await message.channel.send("❌ Claude is not configured (no API key).")
-                elif pref == "gemini" and not self.gemini_provider.enabled:
-                    await message.channel.send("❌ Gemini is not configured (no API key).")
                 else:
-                    self.channel_preferences[channel_id] = pref
-                    await message.channel.send(f"✅ This channel will always use **{pref.title()}**.")
+                    chosen = self.registry.by_id(pref)
+                    if not chosen.enabled:
+                        await message.channel.send(f"❌ {chosen.name} is not configured (no API key).")
+                    else:
+                        self.channel_preferences[channel_id] = pref
+                        await message.channel.send(f"✅ This channel will always use **{chosen.name}**.")
             else:
                 channel_id = message.channel.id
                 parent_id = getattr(message.channel, 'parent_id', None)
                 pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id, "auto")
-                await message.channel.send(
-                    f"Current preference: **{pref}**\n"
-                    f"Usage: `!prefer [claude|deepseek|gemini|auto]`"
-                )
+                await message.channel.send(f"Current preference: **{pref}**\n" + usage)
 
         elif cmd == "!calibration":
             model_name = parts[1].title() if len(parts) >= 2 else None
@@ -6112,13 +6596,13 @@ class ClaudeBot(commands.Bot):
 `!claude <message>` / `!opus <message>` / `!balthasar <message>` - Force Claude to respond
 `!deepseek <message>` / `!melchior <message>` - Force Deepseek to respond
 `!gemini <message>` / `!caspar <message>` - Force Gemini to respond
-`!mistral` / `!mari <message>` - Force Mistral (Mari) — French/EU specialist (needs FIREWORKS_API_KEY)
+`!mistral` / `!mari <message>` - Force Mistral (Mari) — French/EU specialist (needs MISTRAL_API_KEY)
 `!qwen` / `!rei <message>` - Force Qwen (Rei) — cheap coder/mathematician (needs FIREWORKS_API_KEY)
 `!glm` / `!asuka <message>` - Force GLM (Asuka) — agentic open head (needs FIREWORKS_API_KEY)
 `!think <message>` - Use extended thinking (deeper reasoning, slower & costlier)
 `!think:<level> <message>` - Force a specific effort level (low|medium|high|xhigh|max)
 `!models` - Show available models and their usage stats
-`!prefer [claude|deepseek|gemini|auto]` - Set model preference for this channel
+`!prefer [claude|deepseek|gemini|mistral|qwen|glm|auto]` - Set model preference for this channel
 `!calibration` - Show model confidence calibration stats
 React with 👍/👎 to bot responses to improve model selection
 Stack prefixes to combine: `!think !claude <message>` forces Claude with thinking on.
