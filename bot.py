@@ -780,10 +780,18 @@ GLM_PROVIDER = ModelProvider(
 
 
 # Bookclub Gemini caching knobs. Gemini context caches bill storage per
-# token-hour for their whole TTL whether or not they're ever read, so a big fic
-# cache that's created-and-abandoned is pure waste. Keep the TTL bounded and
-# always delete caches on !unload/!unscope (see _drop_gemini_cache).
-GEMINI_CACHE_TTL_SECONDS = 24 * 3600  # cache auto-expires after this
+# token-hour for their WHOLE TTL whether or not they're ever read, so a big fic
+# cache that sits idle is pure waste (~$11.6 for Almost Nowhere's ~452k tokens at
+# 24h). Default TTL is 6h, applied as a SLIDING window: each use bumps the expiry
+# back to a full TTL (_refresh_gemini_cache, once past the halfway point), so an
+# ACTIVE discussion never expires mid-conversation while an IDLE cache still dies
+# ~6h after its last use (~$2.9 worst case). A fully-expired cache recreates
+# automatically on the next message (~$1.8 re-upload + ~30s). Caches are also
+# deleted immediately on !unload/!unscope (_drop_gemini_cache). Tune without code
+# edits via GEMINI_CACHE_TTL_HOURS (e.g. 2 for very sporadic clubs, 24 for a
+# marathon read).
+GEMINI_CACHE_TTL_HOURS = float(os.getenv("GEMINI_CACHE_TTL_HOURS", "6"))
+GEMINI_CACHE_TTL_SECONDS = int(GEMINI_CACHE_TTL_HOURS * 3600)  # cache auto-expires after this
 # Rough storage rate for the heads-up estimate logged at cache creation. VERIFY
 # against current Gemini pricing — used only for a console warning, not billing.
 GEMINI_CACHE_STORAGE_COST_PER_MTOK_HOUR = 1.0
@@ -3235,7 +3243,7 @@ class ClaudeBot(commands.Bot):
             body["tools"] = tools
         print(
             f"📤 Uploading '{material.title}' (~{material.estimated_tokens:,} tokens) "
-            f"to a Gemini context cache (TTL {GEMINI_CACHE_TTL_SECONDS // 3600}h)…"
+            f"to a Gemini context cache (TTL {GEMINI_CACHE_TTL_HOURS:g}h)…"
         )
         try:
             async with aiohttp.ClientSession() as session:
@@ -3283,7 +3291,7 @@ class ClaudeBot(commands.Bot):
             f"🟢 Created Gemini cache {cache_name} "
             f"({cached_tokens:,} tok, expires {expires_at:%Y-%m-%d %H:%M}); "
             f"~${storage_est:.2f} storage if kept its full "
-            f"{GEMINI_CACHE_TTL_SECONDS // 3600}h TTL — deleted on !unload"
+            f"{GEMINI_CACHE_TTL_HOURS:g}h TTL — deleted on !unload"
         )
         return cache_name, expires_at
 
@@ -3321,6 +3329,17 @@ class ClaudeBot(commands.Bot):
                 if legacy_exp is not None:
                     expires = material.cache_expires_at[key] = legacy_exp
         if existing and expires and expires > datetime.now() + timedelta(minutes=5):
+            # Sliding-window TTL: once the cache is past the halfway point of its
+            # life, bump it back to a full TTL so an ACTIVE discussion never hits
+            # a mid-conversation expiry (refreshing only past halfway avoids a
+            # PATCH on every message). An IDLE cache still dies ~TTL after its
+            # last use. Best-effort — on failure the cache still works to expiry.
+            halfway = datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS / 2)
+            if expires < halfway and await self._refresh_gemini_cache(existing):
+                material.cache_expires_at[key] = (
+                    datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
+                )
+                self.manager.mark_dirty()
             return existing
         # Existing handle is missing/stale — best-effort delete any old cache so
         # we don't leave an overlapping one billing storage, then make a fresh one.
@@ -3337,6 +3356,34 @@ class ClaudeBot(commands.Bot):
         material.cache_expires_at[key] = expires_at
         self.manager.mark_dirty()  # persist the new cache handle
         return cache_name
+
+    async def _refresh_gemini_cache(self, cache_name: Optional[str]) -> bool:
+        """Slide a developer-API Gemini cache's expiry forward to now+TTL
+        (PATCH ?updateMask=ttl). Sliding-window TTL: an actively-used cache never
+        expires mid-discussion, while an idle one still dies GEMINI_CACHE_TTL_HOURS
+        after its last use. Best-effort; returns True on success."""
+        if not cache_name:
+            return False
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            return False
+        url = f"https://generativelanguage.googleapis.com/v1beta/{cache_name}?updateMask=ttl"
+        headers = {"Content-Type": "application/json", "x-goog-api-key": gemini_key}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.patch(
+                    url, headers=headers,
+                    json={"ttl": f"{GEMINI_CACHE_TTL_SECONDS}s"},
+                    timeout=30,
+                ) as resp:
+                    if resp.status == 200:
+                        print(f"🔄 Slid Gemini cache TTL → +{GEMINI_CACHE_TTL_HOURS:g}h ({cache_name})")
+                        return True
+                    print(f"⚠️  Gemini cache TTL refresh {cache_name}: HTTP {resp.status}")
+                    return False
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            print(f"⚠️  Gemini cache TTL refresh network error: {e}")
+            return False
 
     async def _delete_gemini_cache(self, cache_name: Optional[str]) -> bool:
         """Delete a Gemini cachedContents entry to stop its storage billing.
@@ -3465,6 +3512,13 @@ class ClaudeBot(commands.Bot):
         existing = material.cache_handles.get(key)
         expires = material.cache_expires_at.get(key)
         if existing and expires and expires > datetime.now() + timedelta(minutes=5):
+            # Sliding-window TTL (see _ensure_gemini_cache). Best-effort.
+            halfway = datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS / 2)
+            if expires < halfway and await self._refresh_gemini_vertex_cache(existing):
+                material.cache_expires_at[key] = (
+                    datetime.now() + timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
+                )
+                self.manager.mark_dirty()
             return existing
         if existing:
             await self._delete_gemini_vertex_cache(existing)
@@ -3478,6 +3532,25 @@ class ClaudeBot(commands.Bot):
         material.cache_expires_at[key] = expires_at
         self.manager.mark_dirty()
         return cache_name
+
+    async def _refresh_gemini_vertex_cache(self, cache_name: Optional[str]) -> bool:
+        """Slide a Vertex CachedContent's expiry forward to now+TTL (SDK update).
+        ⚠️ UNVERIFIED. Best-effort; returns True on success."""
+        if not cache_name:
+            return False
+
+        def _upd() -> bool:
+            try:
+                from vertexai.caching import CachedContent
+                CachedContent(cached_content_name=cache_name).update(
+                    ttl=timedelta(seconds=GEMINI_CACHE_TTL_SECONDS)
+                )
+                return True
+            except Exception as e:
+                print(f"⚠️  Vertex cache TTL refresh {cache_name}: {e}")
+                return False
+
+        return await asyncio.to_thread(_upd)
 
     async def _set_reading_material(self, key: int, material: "ReadingMaterial") -> None:
         """Pin a reading material to a channel/thread key, first dropping any prior
