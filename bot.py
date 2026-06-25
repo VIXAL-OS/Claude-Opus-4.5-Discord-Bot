@@ -6399,6 +6399,46 @@ class ClaudeBot(commands.Bot):
                 )
                 await message.channel.send(f"📤 Unloaded {title}{tail}.")
 
+        elif cmd == "!uncache":
+            # Drop ONLY the Gemini context cache(s) for this channel's loaded
+            # work (and any scoped-thread caches under it) — the book stays
+            # loaded for every model. Stops Gemini storage billing immediately
+            # without unloading; Gemini just recreates a fresh cache (current
+            # sliding TTL) on its next turn. Handy to kill a stranded long-TTL
+            # cache left over from before a restart.
+            channel_id = message.channel.id
+            if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
+                channel_id = message.channel.parent_id
+            material = self.manager.reading_materials.get(channel_id)
+            scoped = []
+            for key, mat in list(self.manager.reading_materials.items()):
+                ch = self.get_channel(key)
+                if isinstance(ch, discord.Thread) and ch.parent_id == channel_id:
+                    scoped.append(mat)
+            targets = ([material] if material is not None else []) + scoped
+            if not targets:
+                await message.channel.send("Nothing loaded in this channel.")
+            elif not any(k.startswith("Gemini") for m in targets for k in m.cache_handles):
+                await message.channel.send(
+                    "No live Gemini cache here to drop — the book stays loaded. "
+                    "(A cache only exists once Gemini has actually been used in this channel.)"
+                )
+            else:
+                for m in targets:
+                    await self._drop_gemini_cache(m)
+                self.manager.mark_dirty()
+                await self.manager.save_memories_async(providers=self.providers)
+                title = f"**{material.title}**" if material is not None else "the scoped threads"
+                scoped_note = (
+                    f" (+{len(scoped)} scoped-thread cache{'s' if len(scoped) != 1 else ''})"
+                    if scoped else ""
+                )
+                await message.channel.send(
+                    f"🗑️ Dropped the Gemini cache for {title}{scoped_note} — storage "
+                    f"billing stops now. The book's still loaded for all models; Gemini "
+                    f"recreates a fresh {GEMINI_CACHE_TTL_HOURS:g}h cache on its next turn."
+                )
+
         elif cmd == "!reading":
             # Lightweight info command — shows what's loaded without the
             # "no usage" path that !load has. Also includes a chapter table
@@ -6695,7 +6735,8 @@ effort level is shown in the response routing.
 `!chapters` - Show the chapter table of contents with per-chapter token counts
 `!scope chapter N` / `!scope chapters N-M` - (in a thread) restrict that thread to a chapter range so models only see those chapters — spoiler-safe + much cheaper per turn
 `!unscope` - (in a thread) drop the scope and use the parent channel's full work
-`!unload` - Drop the loaded work entirely
+`!unload` - Drop the loaded work entirely (removes it for ALL models)
+`!uncache` - Drop just the Gemini cache, keep the book loaded (stops Gemini storage $)
 `!reading` - Show what's currently loaded for this channel/thread
 Workflow: load the whole work in a channel once → create a thread per chapter → `!scope chapter N` in each thread. Each model's caches (Claude ephemeral, Gemini cachedContent, Deepseek server-side) are content-hashed, so each scope gets its own cheap cache after the first turn.
 Tip: set `AO3_COOKIE` in `.env` with your logged-in session cookie to bypass AO3's shields-up rate-limiting.
