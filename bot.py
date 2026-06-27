@@ -3388,9 +3388,11 @@ class ClaudeBot(commands.Bot):
     async def _delete_gemini_cache(self, cache_name: Optional[str]) -> bool:
         """Delete a Gemini cachedContents entry to stop its storage billing.
 
-        Best-effort: a 404 (already expired/deleted) counts as success. Gemini
-        bills cache storage per token-hour for the whole TTL, so deleting a
-        cache the moment we're done with it is what keeps bookclub cheap."""
+        Best-effort. An already-expired/deleted cache counts as success — Gemini
+        returns 404 OR a 403 PERMISSION_DENIED ("CachedContent not found (or
+        permission denied)") for a gone cache (it 403s rather than 404s to avoid
+        leaking existence), so both mean "already gone". Gemini bills storage per
+        token-hour for the whole TTL, so deleting promptly keeps bookclub cheap."""
         if not cache_name:
             return False
         gemini_key = os.getenv("GEMINI_API_KEY")
@@ -3401,8 +3403,13 @@ class ClaudeBot(commands.Bot):
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.delete(url, headers=headers, timeout=60) as resp:
-                    if resp.status in (200, 204, 404):
+                    if resp.status in (200, 204):
                         print(f"🗑️  Deleted Gemini cache {cache_name} (HTTP {resp.status})")
+                        return True
+                    if resp.status in (403, 404):
+                        # Already expired/deleted — Gemini 403s (not 404s) for a
+                        # gone cache. That's the desired end state, so: success.
+                        print(f"🗑️  Gemini cache {cache_name} already gone (HTTP {resp.status})")
                         return True
                     print(f"⚠️  Gemini cache delete {cache_name}: HTTP {resp.status}: "
                           f"{(await resp.text())[:200]}")
