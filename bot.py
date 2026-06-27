@@ -276,6 +276,32 @@ class ModelProvider:
     # for a future config-driven router.
     routing_tags: list = field(default_factory=list)
 
+    # --- Simulator mode (Phase 7, §9) ---------------------------------------
+    # completions_mode flips this provider off the chat path onto the
+    # transcript-completion path (_generate_simulator_response): it talks to a
+    # BASE model by continuing an IRC-style log via /completions instead of
+    # sending chat messages to /chat/completions. Default False → every existing
+    # provider keeps the instruct path byte-for-byte. A completions_mode provider
+    # is also OVERRIDE-ONLY: _select_model never argmax's it (a cold/garrulous
+    # base model shouldn't win auto-routing), but it's reachable by command
+    # (!dummy) and as a sticky channel pref (the spec's "designated channel").
+    completions_mode: bool = False
+    # Base-model sampler knobs the instruct path ignores (§9.3). The OpenAI-
+    # standard keys (temperature/top_p/frequency_penalty/presence_penalty/stop)
+    # go straight to client.completions.create; the non-standard ones
+    # (top_k/min_p/top_a/repetition_penalty) ride in extra_body for vLLM /
+    # Fireworks. Config overrides any key via providers.<id>.sampler; a None
+    # value drops that knob (lets the server pick its own default).
+    sim_sampler: dict = field(default_factory=dict)
+    # Query-driven search grounding for the simulator path (§9.2). A base model
+    # can't call the web_search tool itself, so when this is True the simulator
+    # detects a search intent in the latest user turn, runs `search_backend`
+    # itself, and folds the retrieved snippets into the transcript preamble
+    # (the chat heads append a tool result instead). Default False → the Dummy
+    # Plug never auto-searches; pasted-URL grounding still rides in via
+    # _augment_with_url_extracts. Flip via providers.<id>.search=true.
+    sim_search: bool = False
+
     max_tokens: int = 4096
     # Context window in tokens — the API limit, not our budget. Used to gate
     # whether !load can attach a reading material to this provider's calls
@@ -542,7 +568,7 @@ AMORTIZE_TRAINING = os.getenv("AMORTIZE_TRAINING", "1") not in ("0", "false", "F
 # never fully stopped the echo — this strip is the real fix. ⚠️ KEEP IN SYNC
 # with provider.name when adding a head (else its echo leaks through, the
 # "[Qwen] [Qwen]" double-label bug).
-MODEL_LABEL_NAMES = "Claude|Deepseek|Gemini|Mistral|Qwen|GLM"
+MODEL_LABEL_NAMES = "Claude|Deepseek|Gemini|Mistral|Qwen|GLM|Dummy"
 
 
 CLAUDE_PROVIDER = ModelProvider(
@@ -698,21 +724,22 @@ MISTRAL_PROVIDER = ModelProvider(
     api_key_env="MISTRAL_API_KEY",
     base_url="https://api.mistral.ai/v1",
     backend="api",
-    # On Mistral's OWN API (api.mistral.ai), NOT Fireworks — Mistral Large 3 is
-    # catalog/on-demand-only on Fireworks (serverless 404s "not deployed").
-    # Upside: EU-resident + France ~nuclear grid (the low-carbon win). Needs
-    # MISTRAL_API_KEY. Model alias `mistral-large-latest` tracks the newest Large.
+    # On Mistral's OWN API (api.mistral.ai), NOT Fireworks. `mistral-large-latest`
+    # now resolves to Mistral Large 3 (released 2025-12-02, 675B/41B MoE,
+    # Apache-2.0) — a ~4× price drop from Large 2 ($2/$6 → $0.50/$1.50). On
+    # Fireworks it's on-demand/dedicated only (NOT serverless), so the own-API
+    # route is now both the green win AND the cheap one. Needs MISTRAL_API_KEY.
     model_id="mistral-large-latest",
-    input_cost_per_million=2.0,          # VERIFY at console.mistral.ai (Mistral Large pricing)
-    output_cost_per_million=6.0,
-    cached_input_cost_per_million=2.0,   # Mistral API cache rate varies; assume no discount (shim doesn't extract cache hits)
+    input_cost_per_million=0.50,         # Mistral Large 3 (mistral.ai/pricing, 2026-06) — VERIFY at console.mistral.ai
+    output_cost_per_million=1.50,
+    cached_input_cost_per_million=0.50,  # Mistral API cache rate varies; assume no discount (shim doesn't extract cache hits)
     max_context_tokens=128_000,
     supports_vision=False,
     supports_web_search=False,
     search_backend="tavily",
     est_wh_per_1k_tokens=0.35,  # 675B/41B MoE — light per token
     grid_gco2_per_kwh=20.0,     # France grid (~20 g) — Mistral's own EU infra, the low-carbon win
-    train_tco2e=2200.0,         # Mistral Large-2 LCA (Carbone 4); France-grid-embodied → genuinely low-carbon train
+    train_tco2e=2200.0,         # Large-2 LCA (Carbone 4) carried over — Large-3's isn't published; France-grid-embodied → low-carbon train
     # Backend toggle (Phase 3). Default "api" (above) = api.mistral.ai (EU,
     # France ~nuclear grid — the low-carbon win, and Mistral Large is native).
     # "together" = US serverless (loses the green win); "self_hosted" = local
@@ -778,6 +805,64 @@ GLM_PROVIDER = ModelProvider(
     train_tco2e=2000.0,         # estimate — GLM-5 (744B) trains end-to-end on Huawei Ascend; CN province grid
 )
 
+# Phase 7 — simulator mode (§9). The "Dummy Plug": EVA's autopilot that runs an
+# Eva with NO conscious pilot. A base model continuing a transcript with no
+# instruct "pilot" steering it is exactly that — so the simulator head is a NERV
+# *system*, not a MAGI unit or a pilot, and it sidesteps the trinity-cap-at-3.
+# It is OFF by default (enabled=False → the registry leaves it disabled unless
+# config opts in; see _configure_provider) and OVERRIDE-ONLY (completions_mode
+# keeps it out of the argmax). Point it at any /completions-capable endpoint:
+# the default is a self-hosted vLLM/llama.cpp base model on localhost (no key —
+# the operator owns the box); to use a hosted base model instead, set
+# providers.sim.{base_url,model,api_key_env} in config.json. Pricing/energy are
+# placeholders flagged VERIFY — they only bite once a real endpoint is wired
+# (and read $0 anyway under a "local" self-host until you set cost_mode).
+SIM_PROVIDER = ModelProvider(
+    name="Dummy",                 # canonical routing key + [Dummy] label (NEVER rename — CLAUDE.md)
+    id="sim",
+    display_name="Dummy Plug",    # friendly label shown in !models ([Dummy] stays the routing key/label)
+    sdk_type="openai_compatible",
+    completions_mode=True,
+    enabled=False,                # opt-in: flip providers.sim.enabled=true in config.json
+    api_key_env="",               # self-hosted default → no key (operator owns the server)
+    base_url="http://localhost:8000/v1",  # vLLM default; override via providers.sim.base_url
+    model_id="base-model",        # override via providers.sim.model (e.g. a Ministral/Magistral base)
+    input_cost_per_million=0.0,   # VERIFY — local self-host bills electricity, not tokens
+    output_cost_per_million=0.0,  # VERIFY
+    max_context_tokens=32_000,    # conservative; bump in config if your base model is bigger
+    supports_vision=False,        # base model = text-only transcript
+    supports_web_search=False,
+    # A base model can't tool-call, so the chat heads' web_search loop never
+    # runs here. Instead the simulator can run this backend ITSELF and fold the
+    # snippets into the transcript preamble (§9.2) — but only when the operator
+    # opts in via sim_search (off by default). Tavily is the default backend;
+    # pasted-URL grounding reaches the path regardless via the URL-extract fold.
+    search_backend="tavily",
+    sim_search=False,             # opt-in: providers.sim.search=true (off by default)
+    est_wh_per_1k_tokens=0.4,     # VERIFY — small/mid base model
+    grid_gco2_per_kwh=None,       # self-host → global GRID_GCO2_PER_KWH fallback (your wall socket)
+    # Base-model sampler defaults (§9.3). Higher temp than chat — base models
+    # want headroom — with a light repetition penalty to curb loops. stop cuts
+    # the continuation at the next IRC speaker tag or a paragraph gap so one
+    # !dummy turn = one speaker's line, not the whole imagined channel.
+    sim_sampler={
+        "temperature": 0.9,
+        "top_p": 0.95,
+        "repetition_penalty": 1.05,   # extra_body (vLLM/Fireworks); harmless if unsupported
+        "stop": ["\n<", "\n\n\n"],
+    },
+)
+
+# Recognized simulator sampler keys (§9.3). STD go straight to
+# client.completions.create as named params; EXTRA ride in extra_body
+# (vLLM/Fireworks accept them, plain OpenAI ignores them); `stop` is
+# special-cased. Anything else in a providers.<id>.sampler config block is a
+# typo and is warned about at registry build (see _configure_provider). NB:
+# max_tokens is NOT a sampler key — it's taken from provider.max_tokens.
+SIM_SAMPLER_STD = ("temperature", "top_p", "frequency_penalty", "presence_penalty")
+SIM_SAMPLER_EXTRA = ("top_k", "min_p", "top_a", "repetition_penalty")
+SIM_SAMPLER_KEYS = frozenset(SIM_SAMPLER_STD + SIM_SAMPLER_EXTRA + ("stop",))
+
 
 # Bookclub Gemini caching knobs. Gemini context caches bill storage per
 # token-hour for their WHOLE TTL whether or not they're ever read, so a big fic
@@ -812,6 +897,7 @@ _PROVIDER_CONSTANTS = [
     MISTRAL_PROVIDER,
     QWEN_PROVIDER,
     GLM_PROVIDER,
+    SIM_PROVIDER,   # Phase 7 simulator (Dummy Plug) — last so it sorts after the heads in !models
 ]
 
 # Override-dict key → ModelProvider attribute. A selected non-default backend
@@ -892,6 +978,28 @@ class ProviderRegistry:
             prov.model_id = pcfg["model"]
         if "routing_tags" in pcfg:
             prov.routing_tags = list(pcfg["routing_tags"])
+        # Simulator mode (Phase 7) + the endpoint knobs an operator needs to
+        # point the Dummy Plug at their own /completions box. These are additive
+        # and only fire when present in config, so the default config (and the 6
+        # instruct heads) is untouched. base_url/api_key_env are set here, BEFORE
+        # the key gate + client build below, so they take effect this pass.
+        if "completions_mode" in pcfg:
+            prov.completions_mode = bool(pcfg["completions_mode"])
+        if "base_url" in pcfg:
+            prov.base_url = pcfg["base_url"]
+        if "api_key_env" in pcfg:
+            prov.api_key_env = pcfg["api_key_env"]
+        if "search" in pcfg:
+            # Opt-in query-driven search grounding for a completions_mode head
+            # (§9.2). Inert on the instruct heads (they ignore sim_search).
+            prov.sim_search = bool(pcfg["search"])
+        if isinstance(pcfg.get("sampler"), dict):
+            prov.sim_sampler = {**prov.sim_sampler, **pcfg["sampler"]}
+            unknown = [k for k in pcfg["sampler"] if k not in SIM_SAMPLER_KEYS]
+            if unknown:
+                print(f"⚠️  {prov.name}: ignoring unknown sampler key(s) {unknown} "
+                      f"(known: {sorted(SIM_SAMPLER_KEYS)}; max_tokens is set "
+                      f"separately, not via sampler).")
 
         # 2. Resolve the active backend. config may override it; an unknown
         #    backend falls back to the default with a warning. The default
@@ -908,7 +1016,11 @@ class ProviderRegistry:
         # 3. Key + enabled gate. Backends with no api_key_env (Vertex/self_hosted)
         #    aren't key-gated — the operator owns ADC / the local server.
         key = os.getenv(prov.api_key_env) if prov.api_key_env else None
-        config_enabled = pcfg.get("enabled", True)
+        # Default to the CONSTANT's own `enabled` so a provider shipped off
+        # (SIM_PROVIDER) stays off until config opts in, while the 6 heads
+        # (all enabled=True) behave exactly as before — pcfg.get("enabled",
+        # True) and pcfg.get("enabled", prov.enabled) are identical for them.
+        config_enabled = pcfg.get("enabled", prov.enabled)
         if not config_enabled:
             prov.enabled = False
         elif not prov.api_key_env:
@@ -965,7 +1077,14 @@ class ProviderRegistry:
                 extra += f"; backend={prov.backend}"
             if prov.cost_mode == "local":
                 extra += "; local (no per-token $)"
+            if prov.completions_mode:
+                extra += f"; simulator/base @ {prov.base_url}"
             print(f"🟢 {prov.name} enabled (model: {prov.model_id}{extra})")
+        elif prov.completions_mode and not config_enabled:
+            # Off-by-default simulator head, not a missing key — tell the
+            # operator how to wake it up.
+            print(f"⚪ {prov.name} off (Phase 7 simulator — enable via "
+                  f"providers.{prov.id}.enabled=true + base_url)")
         elif not config_enabled:
             print(f"⚪ {prov.name} disabled in config")
         else:
@@ -1907,6 +2026,7 @@ class ClaudeBot(commands.Bot):
         self.mistral_provider = self.registry.by_id("mistral")
         self.qwen_provider = self.registry.by_id("qwen")
         self.glm_provider = self.registry.by_id("glm")
+        self.sim_provider = self.registry.by_id("sim")   # Phase 7 simulator (Dummy Plug)
 
         # Clients. `clients` is keyed by provider id; `claude_client` /
         # `gemini_client` stay as named handles because their native SDK paths
@@ -1988,6 +2108,9 @@ class ClaudeBot(commands.Bot):
     MISTRAL_PREFIXES = ("!mistral", "!mari")
     QWEN_PREFIXES = ("!qwen", "!rei")
     GLM_PREFIXES = ("!glm", "!asuka")
+    # Phase 7 simulator (base-model transcript completion). !dummy is the EVA
+    # skin (Dummy Plug); !sim is the plain alias.
+    SIM_PREFIXES = ("!dummy", "!sim")
     CLAUDE_THINKING_EFFORT = "high"  # low | medium | high | xhigh | max
     CLAUDE_THINKING_MAX_TOKENS = 16000
 
@@ -2137,6 +2260,7 @@ class ClaudeBot(commands.Bot):
             + self.MISTRAL_PREFIXES
             + self.QWEN_PREFIXES
             + self.GLM_PREFIXES
+            + self.SIM_PREFIXES
         )
         while True:
             stripped = content.strip()
@@ -2184,6 +2308,8 @@ class ClaudeBot(commands.Bot):
                     flags.add("qwen")
                 elif prefix in self.GLM_PREFIXES:
                     flags.add("glm")
+                elif prefix in self.SIM_PREFIXES:
+                    flags.add("sim")
                 content = rest
                 matched = True
                 break
@@ -2320,6 +2446,13 @@ class ClaudeBot(commands.Bot):
         if "glm" in flags and not self.glm_provider.enabled:
             await message.channel.send("❌ GLM (Asuka) isn't configured (no FIREWORKS_API_KEY).")
             return
+        if "sim" in flags and (self.sim_provider is None or not self.sim_provider.enabled):
+            await message.channel.send(
+                "❌ The Dummy Plug (simulator mode) isn't enabled. Set "
+                "`providers.sim.enabled = true` in config.json and point "
+                "`providers.sim.base_url` at a /completions-capable base model."
+            )
+            return
 
         forced_provider = None
         routing_reason = ""
@@ -2341,6 +2474,9 @@ class ClaudeBot(commands.Bot):
         elif "glm" in flags:
             forced_provider = self.glm_provider
             routing_reason = "User directly invoked GLM (Asuka) with !glm/!asuka."
+        elif "sim" in flags:
+            forced_provider = self.sim_provider
+            routing_reason = "User directly invoked simulator mode (Dummy Plug) with !dummy/!sim."
 
         if flags:
             message.content = peeled_content
@@ -3863,6 +3999,12 @@ class ClaudeBot(commands.Bot):
             vision_routing_note = ""
 
         # Only one provider available in the (possibly filtered) pool?
+        # Deliberate exception to "completions_mode = override-only": if the
+        # base/sim head is the ONLY thing enabled (a sim-only box), plain
+        # messages route to it rather than failing — the "never argmax it" rule
+        # exists so a cold base model can't beat an available chat head, which
+        # doesn't apply when it's the only head up. With any chat head enabled,
+        # len>1 here and the auto_pool filter below keeps sim out of the argmax.
         if len(enabled) == 1:
             only = enabled[0]
             return only, f"Only {only.name} is available{vision_routing_note}."
@@ -3889,10 +4031,16 @@ class ClaudeBot(commands.Bot):
         # already encode each model's cost via per-provider penalties/bonuses,
         # so this is just final disambiguation.
         text = message.content or ""
-        scores = {p.name: self._estimate_confidence(text, p) for p in enabled}
+        # Simulator/base heads (Phase 7, completions_mode) are OVERRIDE-ONLY:
+        # never argmax'd (a cold/garrulous base model shouldn't win auto-routing)
+        # — only reachable via !dummy or a !prefer-pinned channel, both handled
+        # above. (The sim-only-box case already returned at the len==1 shortcut.)
+        # `or enabled` is pure defense for a hypothetical all-completions pool.
+        auto_pool = [p for p in enabled if not p.completions_mode] or enabled
+        scores = {p.name: self._estimate_confidence(text, p) for p in auto_pool}
         # Sort: primary = score desc, secondary = cost asc (cheaper wins ties).
         ranked = sorted(
-            enabled,
+            auto_pool,
             key=lambda p: (-scores[p.name], self._avg_cost_per_million(p)),
         )
         winner = ranked[0]
@@ -4086,6 +4234,307 @@ class ClaudeBot(commands.Bot):
             response_text = re.sub(r'  +', ' ', response_text)
 
             return response_text, reactions, reasoning
+
+        except Exception as e:
+            return f"{provider.name} Error: {e}", [], ""
+
+    # =========================================================================
+    # Simulator mode (Phase 7, §9) — base-model transcript completion
+    # =========================================================================
+    # A base model doesn't take chat turns; it continues a transcript. These
+    # three methods ARE the feature (§9.3): _format_transcript renders channel
+    # history as an IRC/script log + a continuation cue, the /completions call
+    # continues it, and _parse_transcript_turn cuts that back to one speaker's
+    # line. Cost + carbon ride the same record_usage path as the chat heads
+    # (§9.2), so a !dummy turn lands in !cost exactly like a chat turn.
+
+    @staticmethod
+    def _transcript_flatten(content) -> str:
+        """Flatten a message's content (str | list of blocks) to plain text,
+        dropping non-text blocks (images are already stripped upstream)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                b.get("text", "") for b in content if b.get("type") == "text"
+            )
+        return str(content or "")
+
+    def _format_transcript(
+        self,
+        messages: list[dict],
+        preamble: str,
+        bot_speaker: str,
+    ) -> tuple[str, str]:
+        """Render history as an IRC/script log and append a continuation cue.
+
+        Returns (prompt, bot_speaker). Each turn becomes a `<speaker> body`
+        line: user turns already carry a `DisplayName:` prefix (optionally
+        behind a `[replying to …]` block) and bot turns a `[Model]` tag — both
+        normalize to the `<speaker>` form. The prompt ends on a dangling
+        `<bot_speaker>` so the base model continues AS the bot; the stop
+        sequences + _parse_transcript_turn keep it to a single line.
+        """
+        # Name caps are generous (80) so webhook/PluralKit proxy names — which
+        # can exceed Discord's 32-char native cap — still attribute correctly
+        # instead of leaking the name into the body.
+        reply_re = re.compile(r'^\s*\[replying to', re.IGNORECASE)
+        user_name_re = re.compile(r'^\s*([^\n:]{1,80}?):\s')
+        bot_tag_re = re.compile(r'^\s*\[([^\]\n]{1,80})\]\s*')
+
+        lines: list[str] = []
+        for msg in messages:
+            # Recover the body text per content-BLOCK: fetch_thread_history puts
+            # a "[replying to …]" reply-context block ahead of the author block,
+            # and the quoted text is arbitrary (embedded ']' / newlines), so it
+            # must never be flattened-then-regex'd into the speaker line. Drop a
+            # leading reply block (the replied-to message is usually already in
+            # the log); parse the speaker from the real author block.
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+            else:
+                texts = [self._transcript_flatten(content)]
+            body_blocks = []
+            for t in texts:
+                if not body_blocks and reply_re.match(t):
+                    continue  # drop the leading reply-context block
+                body_blocks.append(t)
+            text = "\n".join(body_blocks).strip()
+            if not text:
+                continue
+            if msg.get("role") == "assistant":
+                m = bot_tag_re.match(text)
+                speaker = m.group(1).strip() if m else bot_speaker
+                body = text[m.end():].strip() if m else text
+            else:
+                m = user_name_re.match(text)
+                speaker = m.group(1).strip() if m else "user"
+                body = text[m.end():].strip() if m else text
+            if not body:
+                continue
+            lines.append(f"<{speaker}> {body}")
+
+        transcript = "\n".join(lines)
+        header = (preamble or "").strip()
+        framing = (
+            "The following is a log of an ongoing group chat channel. Continue "
+            f"it by writing the next line for <{bot_speaker}>, and only that line."
+        )
+        prompt = "\n\n".join(p for p in (header, framing, transcript) if p)
+        prompt += f"\n<{bot_speaker}>"
+        return prompt, bot_speaker
+
+    def _parse_transcript_turn(self, raw: str, bot_speaker: str) -> str:
+        """Cut a raw /completions continuation back to one speaker's line.
+
+        Belt-and-suspenders to the server-side `stop`: strip any echoed leading
+        speaker tag, then cut at the first NEW speaker line (`<name>` or
+        `[name]` at line start) or a paragraph gap."""
+        text = raw or ""
+        esc = re.escape(bot_speaker)
+        # Strip an echoed leading tag for the bot speaker (<Dummy> / [Dummy] / Dummy:).
+        text = re.sub(rf'^\s*(?:<{esc}>|\[{esc}\]|{esc}:)\s*', '', text, flags=re.IGNORECASE)
+        # Cut at the next speaker line. Only the `<name>` form — the one
+        # _format_transcript actually emits — counts; matching `[name]` too
+        # would over-cut on ordinary bracketed content a base model produces
+        # (code literals `[1, 2, 3]`, citations `[1]`, markdown footnotes).
+        m = re.search(r'\n\s*<[^>\n]{1,80}>', text)
+        if m:
+            text = text[:m.start()]
+        # ... or a paragraph gap (matches the "\n\n\n" stop).
+        text = re.split(r'\n{3,}', text)[0]
+        return text.strip()
+
+    # Query-driven search grounding for the simulator path (§9.2 / §9.5). A base
+    # model can't request the web_search tool itself, so we detect a search
+    # intent in the latest user turn HERE and fold results into the preamble.
+    # Two deliberately conservative triggers so we don't search every turn:
+    #   • explicit inline directive  [search: <query>]
+    #   • a leading-question heuristic — a short factual question / lookup cue
+    _SIM_SEARCH_DIRECTIVE_RE = re.compile(r'\[search:\s*([^\]]+)\]', re.IGNORECASE)
+    _SIM_SEARCH_LEAD_RE = re.compile(
+        r'^(?:who|what|whats|when|where|why|how|which|whose|is|are|was|were|'
+        r'does|do|did|can|could|should|will|would|has|have)\b',
+        re.IGNORECASE,
+    )
+    _SIM_SEARCH_CUE_RE = re.compile(
+        r'\b(?:search (?:for|up)|look(?:ing)? up|google|latest|current(?:ly)?|'
+        r'news (?:on|about)|who is|what is|how much|how many)\b',
+        re.IGNORECASE,
+    )
+
+    def _search_backend_available(self, provider: ModelProvider) -> bool:
+        """True if provider.search_backend can actually run a query right now —
+        mirrors _search_for's backend selection without performing a search, so
+        the simulator never folds a "no backend configured" sentinel into the
+        preamble."""
+        if provider.search_backend == "google_native" and os.getenv("GEMINI_API_KEY"):
+            return True
+        return provider.search_backend is not None and bool(self.tavily_client)
+
+    def _sim_search_query(self, messages: list[dict]) -> Optional[str]:
+        """Decide whether the latest user turn warrants a web search and, if so,
+        return the query (else None). Read-only — never mutates the transcript.
+
+        Mirrors _format_transcript's block handling: drop a leading
+        "[replying to …]" block, then strip the "Name:" speaker prefix before
+        applying the directive / question heuristics (see the regexes above)."""
+        last_user = next(
+            (m for m in reversed(messages) if m.get("role") == "user"), None
+        )
+        if last_user is None:
+            return None
+        content = last_user.get("content", "")
+        if isinstance(content, list):
+            texts = [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text"]
+        else:
+            texts = [content if isinstance(content, str) else ""]
+        body_blocks: list[str] = []
+        for t in texts:
+            if not body_blocks and re.match(r'^\s*\[replying to', t, re.IGNORECASE):
+                continue  # drop the leading reply-context block
+            body_blocks.append(t)
+        text = "\n".join(body_blocks).strip()
+        if not text:
+            return None
+        m = re.match(r'^\s*([^\n:]{1,80}?):\s', text)  # strip "Name:" speaker prefix
+        if m:
+            text = text[m.end():].strip()
+        if not text:
+            return None
+        # Explicit directive wins — exact, operator-/persona-authored intent.
+        d = self._SIM_SEARCH_DIRECTIVE_RE.search(text)
+        if d:
+            return d.group(1).strip() or None
+        # Heuristic: cap length so a long monologue ending on '?' doesn't fire.
+        if len(text) > 300:
+            return None
+        is_question = text.rstrip().endswith("?") and bool(self._SIM_SEARCH_LEAD_RE.match(text))
+        if is_question or self._SIM_SEARCH_CUE_RE.search(text):
+            return text.strip()
+        return None
+
+    async def _generate_simulator_response(
+        self,
+        provider: ModelProvider,
+        guild_id: int,
+        messages: list[dict],
+        system: str,
+        reading_material: Optional["ReadingMaterial"] = None,
+        force_speaker: Optional[str] = None,
+    ) -> tuple[str, list[str], str]:
+        """Generate a turn by CONTINUING a transcript via /completions (§9.3).
+
+        The base-model counterpart to _generate_openai_compatible_response:
+        same client object, same usage/carbon accounting, but it calls
+        client.completions.create on a rendered transcript instead of
+        client.chat.completions.create on chat messages. Returns the same
+        (text, reactions, reasoning) tuple (reasoning always "").
+
+        Grounding (§9.2): reading material and pasted-URL extracts fold in — the
+        latter because _augment_with_url_extracts has already rewritten the user
+        turn before dispatch, so it rides into the transcript for free. Query-
+        driven web_search (the chat heads' tool-call loop) can't run here — a
+        base model can't tool-call — so when the operator opts in (sim_search)
+        we detect a search intent ourselves and PREPEND the snippets to the
+        preamble (the query→search→preamble fold). Off by default."""
+        client = self.clients.get(provider.id)
+        if client is None:
+            return f"{provider.name} Error: simulator endpoint not configured", [], ""
+
+        # Base model = text-only transcript; drop image blocks.
+        msgs = self._strip_images_from_messages(messages)
+
+        # Fold reading material (bookclub) into the preamble, like the chat path.
+        preamble = system
+        if reading_material is not None:
+            preamble = (
+                self._build_reading_material_system_block(reading_material)
+                + "\n\n" + preamble
+            )
+
+        # Query-driven search grounding (§9.2 / §9.5). A base model can't
+        # tool-call, so when the operator opts in (provider.sim_search) AND a
+        # backend is actually available, detect a search intent in the latest
+        # user turn, run the SearchBackend ourselves, and PREPEND the snippets
+        # to the preamble (the chat heads append a tool result instead). Off by
+        # default: sim_search defaults False, so the standard Dummy Plug never
+        # auto-searches — pasted-URL grounding still rides in via the URL fold.
+        if provider.sim_search and self._search_backend_available(provider):
+            query = self._sim_search_query(msgs)
+            if query:
+                result = await self._search_for(provider, query)
+                snippet = (result.text or "").strip() if result else ""
+                if snippet:
+                    grounding = (
+                        f'[Web search results for "{query}" — freshly '
+                        "retrieved, treat as current web context:]\n" + snippet
+                    )
+                    preamble = f"{grounding}\n\n{preamble}" if preamble else grounding
+
+        bot_speaker = force_speaker or provider.name
+        prompt, bot_speaker = self._format_transcript(msgs, preamble, bot_speaker)
+
+        # Resolve sampler knobs (§9.3). Standard OpenAI params go on the call;
+        # the non-standard base-model knobs ride in extra_body (vLLM/Fireworks).
+        # A None value drops the knob (server default). `stop` is special-cased.
+        sampler = dict(provider.sim_sampler or {})
+        STD = ("temperature", "top_p", "frequency_penalty", "presence_penalty")
+        EXTRA = ("top_k", "min_p", "top_a", "repetition_penalty")
+        api_kwargs: dict = {
+            "model": provider.model_id,
+            "prompt": prompt,
+            "max_tokens": provider.max_tokens,
+        }
+        for k in STD:
+            if sampler.get(k) is not None:
+                api_kwargs[k] = sampler[k]
+        if sampler.get("stop"):
+            api_kwargs["stop"] = sampler["stop"]
+        extra_body = {k: sampler[k] for k in EXTRA if sampler.get(k) is not None}
+        if extra_body:
+            api_kwargs["extra_body"] = extra_body
+
+        try:
+            response = await asyncio.to_thread(
+                client.completions.create,
+                **api_kwargs,
+            )
+            # Usage / carbon — identical accounting to the chat path (§9.2).
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                cached_hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+                uncached_input = max(0, (usage.prompt_tokens or 0) - cached_hit)
+                provider.record_usage(
+                    uncached_input,
+                    usage.completion_tokens or 0,
+                    cached_input_tokens=cached_hit,
+                )
+            provider.total_requests += 1
+
+            raw = response.choices[0].text or ""
+            response_text = self._parse_transcript_turn(raw, bot_speaker)
+
+            # Note / reaction parity with the chat heads (cheap; a base model
+            # rarely emits these, but a persona preamble might steer one to).
+            note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
+            for match in re.finditer(note_pattern, response_text):
+                self.manager.memories[guild_id].working.add(
+                    match.group(1).strip(), match.group(2).strip()
+                )
+            response_text = re.sub(note_pattern, '', response_text)
+
+            reactions = []
+            reaction_pattern = r'\[react:\s*([^\]]+)\]'
+            for match in re.finditer(reaction_pattern, response_text):
+                reactions.append(match.group(1).strip())
+            response_text = re.sub(reaction_pattern, '', response_text).strip()
+
+            if not response_text:
+                response_text = "*(the simulator returned an empty continuation)*"
+            return response_text, reactions, ""
 
         except Exception as e:
             return f"{provider.name} Error: {e}", [], ""
@@ -4518,6 +4967,17 @@ class ClaudeBot(commands.Bot):
             needed = reading_material.estimated_tokens + 50_000
             if provider.max_context_tokens < needed:
                 reading_material = None  # silently drop for this provider
+
+        # Simulator mode (Phase 7, §9) takes priority over the sdk_type cases:
+        # a completions_mode provider talks to a BASE model by continuing a
+        # transcript, not by sending chat messages. Same return tuple, so
+        # message-splitting / posting / LaTeX downstream are unchanged. Reuses
+        # the reading-material + URL/search context assembled above (§9.2).
+        if provider.completions_mode:
+            return await self._generate_simulator_response(
+                provider, guild_id, messages, system,
+                reading_material=reading_material,
+            )
 
         # Dispatch on sdk_type (Phase 0 registry). Behavior is preserved:
         # - gemini + vertex backend → native Vertex path (Phase 2; handles
@@ -6636,13 +7096,16 @@ class ClaudeBot(commands.Bot):
             for p in self.providers:
                 status = "🟢 Enabled" if p.enabled else "⚪ Disabled"
                 cost = p.get_cost()
+                # Show the friendly display_name (e.g. "Dummy Plug") when set;
+                # p.name stays the canonical routing key + [label].
+                label = p.display_name or p.name
                 if p.total_requests > 0:
                     lines.append(
-                        f"  **{p.name}** ({p.model_id}) - {status}, "
+                        f"  **{label}** ({p.model_id}) - {status}, "
                         f"{p.total_requests} requests, ${cost:.4f}"
                     )
                 else:
-                    lines.append(f"  **{p.name}** ({p.model_id}) - {status}")
+                    lines.append(f"  **{label}** ({p.model_id}) - {status}")
 
             mode = CONFIG.default_model
             channel_id = message.channel.id
@@ -6672,7 +7135,17 @@ class ClaudeBot(commands.Bot):
                 else:
                     chosen = self.registry.by_id(pref)
                     if not chosen.enabled:
-                        await message.channel.send(f"❌ {chosen.name} is not configured (no API key).")
+                        # Keyless heads (the self-hosted Dummy Plug) aren't gated
+                        # on an API key — don't tell the operator to set one.
+                        if chosen.completions_mode or not chosen.api_key_env:
+                            await message.channel.send(
+                                f"❌ {chosen.name} isn't enabled. Set "
+                                f"`providers.{chosen.id}.enabled = true` in config.json "
+                                f"and point `providers.{chosen.id}.base_url` at a "
+                                f"/completions-capable endpoint."
+                            )
+                        else:
+                            await message.channel.send(f"❌ {chosen.name} is not configured (no API key).")
                     else:
                         self.channel_preferences[channel_id] = pref
                         await message.channel.send(f"✅ This channel will always use **{chosen.name}**.")
@@ -6719,10 +7192,11 @@ class ClaudeBot(commands.Bot):
 `!mistral` / `!mari <message>` - Force Mistral (Mari) — French/EU specialist (needs MISTRAL_API_KEY)
 `!qwen` / `!rei <message>` - Force Qwen (Rei) — cheap coder/mathematician (needs FIREWORKS_API_KEY)
 `!glm` / `!asuka <message>` - Force GLM (Asuka) — agentic open head (needs FIREWORKS_API_KEY)
+`!dummy <message>` / `!sim <message>` - Simulator mode (Phase 7): a base model *continues the channel transcript* instead of chatting. Override-only; needs a /completions endpoint configured (providers.sim in config.json). The "Dummy Plug".
 `!think <message>` - Use extended thinking (deeper reasoning, slower & costlier)
 `!think:<level> <message>` - Force a specific effort level (low|medium|high|xhigh|max)
 `!models` - Show available models and their usage stats
-`!prefer [claude|deepseek|gemini|mistral|qwen|glm|auto]` - Set model preference for this channel
+`!prefer [claude|deepseek|gemini|mistral|qwen|glm|sim|auto]` - Set model preference for this channel (sim = pin this channel to simulator mode)
 `!calibration` - Show model confidence calibration stats
 React with 👍/👎 to bot responses to improve model selection
 Stack prefixes to combine: `!think !claude <message>` forces Claude with thinking on.

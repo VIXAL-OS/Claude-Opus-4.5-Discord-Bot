@@ -4,7 +4,8 @@ Single-file (`bot.py`) multi-model Discord bot. EVA/MAGI-themed heuristic router
 **Claude (Balthasar) · DeepSeek (Melchior) · Gemini (Caspar)** plus open-weight heads
 **Qwen (Rei) · GLM (Asuka)** on Fireworks and **Mistral (Mari)** on its own EU API. Two-tier memory,
 prompt caching, bookclub mode, Mandarin (`!speak`) + French (`!french`) TTS,
-research panel (`!research`), and cost + carbon tracking.
+research panel (`!research`), simulator mode (`!dummy` — base-model transcript completion),
+and cost + carbon tracking.
 
 This file is the working status + remaining-work tracker for the "Hydra Restructure"
 spec. The full spec lives outside the repo (Sarah's Claude.ai artifact); this file is
@@ -20,8 +21,8 @@ self-contained — you don't need it to pick up the remaining work below.
 ## Editing rules (load-bearing — read before touching bot.py)
 - **Graceful degradation:** a missing API key disables ONLY that provider. The gating key follows
   the *active backend* (`provider.api_key_env`): by default `FIREWORKS_API_KEY` gates Qwen+GLM
-  together and **Mistral has its own `MISTRAL_API_KEY`** (`api.mistral.ai`) — its flagship isn't on
-  Fireworks serverless (404s "not deployed"). `self_hosted`/`vertex` backends have no key and aren't
+  together and **Mistral has its own `MISTRAL_API_KEY`** (`api.mistral.ai`) — its flagship (Large 3)
+  is on-demand-only on Fireworks, not serverless. `self_hosted`/`vertex` backends have no key and aren't
   key-gated (operator owns the local server / GCP ADC). Absent keys disable exactly those providers.
 - **Config-driven registry (Phase 0).** `ProviderRegistry.from_config()` (built once in `__init__`
   from `config.json`'s optional `providers` block) wires every provider's client + backend. The 6
@@ -41,8 +42,10 @@ self-contained — you don't need it to pick up the remaining work below.
   in the registry, not `__init__`.
 - **Model slugs drift** — verify in the live libraries. Fireworks (verified 2026-06):
   `qwen3p7-plus`, `glm-5p2`, `deepseek-v4-pro` (under `accounts/fireworks/models/`). Mistral on
-  its own API uses `mistral-large-latest`. ⚠️ Mistral Large 3 is NOT on Fireworks serverless
-  (`mistral-large-3-fp8` / `mistral-large-3` both 404 "not deployed") — hence the own-API route.
+  its own API uses `mistral-large-latest` (→ Mistral Large 3, released 2025-12, 675B/41B MoE,
+  Apache-2.0; priced $0.50/$1.50 per Mtok as of 2026-06 — a ~4× drop from Large 2). ⚠️ Large 3 is
+  on Fireworks only as **on-demand/dedicated** (`mistral-large-3-fp8`), NOT serverless — so the
+  own-API route stays correct AND is now the cheap one, not just the green one.
 - New-provider **pricing + energy constants are estimates** flagged `VERIFY` in comments —
   confirm against the Fireworks pricing page before trusting `!cost` $ figures.
 
@@ -55,9 +58,30 @@ self-contained — you don't need it to pick up the remaining work below.
 
 ---
 
-## Status — 2026-06-24
+## Status — 2026-06-27
 
 ### ✅ Built (validated offline, needs live-key smoke tests)
+- **Phase 7 — simulator mode, rung 1 (2026-06-27).** The **Dummy Plug** (`!dummy`/`!sim`): a base
+  model continues the channel as an IRC/script transcript via `/completions` instead of chatting.
+  `ModelProvider.completions_mode` + `sim_sampler` (§9.1/9.3); `_format_transcript` /
+  `_parse_transcript_turn` / `_generate_simulator_response` (one dispatch branch ahead of the
+  `sdk_type` cases); cost **and** carbon ride the same `record_usage` path as the chat heads (§9.2).
+  Config-driven (`providers.sim.{enabled,base_url,model,api_key_env,sampler,search}`); **off by
+  default** and **override-only** (excluded from the argmax; reachable via `!dummy` or `!prefer sim`
+  — the spec's "designated channel"). Behavior-preserving on the default config (46-check offline
+  harness + adversarial multi-agent review, findings folded in). **Scope (Sarah's call):** rung 1
+  only — rungs 2–3 (ambient turn-taking, webhook personas; "the loom") were deliberately NOT built,
+  and simulator mode is intentionally kept out of Phase 4 / lab planning. ⚠️ Owes one live smoke
+  test against a real base endpoint.
+  - **Query-driven search grounding (§9.2/§9.5, wired 2026-06-27).** A base model can't tool-call,
+    so `_generate_simulator_response` now detects a search intent in the latest user turn
+    (`_sim_search_query`: explicit `[search: …]` directive or a leading-question/lookup-cue
+    heuristic) and **prepends** `_search_for(provider, query).text` to the transcript preamble —
+    the sim analogue of the chat heads' tool-result append. **Off by default** (`sim_search`,
+    flip via `providers.sim.search=true`) and gated on a real backend being available
+    (`_search_backend_available`), so the default Dummy Plug never auto-searches. `SIM_PROVIDER`'s
+    `search_backend` is back to `"tavily"`. Pasted-URL grounding still folds in regardless via
+    `_augment_with_url_extracts`. Offline-validated (31-check `test_sim_search.py`).
 - **Phases 0 + 2 + 3 — registry + Gemini Vertex + DeepSeek/Mistral backend toggles (2026-06-24).**
   Config-driven `ProviderRegistry` (`sdk_type` dispatch; `config.json` `providers`+`platform`),
   behavior-preserving on the default config (24-check offline harness passes). Gemini `vertex`
@@ -102,6 +126,8 @@ self-contained — you don't need it to pick up the remaining work below.
 | 3 — Provider backend toggles: DeepSeek (`api`/`fireworks`/`self_hosted`) **+ Mistral** (`api`/`together`/`self_hosted`) | ✅ **code-complete** — toggles in registry + `local` cost mode; `api` modes live, `fireworks`/`self_hosted`/`together` ⚠️ UNVERIFIED | Med — lab route |
 | 4 — Slack platform abstraction | ❌ not built | **High — the big one** |
 | 5 — Hermes delegation bridge | ❌ not built | Optional / lab-only |
+| 6 — Ephemeral big-model co-op (405B base) | ❌ not built | Optional / lab-only |
+| 7 — Simulator mode (§9, rung 1: transcript completion) | ✅ **code-complete** — Dummy Plug (`!dummy`/`!sim`), config-driven, override-only, cost+carbon tracked (offline-validated, 46-check harness); ⚠️ owes a live smoke test against a real `/completions` endpoint. Rungs 2–3 (ambient/personas) intentionally NOT built. | Done (fun) |
 
 #### Phase 0 — Provider registry refactor — *✅ done (this session)*
 `ProviderRegistry.from_config()` (right after the provider constants in `bot.py`) builds every
@@ -148,10 +174,11 @@ have the shitposts"). To add the toggle: `providers.deepseek.backend = api | fir
   for single-GPU.
 
 **Mistral** is hardcoded to `api.mistral.ai` (set up this way because Mistral Large 3 isn't on
-Fireworks serverless — `mistral-large-3-fp8` 404s "not deployed", catalog/on-demand only). Same
+Fireworks *serverless* — `mistral-large-3-fp8` is on-demand/dedicated only). Same
 toggle shape: `providers.mistral.backend = api | together | self_hosted`.
-- `api` (current) → `api.mistral.ai`, `MISTRAL_API_KEY`, model `mistral-large-latest`. EU-resident
-  + France ~nuclear grid (`grid_gco2_per_kwh=20`). **Best default for the Discord bot — keep it.**
+- `api` (current) → `api.mistral.ai`, `MISTRAL_API_KEY`, model `mistral-large-latest` (→ Large 3,
+  $0.50/$1.50 per Mtok as of 2026-06). EU-resident + France ~nuclear grid (`grid_gco2_per_kwh=20`).
+  **Best default for the Discord bot — keep it** (now the cheap route too, ~4× under Large 2).
 - `together` → Together AI serverless (US) *does* host Mistral Large 3 — use for US residency / one
   fewer bill; set `grid_gco2_per_kwh≈400` + Together's rates. (Fireworks only has it on-demand —
   i.e. rent a dedicated GPU — not worth it for a chat bot.)
@@ -181,14 +208,45 @@ hardened endpoints (Fireworks US/ZDR, self-hosted DeepSeek, Vertex); gate genuin
 prompts to self-hosted only. Optional cron delivery into the lab channel. Hydra must still run
 fully with Hermes absent.
 
+#### Phase 7 — Simulator mode (§9, rung 1) — *✅ code-complete, ⚠️ unverified (2026-06-27)*
+A second **generation mode** behind the same dispatch (NOT a second bot): `completions_mode=True`
+routes a provider to `_generate_simulator_response()` (transcript completion) instead of the chat
+path. The whole feature is three methods (§9.3): `_format_transcript` renders channel history as a
+`<speaker> body` IRC log (user turns carry `Name:`, bot turns `[Model]`; a leading `[replying to …]`
+block is dropped at the block level so embedded `]`/newlines can't corrupt the speaker line) + a
+dangling `<Dummy>` continuation cue; `client.completions.create` continues it; `_parse_transcript_turn`
+cuts back to one line (server `stop` + a client-side `<name>`-only cut — deliberately NOT `[name]`,
+which would eat code/citation lines). `SIM_PROVIDER` ("Dummy"/"Dummy Plug", `id="sim"`) ships
+`enabled=False` + `api_key_env=""` (self-hosted, keyless), so the registry leaves it OFF unless
+config opts in — the one place `config_enabled` now defaults to the constant's `enabled` instead of
+`True` (a no-op for the 6 always-on heads). **Override-only** is enforced in `_select_model`
+(`auto_pool` drops `completions_mode`), with one deliberate exception documented in code: if the
+base model is the *only* enabled provider (a sim-only box), plain messages route to it via the
+`len(enabled)==1` shortcut. Sampler knobs (§9.3) split standard params (on the call) vs
+`top_k`/`min_p`/`top_a`/`repetition_penalty` (in `extra_body`); unknown `providers.sim.sampler` keys
+warn at startup. ⚠️ **OWES A LIVE SMOKE TEST** — stand up any `/completions` base model (a small
+GGUF/Ministral base on vLLM or llama.cpp suffices — no 405B), set
+`providers.sim = {enabled:true, base_url, model}`, then `!dummy <prompt>`; confirm the `[Dummy]`
+turn lands in `!cost` with tokens + 🌱. **Query-driven search grounding** (§9.2/§9.5) is now wired
+behind `providers.sim.search=true` (off by default): `_sim_search_query` detects a `[search: …]`
+directive or a leading-question/lookup cue and `_generate_simulator_response` prepends the
+`_search_for` snippets to the preamble (gated on `_search_backend_available` so no sentinel leaks).
+Rungs 2–3 (ambient turn-taking, webhook personas) and any Phase 4 / lab-adjacent simulator work are
+intentionally out of scope.
+
 ### Cross-cutting follow-ups
-- Verify **pricing**: Fireworks for `qwen3p7-plus` / `glm-5p2`, and `console.mistral.ai` for
-  `mistral-large-latest` (current values are estimates). The **energy** constants
-  (`est_wh_per_1k_tokens`, `train_tco2e`) are order-of-magnitude.
+- Verify **pricing**: Fireworks for `qwen3p7-plus` / `glm-5p2` (confirmed live 2026-06), and
+  `console.mistral.ai` for `mistral-large-latest` (updated 2026-06 to Large 3 = $0.50/$1.50; reconfirm
+  against the console). The **energy** constants (`est_wh_per_1k_tokens`, `train_tco2e`) are
+  order-of-magnitude (Mistral `train_tco2e` is still the Large-2 LCA — Large-3's isn't published).
 - Live smoke tests still owed: `!mari`/`!rei`/`!asuka` round-trips, `!french bonjour` (Azure
   fr-FR synth) and `!french how do you say …` (Mistral G2P), inline `[[french:..]]`. **Plus the
   new backends (Phase 2/3):** Gemini `vertex` (GCP ADC + `google-cloud-aiplatform`); DeepSeek
   `fireworks` (`!deepseek`) + `self_hosted` (local vLLM → shows `local` in `!cost`); Mistral
   `together` (Together key) + `self_hosted`. Verify the Together Mistral-Large-3 slug + Fireworks
   DeepSeek/Together pricing (flagged `VERIFY`).
+- **Phase 7 simulator:** `!dummy <prompt>` against a real `/completions` base endpoint (transcript
+  continuation, tokens + carbon in `!cost`); `SIM_PROVIDER` pricing/energy are `VERIFY` placeholders.
+  Also smoke-test search grounding: `providers.sim.search=true` + a Tavily key, then a `!dummy`
+  turn whose latest line is a question / `[search: …]` — confirm the snippets land in the preamble.
 - Operator: keep Fireworks prepaid balance topped up (auto-reload) and Gemini billing current.
