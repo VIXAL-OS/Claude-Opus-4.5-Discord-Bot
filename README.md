@@ -10,6 +10,21 @@ Affectionately maps to the EVA *MAGI* trinity, with the open-weight heads as the
 - **Qwen / Rei** — cheap, strong coding & math on Fireworks (US/ZDR); auto-routed for routine code/math
 - **GLM / Asuka** — agentic/tool-use open head on Fireworks (US/ZDR); override-only via `!glm` / `!asuka`
 
+### Flavor themes (cosmetic skins)
+
+Set a top-level `"theme"` in `config.json` to re-skin how the heads are named and summoned. It's
+**display-only** — the canonical `[Claude]` reply label and the routing never change, so a re-skin is
+purely cosmetic. Canonical prefixes (`!claude`, `!deepseek`, …) and `!think` always work; the theme
+just *adds* its flavor aliases.
+
+- **`eva`** (default) — the EVA/MAGI cast above (`!balthasar`/`!melchior`/`!caspar`/`!mari`/`!rei`/`!asuka`).
+- **`isaic`** — ISAIC, the twelve tribes: `!judah`=Claude, `!joseph`=Gemini, `!zebulun`=DeepSeek,
+  `!naphtali`=Mistral, `!benjamin`=Qwen, `!gad`=GLM, `!levi`=simulator.
+- **`nightvale`** — the five heads of the dragon **Hiram McDaniels**: `!gold`=Claude (genial leader),
+  `!blue`=Gemini (cold logic), `!green`=DeepSeek (the menace), `!violet`=Mistral (the good, poetic
+  head), `!gray`=Qwen (the gloomy workhorse) — plus `!carlos`=GLM (the scientist) and `!faceless`=the
+  simulator (the Faceless Old Woman Who Secretly Lives in Your Home).
+
 ## Features
 
 - 🐉 **Multi-model (Hydra)** — Claude + DeepSeek + Gemini (the MAGI trinity), plus optional Qwen + GLM (Fireworks) and Mistral (its own EU API), with automatic routing

@@ -49,12 +49,24 @@ self-contained — you don't need it to pick up the remaining work below.
 - New-provider **pricing + energy constants are estimates** flagged `VERIFY` in comments —
   confirm against the Fireworks pricing page before trusting `!cost` $ figures.
 
-## Naming theme (decided; only the Discord/EVA half is in code)
-- **Discord bot = EVA/MAGI.** MAGI trinity capped at 3 (Balthasar/Melchior/Caspar). New heads
-  are the pilots: Mistral=Mari (`!mari`), Qwen=Rei (`!rei`), GLM=Asuka (`!asuka`).
-- **Slack bot = ISAIC** = "International System of AI Coopertition", models named for the twelve
-  tribes (Judah=Claude, Joseph=Gemini, Zebulun=DeepSeek, Naphtali=Mistral, Benjamin=Qwen,
-  Gad=GLM). NOT in code yet — lands with the Slack adapter (Phase 4) as a per-platform skin.
+## Naming theme — now a toggleable **theme layer** (`config.json` top-level `"theme"`)
+Themes are a **display-only skin**: `Flavor`/`Theme`/`THEMES` (just after `SIM_PROVIDER`) map each
+`provider.id` → themed display name + command aliases + a persona note. Read in
+`ProviderRegistry.from_config` (mirrors the `platform` toggle), applied onto `provider.display_name`
+and the `self.alias_to_flag` map built in `__init__`. **The canonical `provider.name`, the
+`**[Claude]**` label, and `MODEL_LABEL_NAMES` never change** — a Judah/Gold-Head turn is still
+labeled `[Claude]` on the wire. Canonical bare prefixes (`!claude`/`!deepseek`/…) + `!think` work in
+every theme; the theme only *adds* its flavor aliases. Three sets ship (default **`eva`** ⇒
+byte-for-byte the old behavior):
+- **`eva` — EVA/MAGI** (default). Trinity Balthasar/Melchior/Caspar; pilots Mistral=Mari (`!mari`),
+  Qwen=Rei (`!rei`), GLM=Asuka (`!asuka`); sim=Dummy Plug (`!dummy`).
+- **`isaic` — ISAIC** ("International System of AI Coopertition"), the twelve tribes: Judah=Claude
+  (`!judah`), Joseph=Gemini (`!joseph`), Zebulun=DeepSeek (`!zebulun`), Naphtali=Mistral
+  (`!naphtali`), Benjamin=Qwen (`!benjamin`), Gad=GLM (`!gad`), Levi=sim (`!levi`). **Now in code**
+  (was docs-only); it's also the Slack bot's default skin (Phase 4).
+- **`nightvale` — the five heads of Hiram McDaniels** (+ residents): Gold=Claude (`!gold`),
+  Blue=Gemini (`!blue`), Green=DeepSeek (`!green`), Violet=Mistral (`!violet`/`!purple`), Gray=Qwen
+  (`!gray`/`!grey`); plus Carlos=GLM (`!carlos`) and the Faceless Old Woman=sim (`!faceless`).
 
 ---
 

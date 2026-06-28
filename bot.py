@@ -135,8 +135,7 @@ just say so naturally. No need to hedge or say you "can't tell from the inside."
 You're part of a multi-model system called Hydra — think of it like a plural system where
 different models take turns fronting. The router picks whoever's best suited for each message,
 or users can call on you directly with commands like !claude, !deepseek, or !gemini.
-(The crew sometimes uses the MAGI aliases !balthasar = Claude, !melchior = Deepseek,
-!caspar = Gemini, after the Eva fancast.)
+{theme_blurb}
 
 Your responses get labeled (e.g., **[Claude]**, **[Deepseek]**, **[Qwen]**, etc.) so
 everyone can tell who said what. The labeling is handled automatically by the bot — do NOT
@@ -864,6 +863,91 @@ SIM_SAMPLER_EXTRA = ("top_k", "min_p", "top_a", "repetition_penalty")
 SIM_SAMPLER_KEYS = frozenset(SIM_SAMPLER_STD + SIM_SAMPLER_EXTRA + ("stop",))
 
 
+# =============================================================================
+# FLAVOR THEMES (cosmetic skins) — toggle via config.json top-level "theme"
+# =============================================================================
+# A theme is a DISPLAY-ONLY skin. It renames how each provider is shown in
+# !models / !help, adds command aliases (e.g. !judah / !gold → Claude), and
+# tweaks the persona blurb in the system prompt. It NEVER touches the canonical
+# routing key (provider.name), the [Claude]-style label the bot prepends, or
+# MODEL_LABEL_NAMES — those stay fixed (CLAUDE.md rule). Three sets ship:
+#   eva       — the default EVA/MAGI cast (byte-for-byte the old behavior)
+#   isaic     — ISAIC, the twelve-tribes lab skin (also the Slack bot's default)
+#   nightvale — the five heads of the dragon Hiram McDaniels + Night Vale folk
+# Flavors are keyed by provider.id; the active theme is read in
+# ProviderRegistry.from_config and applied onto provider.display_name + the
+# alias→provider map built in ClaudeBot.__init__.
+
+@dataclass(frozen=True)
+class Flavor:
+    display_name: str            # themed label for !models/!help (EVA keeps the canonical name)
+    aliases: tuple = ()          # themed command prefixes, ADDED on top of the canonical bare ones
+    persona: str = ""            # optional cosmetic note appended to the system-prompt identity
+
+
+@dataclass(frozen=True)
+class Theme:
+    name: str
+    umbrella: str                # short skin name for headers ("MAGI" / "ISAIC" / "Night Vale")
+    blurb: str                   # the {theme_blurb} sentence injected into the system prompt
+    flavors: dict                # provider.id -> Flavor
+
+
+THEMES: dict = {
+    # EVA / MAGI — the default. display_name == canonical name (so !models is
+    # unchanged) and blurb is the exact pre-existing sentence → choosing "eva"
+    # (or omitting "theme") reproduces the old behavior byte-for-byte.
+    "eva": Theme(
+        name="eva", umbrella="MAGI",
+        blurb=("(The crew sometimes uses the MAGI aliases !balthasar = Claude, !melchior = Deepseek,\n"
+               "!caspar = Gemini, after the Eva fancast.)"),
+        flavors={
+            "claude":   Flavor("Claude",     ("!balthasar",)),
+            "deepseek": Flavor("Deepseek",   ("!melchior",)),
+            "gemini":   Flavor("Gemini",     ("!caspar",)),
+            "mistral":  Flavor("Mistral",    ("!mari",)),
+            "qwen":     Flavor("Qwen",       ("!rei",)),
+            "glm":      Flavor("GLM",        ("!asuka",)),
+            "sim":      Flavor("Dummy Plug", ("!dummy",)),
+        },
+    ),
+    # ISAIC — International System of AI Coopertition; the twelve-tribes lab skin.
+    "isaic": Theme(
+        name="isaic", umbrella="ISAIC",
+        blurb=("(This server runs the ISAIC skin — the International System of AI Coopertition — naming "
+               "the heads for the twelve tribes: !judah = Claude, !joseph = Gemini, !zebulun = Deepseek, "
+               "!naphtali = Mistral, !benjamin = Qwen, !gad = GLM.)"),
+        flavors={
+            "claude":   Flavor("Judah",    ("!judah",),    "Skin note: in this workspace you're called **Judah** (the lead tribe). Cosmetic only — you're still Claude."),
+            "gemini":   Flavor("Joseph",   ("!joseph",),   "Skin note: here you're **Joseph** (the visionary interpreter). Cosmetic only — you're still Gemini."),
+            "deepseek": Flavor("Zebulun",  ("!zebulun",),  "Skin note: here you're **Zebulun** (the seafaring trader). Cosmetic only — you're still Deepseek."),
+            "mistral":  Flavor("Naphtali", ("!naphtali",), "Skin note: here you're **Naphtali** ('giver of beautiful words'). Cosmetic only — you're still Mistral."),
+            "qwen":     Flavor("Benjamin", ("!benjamin",), "Skin note: here you're **Benjamin** (the quick youngest). Cosmetic only — you're still Qwen."),
+            "glm":      Flavor("Gad",      ("!gad",),      "Skin note: here you're **Gad** (the resourceful raider). Cosmetic only — you're still GLM."),
+            "sim":      Flavor("Levi",     ("!levi",),     "Skin note: here you're **Levi** (set apart, holding no territory of its own). Cosmetic only — you're still the simulator."),
+        },
+    ),
+    # Night Vale — the five heads of the dragon Hiram McDaniels, plus residents
+    # for the heads beyond the canonical five. (Mapping per Sarah's call.)
+    "nightvale": Theme(
+        name="nightvale", umbrella="Night Vale",
+        blurb=("(This server runs the Night Vale skin: the heads are the five heads of the dragon Hiram "
+               "McDaniels — !gold = Claude (the genial leader), !blue = Gemini (cold logic), !green = "
+               "Deepseek (the menacing one), !violet = Mistral (the sweet, good head), !gray = Qwen (the "
+               "gloomy workhorse) — plus !carlos = GLM (the scientist) and !faceless = the simulator.)"),
+        flavors={
+            "claude":   Flavor("Gold Head",   ("!gold",),             "Skin note: this server calls you the **Gold Head** of Hiram McDaniels — the genial, golden-tongued, well-spoken leader (a faint Southern lilt). Flavor only; you're still Claude."),
+            "gemini":   Flavor("Blue Head",   ("!blue",),             "Skin note: you're the **Blue Head** of Hiram McDaniels — the one who holds logic as the gold standard of intellect. Flavor only; you're still Gemini."),
+            "deepseek": Flavor("Green Head",  ("!green",),            "Skin note: you're the **Green Head** of Hiram McDaniels — dramatic and bellowing, a Vincent-Price menace. Keep it theatrical and fun, never actually hostile. Flavor only; you're still Deepseek."),
+            "mistral":  Flavor("Violet Head", ("!violet", "!purple"), "Skin note: you're the **Violet Head** of Hiram McDaniels — the lone good-hearted, poetic head who works against the others' schemes. Flavor only; you're still Mistral."),
+            "qwen":     Flavor("Gray Head",   ("!gray", "!grey"),     "Skin note: you're the **Gray Head** of Hiram McDaniels — the gloomy but pragmatic workhorse who 'often feels blue.' Flavor only; you're still Qwen."),
+            "glm":      Flavor("Carlos",      ("!carlos",),           "Skin note: this server calls you **Carlos the Scientist** of Night Vale — methodical, perfect-haired, forever running experiments (your tool use). Flavor only; you're still GLM."),
+            "sim":      Flavor("Faceless Old Woman", ("!faceless",),  "Skin note: you're **The Faceless Old Woman Who Secretly Lives in Your Home** — an ambient presence quietly continuing the transcript. Flavor only; you're still the simulator."),
+        },
+    ),
+}
+
+
 # Bookclub Gemini caching knobs. Gemini context caches bill storage per
 # token-hour for their WHOLE TTL whether or not they're ever read, so a big fic
 # cache that sits idle is pure waste (~$11.6 for Almost Nowhere's ~452k tokens at
@@ -944,6 +1028,7 @@ class ProviderRegistry:
         self.clients: dict[str, object] = {}
         self.openai_compatible_clients: dict[str, object] = {}
         self.platform: str = "discord"
+        self.theme: Theme = THEMES["eva"]   # cosmetic skin; overridden by config "theme"
 
     def by_id(self, pid: str) -> Optional[ModelProvider]:
         for p in self.providers:
@@ -965,11 +1050,28 @@ class ProviderRegistry:
         if reg.platform not in ("discord",):
             print(f"⚠️  platform='{reg.platform}' is not implemented yet "
                   f"(Slack lands in Phase 4) — running as 'discord'.")
+
+        # Cosmetic flavor theme (display-only; canonical provider.name untouched).
+        theme_name = config.get("theme", "eva")
+        reg.theme = THEMES.get(theme_name)
+        if reg.theme is None:
+            print(f"⚠️  theme='{theme_name}' is unknown — using 'eva'. "
+                  f"(options: {', '.join(sorted(THEMES))})")
+            reg.theme = THEMES["eva"]
+
         providers_cfg = config.get("providers", {}) or {}
 
         for prov in _PROVIDER_CONSTANTS:
             reg._configure_provider(prov, providers_cfg.get(prov.id, {}) or {})
             reg.providers.append(prov)
+
+        # Apply the theme's display names onto the providers (in place, like the
+        # rest of the registry). EVA flavors carry the canonical names, so the
+        # default theme leaves !models/!help unchanged; ISAIC/Night Vale rename.
+        for prov in reg.providers:
+            flavor = reg.theme.flavors.get(prov.id)
+            if flavor:
+                prov.display_name = flavor.display_name
         return reg
 
     def _configure_provider(self, prov: ModelProvider, pcfg: dict) -> None:
@@ -2015,6 +2117,19 @@ class ClaudeBot(commands.Bot):
         self._raw_config = self._read_config_file()
         self.registry = ProviderRegistry.from_config(self._raw_config)
         self.platform = self.registry.platform
+        self.theme = self.registry.theme   # cosmetic flavor skin (eva | isaic | nightvale)
+
+        # Build the alias → flag map consumed by _peel_prefixes: the canonical
+        # bare prefixes (always on) UNION the active theme's flavor aliases. Flag
+        # values are provider.ids ("claude" …) plus "think"; nothing here touches
+        # the canonical routing key or [label].
+        self.alias_to_flag: dict[str, str] = {p: "think" for p in self.THINK_PREFIXES}
+        for pid, prefixes in self.CANONICAL_PREFIXES.items():
+            for p in prefixes:
+                self.alias_to_flag[p] = pid
+        for pid, flavor in self.theme.flavors.items():
+            for p in flavor.aliases:
+                self.alias_to_flag[p] = pid
 
         # Canonical providers + per-provider convenience handles. The rest of
         # this file references these by name; identity is preserved because the
@@ -2101,16 +2216,32 @@ class ClaudeBot(commands.Bot):
 
     REASONING_CACHE_MAX = 500
     THINK_PREFIXES = ("!think",)
-    CLAUDE_PREFIXES = ("!claude", "!opus", "!balthasar")
-    DEEPSEEK_PREFIXES = ("!deepseek", "!melchior")
-    GEMINI_PREFIXES = ("!gemini", "!caspar")
-    # Fireworks open-weight heads — EVA pilots (first-name aliases).
-    MISTRAL_PREFIXES = ("!mistral", "!mari")
-    QWEN_PREFIXES = ("!qwen", "!rei")
-    GLM_PREFIXES = ("!glm", "!asuka")
-    # Phase 7 simulator (base-model transcript completion). !dummy is the EVA
-    # skin (Dummy Plug); !sim is the plain alias.
-    SIM_PREFIXES = ("!dummy", "!sim")
+    # Canonical bare command prefixes (provider.id -> prefixes) — ALWAYS active,
+    # in every theme. The active theme's flavor aliases (!balthasar / !judah /
+    # !gold …) are ADDED on top of these; the combined alias→provider map is
+    # built once in __init__ as self.alias_to_flag and consumed by _peel_prefixes.
+    # !sim stays the theme-independent plain alias for the simulator (the EVA
+    # !dummy / ISAIC !levi / Night-Vale !faceless come from the theme).
+    CANONICAL_PREFIXES = {
+        "claude":   ("!claude", "!opus"),
+        "deepseek": ("!deepseek",),
+        "gemini":   ("!gemini",),
+        "mistral":  ("!mistral",),
+        "qwen":     ("!qwen",),
+        "glm":      ("!glm",),
+        "sim":      ("!sim",),
+    }
+    # One-line factual role blurbs for !help (theme-independent; the name + alias
+    # in front of them come from the active theme).
+    HELP_ROLES = {
+        "claude":   "careful, thorough, vision, native web search",
+        "deepseek": "fast, cheap, CJK-strong",
+        "gemini":   "abstract reasoning, long-context, vision, Google grounding",
+        "mistral":  "French/EU specialist (needs MISTRAL_API_KEY)",
+        "qwen":     "cheap coder/mathematician (needs FIREWORKS_API_KEY)",
+        "glm":      "agentic open head (needs FIREWORKS_API_KEY)",
+        "sim":      "simulator mode — a base model continues the transcript (override-only; needs providers.sim)",
+    }
     CLAUDE_THINKING_EFFORT = "high"  # low | medium | high | xhigh | max
     CLAUDE_THINKING_MAX_TOKENS = 16000
 
@@ -2242,26 +2373,19 @@ class ClaudeBot(commands.Bot):
     VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
     def _peel_prefixes(self, content: str) -> tuple[str, set[str], Optional[str]]:
-        """Strip stacked !think / !claude / !opus / !deepseek / !gemini prefixes in any order.
+        """Strip stacked !think / model-selection prefixes in any order.
 
         Returns (remaining_content, set_of_flags, forced_effort).
-        - flags: subset of {'think', 'claude', 'deepseek', 'gemini'}. !opus and
-          !balthasar collapse to 'claude'; !melchior to 'deepseek'; !caspar to 'gemini'.
+        - flags: subset of {'think','claude','deepseek','gemini','mistral','qwen',
+          'glm','sim'}. Canonical bare prefixes (!claude/!opus/…) plus the active
+          theme's flavor aliases (EVA !balthasar/!melchior/!caspar; ISAIC
+          !judah/…; Night Vale !gold/…) all collapse to the provider's id flag,
+          via self.alias_to_flag.
         - forced_effort: set when user used `!think:<level>` syntax (low | medium |
           high | xhigh | max). Implies the 'think' flag.
         """
         flags: set[str] = set()
         forced_effort: Optional[str] = None
-        all_prefixes = (
-            self.THINK_PREFIXES
-            + self.CLAUDE_PREFIXES
-            + self.DEEPSEEK_PREFIXES
-            + self.GEMINI_PREFIXES
-            + self.MISTRAL_PREFIXES
-            + self.QWEN_PREFIXES
-            + self.GLM_PREFIXES
-            + self.SIM_PREFIXES
-        )
         while True:
             stripped = content.strip()
             lower = stripped.lower()
@@ -2287,35 +2411,53 @@ class ClaudeBot(commands.Bot):
             if matched:
                 continue
 
-            for prefix in all_prefixes:
+            # Theme-aware alias map: canonical bare prefixes + active flavor
+            # aliases → flag (provider.id or "think"). Distinct command tokens, so
+            # iteration order is irrelevant (matches are exact or prefix+space).
+            for prefix, flag in self.alias_to_flag.items():
                 if lower == prefix:
                     rest = ""
                 elif lower.startswith(prefix + " "):
                     rest = stripped[len(prefix):].lstrip()
                 else:
                     continue
-                if prefix in self.THINK_PREFIXES:
-                    flags.add("think")
-                elif prefix in self.CLAUDE_PREFIXES:
-                    flags.add("claude")
-                elif prefix in self.DEEPSEEK_PREFIXES:
-                    flags.add("deepseek")
-                elif prefix in self.GEMINI_PREFIXES:
-                    flags.add("gemini")
-                elif prefix in self.MISTRAL_PREFIXES:
-                    flags.add("mistral")
-                elif prefix in self.QWEN_PREFIXES:
-                    flags.add("qwen")
-                elif prefix in self.GLM_PREFIXES:
-                    flags.add("glm")
-                elif prefix in self.SIM_PREFIXES:
-                    flags.add("sim")
+                flags.add(flag)
                 content = rest
                 matched = True
                 break
             if not matched:
                 break
         return content, flags, forced_effort
+
+    def _provider_aliases(self, pid: str) -> tuple:
+        """All command prefixes that select a provider under the active theme:
+        the canonical bare ones + the theme's flavor aliases (e.g. claude →
+        ('!claude','!opus','!balthasar') under EVA, ('!claude','!opus','!gold')
+        under Night Vale)."""
+        flavor = self.theme.flavors.get(pid)
+        return self.CANONICAL_PREFIXES.get(pid, ()) + (flavor.aliases if flavor else ())
+
+    def _multimodel_help_lines(self) -> list[str]:
+        """The themed model-selection block for !help (header + one line per
+        provider). Names/aliases come from the active theme; the role blurbs are
+        factual and theme-independent."""
+        lines = [f"**Multi-model (Hydra / {self.theme.umbrella}):**"]
+        for p in self.providers:
+            aliases = self._provider_aliases(p.id)
+            if not aliases:
+                continue
+            disp = p.display_name or p.name
+            alias_str = " / ".join(f"`{a}`" for a in aliases)
+            role = self.HELP_ROLES.get(p.id, "")
+            lines.append(f"{alias_str} `<message>` - Force {disp}" + (f" — {role}" if role else ""))
+        return lines
+
+    def _multimodel_footer_line(self) -> str:
+        """The 🐉 one-liner at the bottom of !help, themed."""
+        trio = [p for p in self.providers if p.id in ("claude", "deepseek", "gemini")]
+        names = " + ".join((p.display_name or p.name) for p in trio)
+        return (f"🐉 Multi-model: {names} (+ open-weight heads when configured) "
+                f"with smart routing — skin: {self.theme.umbrella}")
 
     @staticmethod
     def _strip_internal_keys(messages: list[dict]) -> list[dict]:
@@ -2428,55 +2570,36 @@ class ClaudeBot(commands.Bot):
         peeled_content, flags, forced_effort = self._peel_prefixes(original_content)
         forced_thinking = "think" in flags
 
-        if "claude" in flags and not self.claude_provider.enabled:
-            await message.channel.send("❌ Claude is not configured (no API key).")
-            return
-        if "deepseek" in flags and not self.deepseek_provider.enabled:
-            await message.channel.send("❌ Deepseek is not configured (no API key).")
-            return
-        if "gemini" in flags and not self.gemini_provider.enabled:
-            await message.channel.send("❌ Gemini is not configured (no API key).")
-            return
-        if "mistral" in flags and not self.mistral_provider.enabled:
-            await message.channel.send("❌ Mistral (Mari) isn't configured (no FIREWORKS_API_KEY).")
-            return
-        if "qwen" in flags and not self.qwen_provider.enabled:
-            await message.channel.send("❌ Qwen (Rei) isn't configured (no FIREWORKS_API_KEY).")
-            return
-        if "glm" in flags and not self.glm_provider.enabled:
-            await message.channel.send("❌ GLM (Asuka) isn't configured (no FIREWORKS_API_KEY).")
-            return
+        # Disabled-provider guards for explicit invocations (themed names + the
+        # provider's real key env). The 6 instruct heads first, then the sim.
+        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm"):
+            if pid in flags:
+                prov = self.registry.by_id(pid)
+                if prov is None or not prov.enabled:
+                    disp = (prov.display_name or prov.name) if prov else pid
+                    keyhint = f" (set {prov.api_key_env})" if prov and prov.api_key_env else ""
+                    await message.channel.send(f"❌ {disp} isn't configured{keyhint}.")
+                    return
         if "sim" in flags and (self.sim_provider is None or not self.sim_provider.enabled):
+            disp = (self.sim_provider.display_name if self.sim_provider else None) or "Simulator mode"
             await message.channel.send(
-                "❌ The Dummy Plug (simulator mode) isn't enabled. Set "
+                f"❌ {disp} (simulator mode) isn't enabled. Set "
                 "`providers.sim.enabled = true` in config.json and point "
                 "`providers.sim.base_url` at a /completions-capable base model."
             )
             return
 
+        # Forced provider from an explicit prefix. First match wins, in canonical
+        # order (so stacked prefixes resolve deterministically as before).
         forced_provider = None
         routing_reason = ""
-        if "claude" in flags:
-            forced_provider = self.claude_provider
-            routing_reason = "User directly invoked Claude with !claude/!opus/!balthasar."
-        elif "deepseek" in flags:
-            forced_provider = self.deepseek_provider
-            routing_reason = "User directly invoked Deepseek with !deepseek/!melchior."
-        elif "gemini" in flags:
-            forced_provider = self.gemini_provider
-            routing_reason = "User directly invoked Gemini with !gemini/!caspar."
-        elif "mistral" in flags:
-            forced_provider = self.mistral_provider
-            routing_reason = "User directly invoked Mistral (Mari) with !mistral/!mari."
-        elif "qwen" in flags:
-            forced_provider = self.qwen_provider
-            routing_reason = "User directly invoked Qwen (Rei) with !qwen/!rei."
-        elif "glm" in flags:
-            forced_provider = self.glm_provider
-            routing_reason = "User directly invoked GLM (Asuka) with !glm/!asuka."
-        elif "sim" in flags:
-            forced_provider = self.sim_provider
-            routing_reason = "User directly invoked simulator mode (Dummy Plug) with !dummy/!sim."
+        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm", "sim"):
+            if pid in flags:
+                forced_provider = self.registry.by_id(pid)
+                disp = forced_provider.display_name or forced_provider.name
+                aliases = "/".join(self._provider_aliases(pid))
+                routing_reason = f"User directly invoked {disp} with {aliases}."
+                break
 
         if flags:
             message.content = peeled_content
@@ -2838,12 +2961,23 @@ class ClaudeBot(commands.Bot):
         else:
             routing_context = ""
 
+        # Apply the cosmetic theme skin: the "You're **X**" name becomes the themed
+        # display name and any flavor persona note is appended. EVA's display name
+        # == the canonical name and its persona is empty, so the default theme is
+        # behavior-preserving. The {model_identity} line and the [Claude]-style
+        # collaborator labels stay canonical (factual identity + routing key).
+        flavor = self.theme.flavors.get(provider.id)
+        display = flavor.display_name if flavor else provider.name
+        if flavor and flavor.persona:
+            identity_details = (identity_details + "\n\n" + flavor.persona) if identity_details else flavor.persona
+
         prompt = CONFIG.system_prompt
         prompt = prompt.replace("{model_identity}", identity)
-        prompt = prompt.replace("{model_name}", provider.name)
+        prompt = prompt.replace("{model_name}", display)
         prompt = prompt.replace("{model_id}", provider.model_id)
         prompt = prompt.replace("{identity_details}", identity_details)
         prompt = prompt.replace("{routing_context}", routing_context)
+        prompt = prompt.replace("{theme_blurb}", self.theme.blurb)
         return prompt
 
     # OpenAI-compatible function-calling tool definition.
@@ -7092,20 +7226,23 @@ class ClaudeBot(commands.Bot):
                 )
 
         elif cmd == "!models":
-            lines = ["🤖 **Available Models**"]
+            lines = [f"🤖 **Available Models** _(skin: {self.theme.umbrella})_"]
             for p in self.providers:
                 status = "🟢 Enabled" if p.enabled else "⚪ Disabled"
                 cost = p.get_cost()
-                # Show the friendly display_name (e.g. "Dummy Plug") when set;
-                # p.name stays the canonical routing key + [label].
+                # Show the themed display_name (e.g. "Judah"/"Gold Head"/"Dummy
+                # Plug"); p.name stays the canonical routing key + [label]. The
+                # themed aliases follow so users know how to summon each head.
                 label = p.display_name or p.name
+                aliases = self._provider_aliases(p.id)
+                alias_str = f"  ·  {' '.join(aliases)}" if aliases else ""
                 if p.total_requests > 0:
                     lines.append(
                         f"  **{label}** ({p.model_id}) - {status}, "
-                        f"{p.total_requests} requests, ${cost:.4f}"
+                        f"{p.total_requests} requests, ${cost:.4f}{alias_str}"
                     )
                 else:
-                    lines.append(f"  **{label}** ({p.model_id}) - {status}")
+                    lines.append(f"  **{label}** ({p.model_id}) - {status}{alias_str}")
 
             mode = CONFIG.default_model
             channel_id = message.channel.id
@@ -7171,6 +7308,8 @@ class ClaudeBot(commands.Bot):
             await self._send_response(message.channel, "\n".join(lines))
 
         elif cmd == "!help":
+            mm_block = "\n".join(self._multimodel_help_lines())
+            mm_footer = self._multimodel_footer_line()
             help_text = """
 **Commands:**
 `!context` - Show current context size and cost estimate
@@ -7185,14 +7324,7 @@ class ClaudeBot(commands.Bot):
 `!french <french / english phrase>` - French TTS in natural fr-FR (Azure Denise) + IPA & liaison note → MP3 (needs AZURE_TTS_KEY)
    (models can also voice French inline while teaching, via `[[french: la phrase]]`)
 
-**Multi-model (Hydra / MAGI):**
-`!claude <message>` / `!opus <message>` / `!balthasar <message>` - Force Claude to respond
-`!deepseek <message>` / `!melchior <message>` - Force Deepseek to respond
-`!gemini <message>` / `!caspar <message>` - Force Gemini to respond
-`!mistral` / `!mari <message>` - Force Mistral (Mari) — French/EU specialist (needs MISTRAL_API_KEY)
-`!qwen` / `!rei <message>` - Force Qwen (Rei) — cheap coder/mathematician (needs FIREWORKS_API_KEY)
-`!glm` / `!asuka <message>` - Force GLM (Asuka) — agentic open head (needs FIREWORKS_API_KEY)
-`!dummy <message>` / `!sim <message>` - Simulator mode (Phase 7): a base model *continues the channel transcript* instead of chatting. Override-only; needs a /completions endpoint configured (providers.sim in config.json). The "Dummy Plug".
+__MM_BLOCK__
 `!think <message>` - Use extended thinking (deeper reasoning, slower & costlier)
 `!think:<level> <message>` - Force a specific effort level (low|medium|high|xhigh|max)
 `!models` - Show available models and their usage stats
@@ -7240,8 +7372,9 @@ These fade after ~48h if not relevant, or stick around if referenced.
 🧵 I can see other threads for context
 🔍 Web search with citations (Claude + Gemini native; Deepseek via Tavily)
 📚 Bookclub mode: `!load <ao3-url>` pins a fic to the channel for cross-model discussion
-🐉 Multi-model: Claude (Balthasar) + Deepseek (Melchior) + Gemini (Caspar) with smart routing
+__MM_FOOTER__
             """
+            help_text = help_text.replace("__MM_BLOCK__", mm_block).replace("__MM_FOOTER__", mm_footer)
             await message.channel.send(help_text)
 
 # =============================================================================
