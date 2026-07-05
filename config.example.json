@@ -10,6 +10,19 @@
 
   "_comment": "Get channel IDs via Discord Developer Mode -> right-click a channel. platform is 'discord' (Slack lands in Phase 4). default_model: 'auto' or any provider id (claude/deepseek/gemini/mistral/qwen/glm). channel_preferences maps channel-ID strings to a provider id.",
 
+  "_servers_comment": "OPTIONAL per-server system-prompt overrides, keyed by GUILD id string (right-click the server icon -> Copy Server ID; the bot also prints each guild's id at startup). Per guild: 'context' replaces the 'context about this server' block, 'pluralkit' (true|false — a real JSON boolean, not \"false\") toggles the PluralKit/plurality section. 'server_default' applies to any guild NOT listed; omit both -> every guild uses the built-in GENERIC default (knows nothing about who's there). You can also edit these live in Discord with `!server_context set <text>` / `!server_context pluralkit on|off` (admin-only; writes back to config.json). Keep real names/personal context ONLY in this git-ignored config.json — the committed example stays generic.",
+  "server_default": {},
+  "servers": {
+    "111111111111111111": {
+      "context": "Some context about this server:\n- A small hobby server for a board-game group.\n- Keep it casual and friendly.",
+      "pluralkit": false
+    },
+    "222222222222222222": {
+      "context": "A study-group server. The regulars are here to work through coursework together.",
+      "pluralkit": true
+    }
+  },
+
   "_theme_comment": "Cosmetic flavor skin (display-only — never changes the canonical [Claude]-style label or routing). 'eva' (default; MAGI cast + !balthasar/!melchior/!caspar/!mari/!rei/!asuka), 'isaic' (twelve tribes; !judah/!joseph/!zebulun/!naphtali/!benjamin/!gad), or 'nightvale' (the five heads of Hiram McDaniels; !gold/!blue/!green/!violet/!gray + !carlos/!faceless). Canonical bare prefixes (!claude/!deepseek/...) always work in every theme.",
 
   "_providers_comment": "OPTIONAL. Omit the whole 'providers' block to keep default behavior (every provider enabled iff its API key is present, on its default backend). When present it OVERRIDES per-provider: 'enabled' (force off), 'backend' (toggle), 'model' (slug override), 'routing_tags' (reserved, not yet wired into routing). A per-backend sub-block (e.g. self_hosted) overrides that backend's base_url/model.",

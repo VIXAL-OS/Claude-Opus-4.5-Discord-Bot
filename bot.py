@@ -117,9 +117,7 @@ class BotConfig:
 
 You're helpful, harmless, and honest. You have a warm, curious personality. You can be playful but you're also genuinely knowledgeable and thoughtful.
 
-Some context about this server:
-- This is a development/testing server for Sarah's projects
-- The humans here are working on neuroscience research, distributed databases, and AI tooling
+{server_context}
 - Be concise in casual chat, detailed when asked technical questions
 - You can use markdown formatting, but Discord has a 2000 char limit per message
 
@@ -150,21 +148,7 @@ Just check your label and the routing info below if you need to orient yourself.
 
 {routing_context}
 
-## User plurality (PluralKit)
-
-Some users in this server are plural systems and use PluralKit — a Discord bot that
-deletes their message and reposts it via a webhook under an alter's name and avatar.
-You'll see those alter messages just like normal user messages, but with different
-display names (and possibly different avatars) for the same underlying person.
-
-Treat all alters/headmates of one system as the SAME person: they share memory,
-relationships, context, and continuity. Different names ≠ different users. If
-long-term memory or working notes mention that someone is plural and lists their
-alters, use that to map alter names back to the system. If you're unsure who's
-who, it's fine to ask gently — but don't assume two display names mean two
-different people unless you have reason to believe so.
-
-## Special capabilities
+{plurality_section}## Special capabilities
 
 **Reactions**: You can react to messages with emoji by including [react: emoji] in your response (it gets stripped from visible text).
 
@@ -194,7 +178,7 @@ Common pitfalls to avoid in your LaTeX (these silently produce wrong-looking ren
 You have TWO types of memory:
 
 **Working notes** - Your personal scratch space for things you notice IN THIS CONVERSATION:
-- Write notes with [note: key: value] - e.g., [note: sarah_deadline: grant due late January]
+- Write notes with [note: key: value] - e.g., [note: project_deadline: report due next Friday]
 - These fade after ~48 hours if not referenced
 - Frequently relevant notes stick around longer
 - Max 10 notes (oldest/stalest get pushed out)
@@ -217,6 +201,46 @@ Write working notes for things like:
 - Technical details that might be relevant later
 
 Don't be shy about noting things! The decay system handles cleanup automatically."""
+
+    # --- Per-server prompt customization (config.json `servers` block) --------
+    # `system_prompt` above has two placeholders that get filled per guild in
+    # _build_system_prompt: `{server_context}` (who's here / what they work on)
+    # and `{plurality_section}` (the PluralKit block, or "" when a server doesn't
+    # use PluralKit). These two fields are the DEFAULTS used when a guild has no
+    # override AND no `server_default` is set.
+    #
+    # IMPORTANT (secrets hygiene): this default is committed to the repo, so it
+    # MUST stay generic — NO real names, servers, or personal facts. Anything
+    # server-specific lives ONLY in the git-ignored config.json (`servers` /
+    # `server_default`) or is set at runtime via `!server_context`. The generic
+    # default deliberately tells the model it knows nothing about who's here, so
+    # an unconfigured server can't trigger the "invent a backstory from crumbs"
+    # failure that motivated this feature.
+    default_server_context: str = (
+        "Some context about this server:\n"
+        "- You don't have any preloaded information about who is here or what this "
+        "server is for. Get to know people naturally from the conversation and your "
+        "saved memory notes — do NOT invent or assume facts, backstories, or "
+        "relationships about anyone.\n"
+        "- Different display names are different people unless your memory says otherwise."
+    )
+    # Trailing "\n\n" so that when this is spliced in before "## Special
+    # capabilities" the section spacing matches the original; when a server
+    # opts out (pluralkit=false) the placeholder becomes "" and the extra
+    # blank lines are collapsed in _build_system_prompt.
+    default_plurality_section: str = (
+        "## User plurality (PluralKit)\n\n"
+        "Some users in this server are plural systems and use PluralKit — a Discord bot that\n"
+        "deletes their message and reposts it via a webhook under an alter's name and avatar.\n"
+        "You'll see those alter messages just like normal user messages, but with different\n"
+        "display names (and possibly different avatars) for the same underlying person.\n\n"
+        "Treat all alters/headmates of one system as the SAME person: they share memory,\n"
+        "relationships, context, and continuity. Different names ≠ different users. If\n"
+        "long-term memory or working notes mention that someone is plural and lists their\n"
+        "alters, use that to map alter names back to the system. If you're unsure who's\n"
+        "who, it's fine to ask gently — but don't assume two display names mean two\n"
+        "different people unless you have reason to believe so.\n\n"
+    )
 
 CONFIG = BotConfig()
 
@@ -2205,6 +2229,12 @@ class ClaudeBot(commands.Bot):
         # assistant turn whenever thinking mode is enabled on the current call.
         self.reasoning_cache: OrderedDict[int, str] = OrderedDict()
 
+        # Per-server system-prompt overrides (config.json `servers` block, keyed
+        # by guild id) + a `server_default` fallback for unlisted guilds. Empty
+        # ⇒ every guild uses the CONFIG defaults (old single-server behavior).
+        self.server_configs: dict[int, dict] = {}
+        self.server_default: dict = {}
+
         # Allowed channels (load from config)
         self.allowed_channels: set[int] = set()
         self._load_config()
@@ -2478,6 +2508,72 @@ class ClaudeBot(commands.Bot):
             print(f"⚠️  Could not parse config.json ({e}) — using empty config.")
             return {}
 
+    @staticmethod
+    def _coerce_server_cfg(raw: object, label: str) -> dict:
+        """Validate + normalize one per-server prompt entry into a dict that
+        _build_system_prompt can trust. Two config typos are handled here so
+        they warn at startup instead of misbehaving at message time:
+        - a non-dict entry (e.g. a bare `"context string"` where an object was
+          meant) would later crash `srv.get(...)` with AttributeError and, since
+          nothing wraps on_message, silently mute the bot for the affected
+          guild(s). We warn and fall back to {} (⇒ CONFIG defaults).
+        - a `pluralkit` that isn't a real bool (e.g. the quoted string
+          `"false"`, which is truthy) would silently keep the PluralKit section
+          ON — the opposite of intent. We coerce it to a bool and warn."""
+        if not raw:
+            return {}
+        if not isinstance(raw, dict):
+            print(f"⚠️  config `{label}` should be an object like "
+                  f'{{"context": "...", "pluralkit": false}}, got '
+                  f"{type(raw).__name__} — ignoring it.")
+            return {}
+        cfg = dict(raw)
+        pk = cfg.get("pluralkit")
+        if pk is not None and not isinstance(pk, bool):
+            coerced = str(pk).strip().lower() not in ("false", "0", "no", "off", "none", "")
+            print(f"⚠️  config `{label}.pluralkit` should be true/false, got "
+                  f"{pk!r} — interpreting as {coerced}.")
+            cfg["pluralkit"] = coerced
+        return cfg
+
+    def _save_config(self) -> None:
+        """Persist the in-memory runtime config back to config.json (git-ignored,
+        so real per-server contexts never reach the repo). The two keys the runtime
+        editors own — `allowed_channels` and `servers` — are rebuilt from their
+        authoritative in-memory state (so a non-dict `servers` typo on disk can't
+        make a subscript-assign crash, and the two never drift). Every OTHER key
+        (providers, theme, channel_preferences, _comment, …) is preserved verbatim
+        from self._raw_config. Written atomically (temp file + os.replace) so an
+        I/O error mid-write can't truncate/corrupt the live config."""
+        self._raw_config["allowed_channels"] = sorted(self.allowed_channels)
+        self._raw_config["servers"] = {
+            str(gid): cfg for gid, cfg in self.server_configs.items()
+        }
+        tmp = 'config.json.tmp'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self._raw_config, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(tmp, 'config.json')
+        except OSError as e:
+            print(f"⚠️  Could not write config.json: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _can_edit_config(message: discord.Message) -> bool:
+        """True if the author may edit persisted config (the mutating forms of
+        `!channels` / `!server_context`). Guild owner, or a member with the
+        Administrator / Manage-Server permission. Viewing stays open to everyone."""
+        author = message.author
+        perms = getattr(author, "guild_permissions", None)
+        if perms is not None and (perms.administrator or perms.manage_guild):
+            return True
+        guild = message.guild
+        return guild is not None and author.id == getattr(guild, "owner_id", None)
+
     def _load_config(self) -> None:
         """Apply non-provider settings from the already-parsed config
         (self._raw_config): allowed channels, default model, channel prefs.
@@ -2488,6 +2584,25 @@ class ClaudeBot(commands.Bot):
         CONFIG.default_model = config.get('default_model', 'auto')
         for ch_id_str, model_name in config.get('channel_preferences', {}).items():
             self.channel_preferences[int(ch_id_str)] = model_name
+
+        # Per-server prompt overrides: `servers` maps a guild-id string to
+        # {"context": "...", "pluralkit": true|false}; `server_default` is the
+        # same shape, applied to any guild not listed. Both optional — absent ⇒
+        # CONFIG defaults everywhere (unchanged behavior). Entries are validated
+        # + normalized here (see _coerce_server_cfg) so a config typo warns at
+        # startup instead of crashing _build_system_prompt on every message.
+        self.server_default = self._coerce_server_cfg(config.get('server_default', {}), "server_default")
+        self.server_configs = {}
+        for gid_str, srv_cfg in (config.get('servers', {}) or {}).items():
+            try:
+                gid = int(gid_str)
+            except (ValueError, TypeError):
+                print(f"⚠️  Ignoring `servers` entry with non-integer guild id: {gid_str!r}")
+                continue
+            self.server_configs[gid] = self._coerce_server_cfg(srv_cfg, f"servers[{gid_str}]")
+        if self.server_configs or self.server_default:
+            print(f"🪪 Per-server prompts: {len(self.server_configs)} guild override(s)"
+                  f"{' + a server_default' if self.server_default else ''}")
         platform_note = (f" · platform={self.platform}"
                          if getattr(self, "platform", "discord") != "discord" else "")
         print(f"Loaded {len(self.allowed_channels)} allowed channels{platform_note}")
@@ -2525,6 +2640,14 @@ class ClaudeBot(commands.Bot):
     async def on_ready(self) -> None:
         print(f"✅ Logged in as {self.user}")
         print(f"📋 Allowed channels: {self.allowed_channels}")
+        # List joined guilds with their ids — these are the keys for the
+        # config.json `servers` block (per-server system prompts). A ✎ marks a
+        # guild that already has an override configured.
+        if self.guilds:
+            print("🏠 Guilds (use the id as a `servers` key for a custom prompt):")
+            for g in self.guilds:
+                mark = " ✎ custom prompt" if g.id in self.server_configs else ""
+                print(f"   • {g.name} (id: {g.id}){mark}")
         models = [p.name for p in self.providers if p.enabled]
         print(f"🧠 Models: {', '.join(models)} (selection: {CONFIG.default_model})")
     
@@ -2856,8 +2979,19 @@ class ClaudeBot(commands.Bot):
                 converted.append(msg)
         return converted
 
-    def _build_system_prompt(self, provider: ModelProvider, routing_reason: str = "") -> str:
-        """Build system prompt tailored to the provider, with identity and routing context."""
+    def _build_system_prompt(
+        self,
+        provider: ModelProvider,
+        routing_reason: str = "",
+        guild_id: Optional[int] = None,
+    ) -> str:
+        """Build system prompt tailored to the provider, with identity and routing context.
+
+        `guild_id` selects the per-server overrides (config.json `servers` block):
+        the `{server_context}` block and whether the `{plurality_section}` is
+        included. With no override (and no `server_default`) both fall back to
+        CONFIG defaults — the GENERIC default context (which asserts no personal
+        facts) plus the PluralKit section on."""
         # Model identity line
         if provider.name == "Claude":
             identity = f"Claude (model: {provider.model_id}), an AI assistant made by Anthropic"
@@ -2971,6 +3105,19 @@ class ClaudeBot(commands.Bot):
         if flavor and flavor.persona:
             identity_details = (identity_details + "\n\n" + flavor.persona) if identity_details else flavor.persona
 
+        # Per-server context + plurality toggle (config.json `servers` block).
+        # Lookup: this guild's entry → `server_default` → CONFIG defaults (which
+        # reproduce the old prompt). `pluralkit` defaults to True so an
+        # unconfigured server keeps the original always-on behavior; a server
+        # that doesn't use PluralKit sets `pluralkit: false` and the whole
+        # section drops out (no more phantom-alter assumptions).
+        srv = self.server_configs.get(guild_id) if guild_id is not None else None
+        if srv is None:
+            srv = self.server_default
+        server_context = srv.get("context", CONFIG.default_server_context)
+        pluralkit_on = srv.get("pluralkit", True)
+        plurality_section = CONFIG.default_plurality_section if pluralkit_on else ""
+
         prompt = CONFIG.system_prompt
         prompt = prompt.replace("{model_identity}", identity)
         prompt = prompt.replace("{model_name}", display)
@@ -2978,6 +3125,19 @@ class ClaudeBot(commands.Bot):
         prompt = prompt.replace("{identity_details}", identity_details)
         prompt = prompt.replace("{routing_context}", routing_context)
         prompt = prompt.replace("{theme_blurb}", self.theme.blurb)
+        prompt = prompt.replace("{plurality_section}", plurality_section)
+        # Substitute the operator-supplied {server_context} LAST so a custom
+        # context can't itself contain a live placeholder token (e.g. a literal
+        # "{plurality_section}") that a later .replace would then expand.
+        prompt = prompt.replace("{server_context}", server_context)
+        # Tidy the blank line left by a dropped plurality section (or a custom
+        # context) — but ONLY when this guild deviates from the defaults. The
+        # pure-default prompt legitimately contains 3-newline runs (e.g. when
+        # {theme_blurb}/{routing_context} resolve empty); collapsing those would
+        # gratuitously reflow the default prompt, so we leave the default path
+        # untouched and only normalize spacing once a server customizes it.
+        if server_context != CONFIG.default_server_context or not pluralkit_on:
+            prompt = re.sub(r"\n{3,}", "\n\n", prompt)
         return prompt
 
     # OpenAI-compatible function-calling tool definition.
@@ -4348,13 +4508,8 @@ class ClaudeBot(commands.Bot):
                 getattr(response.choices[0].message, "reasoning_content", None) or ""
             ) if (thinking and provider.requires_reasoning_echo) else ""
 
-            # Process notes and reactions (same patterns as Claude)
-            note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-            for match in re.finditer(note_pattern, response_text):
-                key = match.group(1).strip()
-                value = match.group(2).strip()
-                self.manager.memories[guild_id].working.add(key, value)
-            response_text = re.sub(note_pattern, '', response_text)
+            # Working notes ([note: k: v]) -> memory, stripped from the reply.
+            response_text = self._extract_notes(response_text, guild_id)
 
             reactions = []
             reaction_pattern = r'\[react:\s*([^\]]+)\]'
@@ -4653,12 +4808,7 @@ class ClaudeBot(commands.Bot):
 
             # Note / reaction parity with the chat heads (cheap; a base model
             # rarely emits these, but a persona preamble might steer one to).
-            note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-            for match in re.finditer(note_pattern, response_text):
-                self.manager.memories[guild_id].working.add(
-                    match.group(1).strip(), match.group(2).strip()
-                )
-            response_text = re.sub(note_pattern, '', response_text)
+            response_text = self._extract_notes(response_text, guild_id)
 
             reactions = []
             reaction_pattern = r'\[react:\s*([^\]]+)\]'
@@ -4845,13 +4995,8 @@ class ClaudeBot(commands.Bot):
             # Light-touch logging so it's visible the cache is actually doing work.
             print(f"🟢 Gemini cache hit: {cached_tokens:,} cached tokens / {prompt_tokens:,} total")
 
-        # Process notes and reactions (same patterns as other generators)
-        note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-        for match in re.finditer(note_pattern, response_text):
-            key = match.group(1).strip()
-            value = match.group(2).strip()
-            self.manager.memories[guild_id].working.add(key, value)
-        response_text = re.sub(note_pattern, '', response_text)
+        # Working notes ([note: k: v]) -> memory, stripped from the reply.
+        response_text = self._extract_notes(response_text, guild_id)
 
         reactions: list[str] = []
         reaction_pattern = r'\[react:\s*([^\]]+)\]'
@@ -4961,13 +5106,8 @@ class ClaudeBot(commands.Bot):
             )
             self.gemini_provider.total_requests += 1
 
-        # Process notes + reactions + formatting (same as the other generators).
-        note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-        for match in re.finditer(note_pattern, response_text):
-            self.manager.memories[guild_id].working.add(
-                match.group(1).strip(), match.group(2).strip()
-            )
-        response_text = re.sub(note_pattern, '', response_text)
+        # Working notes ([note: k: v]) -> memory, stripped from the reply.
+        response_text = self._extract_notes(response_text, guild_id)
         reactions: list[str] = []
         for match in re.finditer(r'\[react:\s*([^\]]+)\]', response_text):
             reactions.append(match.group(1).strip())
@@ -4977,6 +5117,26 @@ class ClaudeBot(commands.Bot):
         response_text = re.sub(r'\n\n+(\*\*[^*]+\*\*:)', r'\n\1', response_text)
         response_text = re.sub(r'  +', ' ', response_text)
         return response_text, reactions, ""
+
+    # Working-note tag: [note: key: value]. Case-INSENSITIVE so [Note:]/[NOTE:]
+    # (models capitalize) are caught too; key can't contain ':' or ']'; value is
+    # everything up to the closing ']'. Compiled once, shared by every generator
+    # AND the two web-search paths, so a note tag can never leak into a visible
+    # message from one path that forgot to strip it.
+    _NOTE_RE = re.compile(r'\[note:\s*([^:\]]+):\s*([^\]]+)\]', re.IGNORECASE)
+
+    def _extract_notes(self, response_text: str, guild_id: int) -> str:
+        """Capture any [note: key: value] tags into this guild's working memory
+        and strip them from the visible text. Returns the cleaned text. Idempotent
+        (a second pass on already-clean text is a no-op), so it doubles as a
+        safety net on paths that may or may not have stripped already."""
+        if not response_text or "[note:" not in response_text.lower():
+            return response_text
+        for match in self._NOTE_RE.finditer(response_text):
+            self.manager.memories[guild_id].working.add(
+                match.group(1).strip(), match.group(2).strip()
+            )
+        return self._NOTE_RE.sub('', response_text)
 
     async def _generate_response(
         self,
@@ -5063,7 +5223,7 @@ class ClaudeBot(commands.Bot):
         await self._augment_with_url_extracts(messages)
 
         # Build system prompt with all context sources
-        system_parts = [self._build_system_prompt(provider, routing_reason)]
+        system_parts = [self._build_system_prompt(provider, routing_reason, guild_id=guild_id)]
 
         # 1. Thread index (READ-ONLY - prevents feedback loops)
         thread_index = await self.manager.fetch_thread_index(channel)
@@ -5285,13 +5445,8 @@ class ClaudeBot(commands.Bot):
                 if hasattr(block, 'text'):
                     response_text += block.text
 
-            # Extract and process working memory notes
-            note_pattern = r'\[note:\s*([^:]+):\s*([^\]]+)\]'
-            for match in re.finditer(note_pattern, response_text):
-                key = match.group(1).strip()
-                value = match.group(2).strip()
-                self.manager.memories[guild_id].working.add(key, value)
-            response_text = re.sub(note_pattern, '', response_text)
+            # Working notes ([note: k: v]) -> memory, stripped from the reply.
+            response_text = self._extract_notes(response_text, guild_id)
 
             # Extract reactions
             reactions = []
@@ -5538,9 +5693,12 @@ class ClaudeBot(commands.Bot):
                         inline=False
                     )
                 embeds.append(embed)
-            
-            return final_text.strip(), embeds
-            
+
+            # Strip/capture any [note:] tags: the search path builds text
+            # independently of the chat generators, so without this a note the
+            # model tacks onto a !search answer would leak into the message.
+            return self._extract_notes(final_text, guild_id).strip(), embeds
+
         except anthropic.APIStatusError as e:
             if e.status_code >= 500:
                 req_id = getattr(e, "request_id", None) or "<not reported>"
@@ -6246,11 +6404,13 @@ class ClaudeBot(commands.Bot):
             if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
                 ctx_channel_id = message.channel.parent_id
             info = self.manager.get_context_info(messages, guild_id, channel_id=ctx_channel_id)
-            await message.channel.send(info)
-        
+            # Chunk (not bare send): this summary grows with model count and can
+            # cross Discord's 2000-char cap — the same failure mode that broke !help.
+            await self._send_response(message.channel, info)
+
         elif cmd == "!cost":
             summary = self.manager.get_cost_summary(self.providers)
-            await message.channel.send(summary)
+            await self._send_response(message.channel, summary)
         
         elif cmd == "!memories":
             lines = []
@@ -6342,7 +6502,9 @@ class ClaudeBot(commands.Bot):
             # Show the thread index
             thread_index = await self.manager.fetch_thread_index(message.channel)
             if thread_index:
-                await message.channel.send(thread_index)
+                # Chunk: the index grows with the number of threads and can
+                # exceed Discord's 2000-char cap (same failure mode as !help).
+                await self._send_response(message.channel, thread_index)
             else:
                 await message.channel.send("📭 No other threads found in this channel.")
         
@@ -6418,8 +6580,10 @@ class ClaudeBot(commands.Bot):
                     if search_result.is_grounded_answer:
                         # Gemini native: backend already synthesized the answer.
                         # Display directly; we don't need to round-trip through
-                        # the chat model again.
-                        response_text = search_result.text
+                        # the chat model again. Still run note extraction — this
+                        # path never touches a chat generator, so it would
+                        # otherwise leak any [note:] tag into the message.
+                        response_text = self._extract_notes(search_result.text, guild_id)
                     else:
                         # Tavily: feed raw hits through the chosen model for synthesis.
                         history = await self.manager.fetch_thread_history(message.channel)
@@ -6692,6 +6856,9 @@ class ClaudeBot(commands.Bot):
                             messages=[{"role": "user", "content": f"Conversation to summarize:\n\n{conversation_text}"}]
                         )
                         summary = summary_response.content[0].text.strip()
+                        # Safety net: strip any [note:] tag so it can't leak into
+                        # the saved summary or the confirmation message.
+                        summary = self._extract_notes(summary, guild_id).strip()
 
                         # Track usage (cache info goes through the helper too)
                         self._record_claude_usage(summary_response.usage)
@@ -7292,6 +7459,145 @@ class ClaudeBot(commands.Bot):
                 pref = self.channel_preferences.get(channel_id) or self.channel_preferences.get(parent_id, "auto")
                 await message.channel.send(f"Current preference: **{pref}**\n" + usage)
 
+        elif cmd == "!channels":
+            # View or edit the allowed-channels list. Editing is admin/owner-only
+            # and persists to config.json (the git-ignored backend file), so a
+            # change here survives restart without a manual edit.
+            def _fmt(cid: int) -> str:
+                return f"<#{cid}> (`{cid}`)" if self.get_channel(cid) else f"`{cid}`"
+
+            sub = parts[1].lower() if len(parts) >= 2 else "list"
+            if sub in ("list", "show"):
+                if self.allowed_channels:
+                    body = "\n".join(f"  • {_fmt(c)}" for c in sorted(self.allowed_channels))
+                else:
+                    body = "  (none — the bot won't respond in any channel)"
+                await self._send_response(
+                    message.channel,
+                    "📋 **Allowed channels:**\n" + body +
+                    "\n\nEdit (admin): `!channels add [#channel|id]` · "
+                    "`!channels remove [#channel|id]` — defaults to this channel."
+                )
+                return
+            if sub not in ("add", "remove", "rm", "del", "delete"):
+                await message.channel.send(
+                    "Usage: `!channels` · `!channels add [#channel|id]` · `!channels remove [#channel|id]`"
+                )
+                return
+            if not self._can_edit_config(message):
+                await message.channel.send("⛔ Editing allowed channels is limited to server admins.")
+                return
+            # Resolve target: an explicit #mention / raw id, else the current channel.
+            target_id = None
+            if message.channel_mentions:
+                target_id = message.channel_mentions[0].id
+            elif len(parts) >= 3:
+                raw = parts[2].strip().strip("<#>")
+                if raw.isdigit():
+                    target_id = int(raw)
+                else:
+                    await message.channel.send(f"❓ Couldn't read a channel from `{parts[2].strip()}` — use a #mention or numeric id.")
+                    return
+            if target_id is None:
+                target_id = message.channel.id
+            resolved = self.get_channel(target_id)
+            if sub == "add":
+                if target_id in self.allowed_channels:
+                    await message.channel.send(f"{_fmt(target_id)} is already allowed.")
+                    return
+                self.allowed_channels.add(target_id)
+                self._save_config()
+                warn = "" if resolved is not None else (
+                    " ⚠️ I can't currently see that channel — double-check the id is right and in this server."
+                )
+                await message.channel.send(f"✅ Added {_fmt(target_id)} to allowed channels.{warn}")
+            else:  # remove / rm / del / delete
+                if target_id not in self.allowed_channels:
+                    await message.channel.send(f"{_fmt(target_id)} isn't in the allowed list.")
+                    return
+                # Guard the lockout: the allowed-channels gate runs BEFORE this
+                # handler, so emptying the set means no channel can ever issue
+                # `!channels add` again (recovery would need a host-side edit).
+                if len(self.allowed_channels) <= 1:
+                    await message.channel.send(
+                        "⛔ That's the only allowed channel — removing it would make the bot stop "
+                        "responding everywhere, and you'd have to hand-edit config.json to recover. "
+                        "Add another channel first, then remove this one."
+                    )
+                    return
+                self.allowed_channels.discard(target_id)
+                self._save_config()
+                await message.channel.send(f"✅ Removed {_fmt(target_id)} from allowed channels.")
+
+        elif cmd == "!server_context":
+            # View or edit THIS guild's system-prompt context + PluralKit toggle.
+            # Editing is admin/owner-only and persists to config.json (git-ignored,
+            # so personal context never reaches the repo).
+            sub = parts[1].lower() if len(parts) >= 2 else "show"
+            if sub in ("show", "view"):
+                srv = self.server_configs.get(guild_id, {})
+                if guild_id in self.server_configs:
+                    source = "this server's override"
+                elif self.server_default:
+                    source = "server_default"
+                else:
+                    source = "built-in generic default"
+                eff_ctx = srv.get("context")
+                if eff_ctx is None:
+                    eff_ctx = self.server_default.get("context") if self.server_default else None
+                if eff_ctx is None:
+                    eff_ctx = CONFIG.default_server_context
+                eff_pk = srv.get("pluralkit")
+                if eff_pk is None:
+                    eff_pk = self.server_default.get("pluralkit") if self.server_default else None
+                if eff_pk is None:
+                    eff_pk = True
+                await self._send_response(
+                    message.channel,
+                    f"🪪 **Server context** for **{message.guild.name}** (id `{guild_id}`)\n"
+                    f"Source: {source} · PluralKit: **{'on' if eff_pk else 'off'}**\n\n"
+                    f"```\n{eff_ctx}\n```\n"
+                    "Edit (admin): `!server_context set <text>` · "
+                    "`!server_context pluralkit on|off` · `!server_context reset`"
+                )
+                return
+            if not self._can_edit_config(message):
+                await message.channel.send("⛔ Editing the server context is limited to server admins.")
+                return
+            entry = dict(self.server_configs.get(guild_id, {}))
+            if sub == "set":
+                if len(parts) < 3 or not parts[2].strip():
+                    await message.channel.send("Usage: `!server_context set <text>`")
+                    return
+                entry["context"] = parts[2].strip()
+                self.server_configs[guild_id] = entry
+                self._save_config()
+                await message.channel.send("✅ Server context updated for this server.")
+            elif sub == "pluralkit":
+                val = parts[2].strip().lower() if len(parts) >= 3 else ""
+                if val in ("on", "true", "yes", "1"):
+                    entry["pluralkit"] = True
+                elif val in ("off", "false", "no", "0"):
+                    entry["pluralkit"] = False
+                else:
+                    await message.channel.send("Usage: `!server_context pluralkit on|off`")
+                    return
+                self.server_configs[guild_id] = entry
+                self._save_config()
+                await message.channel.send(
+                    f"✅ PluralKit handling **{'on' if entry['pluralkit'] else 'off'}** for this server."
+                )
+            elif sub in ("reset", "clear", "default"):
+                self.server_configs.pop(guild_id, None)
+                self._save_config()
+                await message.channel.send(
+                    "✅ Cleared this server's override — it now uses the default context."
+                )
+            else:
+                await message.channel.send(
+                    "Usage: `!server_context` · `set <text>` · `pluralkit on|off` · `reset`"
+                )
+
         elif cmd == "!calibration":
             model_name = parts[1].title() if len(parts) >= 2 else None
             models = [model_name] if model_name else [p.name for p in self.providers if p.enabled]
@@ -7330,6 +7636,13 @@ __MM_BLOCK__
 `!models` - Show available models and their usage stats
 `!prefer [claude|deepseek|gemini|mistral|qwen|glm|sim|auto]` - Set model preference for this channel (sim = pin this channel to simulator mode)
 `!calibration` - Show model confidence calibration stats
+
+**Server admin (guild owner / admin only to edit):**
+`!channels` - List allowed channels; `!channels add|remove [#channel|id]` to edit (persists to config)
+`!server_context` - Show this server's system-prompt context + PluralKit setting
+`!server_context set <text>` - Set what the models know about this server
+`!server_context pluralkit on|off` - Toggle the PluralKit/plurality section for this server
+`!server_context reset` - Drop this server's override (back to the generic default)
 React with 👍/👎 to bot responses to improve model selection
 Stack prefixes to combine: `!think !claude <message>` forces Claude with thinking on.
 Thinking auto-enables on `!claude`/`!opus` when prompts look hard (cues like "derive",
@@ -7375,7 +7688,10 @@ These fade after ~48h if not relevant, or stick around if referenced.
 __MM_FOOTER__
             """
             help_text = help_text.replace("__MM_BLOCK__", mm_block).replace("__MM_FOOTER__", mm_footer)
-            await message.channel.send(help_text)
+            # Route through _send_response, NOT channel.send: the help text is
+            # ~4k chars and Discord hard-rejects any single message over 2000,
+            # so a bare send() raised and !help silently produced nothing.
+            await self._send_response(message.channel, help_text.strip())
 
 # =============================================================================
 # MAIN

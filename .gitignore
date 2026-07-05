@@ -2,6 +2,7 @@
 memories.json
 __pycache__/
 config.json
+config.json.tmp
 .claude/
 
 # Bookclub source texts loaded via !load_text — copyrighted fics/works.

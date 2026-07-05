@@ -127,6 +127,31 @@ byte-for-byte the old behavior):
   - **`!french` tutor** — inverse of the Mandarin path: Azure `fr-FR-DeniseNeural`, Mistral-native
     G2P returning text+IPA+liaison note, IPA is display-only (no forced phonemes — Azure infers),
     inline `[[french:..]]` for models. Shares Azure config with `!speak`.
+  - **Per-server system prompts (config.json `servers`, keyed by guild id) + runtime editors.** The
+    system-prompt template has two placeholders filled per guild in `_build_system_prompt(...,
+    guild_id=)`: `{server_context}` (the "context about this server" block) and `{plurality_section}`
+    (the whole PluralKit block, dropped when a server sets `pluralkit: false`). Lookup order:
+    `servers[<guild_id>]` → `server_default` → the `BotConfig` defaults. **The committed
+    `default_server_context` is now GENERIC** — it tells the model it knows nothing about who's
+    there and must not invent facts (secrets hygiene: no real names/servers in the repo; personal
+    context lives only in git-ignored config.json or is set at runtime). `default_plurality_section`
+    default is still `pluralkit=true`. The tidy-spacing `re.sub` runs whenever a guild deviates from
+    the default. Config entries are validated/normalized by `_coerce_server_cfg` (non-dict → `{}` +
+    warn; a quoted `"pluralkit"` → real bool + warn) so a config typo warns at startup instead of
+    crashing `_build_system_prompt` on every message and silently muting the guild. `{server_context}`
+    is substituted LAST so a custom context can't re-expand a placeholder token. `on_ready` prints
+    each joined guild's name+id. **Runtime editors** (`!channels`, `!server_context`; admin/owner-only
+    via `_can_edit_config`) mutate the in-memory state AND persist through `_save_config()`, which
+    re-dumps `self._raw_config` to config.json (git-ignored) preserving all other keys — so a Discord
+    edit and a hand-edit stay in sync. Rationale: the *old* prompt hardcoded "Sarah's projects /
+    neuroscience / distributed databases" + an always-on PluralKit section, which made the bot invent
+    plural-alter histories on servers that don't use PluralKit.
+  - **Working-note extraction hardened.** All 5 generators + both web-search paths now call one
+    `_extract_notes(text, guild_id)` helper (compiled `_NOTE_RE`, **case-insensitive** so
+    `[Note:]`/`[NOTE:]` are caught, idempotent so it doubles as a safety net). Fixes a real leak:
+    `_web_search` (Claude native) and the grounded-Gemini `!search` branch returned model text
+    straight to Discord WITHOUT stripping `[note:]`, so a note tacked onto a `!search` answer leaked
+    into the message.
 
 ### Remaining from the restructure spec
 | Phase | Status | Priority |

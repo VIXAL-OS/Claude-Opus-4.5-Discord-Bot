@@ -263,6 +263,26 @@ AO3_COOKIE=                               # Optional, for bookclub mode
 }
 ```
 
+**Per-server prompts (optional):** by default the bot uses a **generic** system prompt that knows nothing about who's in a server (and is told not to invent anything). Give a specific server its own context with a `servers` block keyed by **guild id** (the bot prints each joined guild's name + id at startup). Unlisted guilds fall back to `server_default`, then to the generic default.
+```json
+{
+  "server_default": {},
+  "servers": {
+    "111111111111111111": {
+      "context": "Some context about this server:\n- A small hobby server for a board-game group.\n- Keep it casual.",
+      "pluralkit": false
+    },
+    "222222222222222222": {
+      "context": "A study-group server. The regulars work through coursework together.",
+      "pluralkit": true
+    }
+  }
+}
+```
+`context` replaces the "context about this server" block; `pluralkit: false` drops the whole PluralKit/plurality section (stops the bot assuming users are plural systems). Everything else in the prompt — identity, capabilities, memory rules — stays intact. `config.json` is git-ignored, so keep real names / personal context there (never in the committed example).
+
+You can also edit this **live from Discord** (guild owner / admin): `!server_context set <text>`, `!server_context pluralkit on|off`, `!server_context reset`, and `!channels add|remove [#channel|id]` — all persist back to `config.json`.
+
 ### 4. Run
 
 ```bash
