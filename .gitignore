@@ -4,6 +4,8 @@ __pycache__/
 config.json
 config.json.tmp
 .claude/
+.venv/
+venv/
 
 # Bookclub source texts loaded via !load_text — copyrighted fics/works.
 # NEVER commit these (a 3 MB AO3 HTML slipped in once). Keep them local only.
