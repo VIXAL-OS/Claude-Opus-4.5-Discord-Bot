@@ -72,6 +72,64 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-06-27
 
+### ✅ Gemini bookclub cache — inline by default + real cost accounting (2026-07-08)
+Root-caused a recurring Gemini prepay depletion (a persistent 452k-token bookclub cache). Fixes,
+all offline-validated (`scratchpad/test_cache_fixes.py`, 20/20; import/syntax gates pass):
+- **Inline is now the DEFAULT for Gemini bookclub.** `self.gemini_explicit_cache` (init in `__init__`
+  from `providers.gemini.explicit_cache`, default **False**) gates BOTH `_ensure_gemini_cache` (native)
+  and `_ensure_gemini_vertex_cache`. Off ⇒ the fic is inlined each turn (existing no-cache branch) and
+  Google's **implicit** caching gives the read discount with **no per-hour storage bill** — no
+  cachedContents to create/refresh/leak/`!uncache`. This CHANGES the old default (was explicit
+  caching). Explicit stays fully intact behind the toggle. **`!explicitcache on|off`** (admin, persists
+  via `_save_config`) flips it — `on` for a sustained back-to-back marathon (guaranteed discount, bills
+  ~$0.45/hr storage for the 452k fic), `off` returns to inline AND drops any live cache. Startup prints
+  the active mode.
+- **Timezone bug fixed.** Cache expiry math mixed naive-UTC (`expireTime`, tzinfo stripped) with
+  naive-LOCAL `datetime.now()` — on the UTC−4 host this made the code think a Google-expired cache was
+  alive ~4h longer (dead-zone of full-price inline re-uploads; the sliding refresh also never fired).
+  Now ONE aware-UTC clock: `_utcnow()` / `_as_utc()` everywhere in the cache path; `from_dict` coerces
+  old (naive/mixed) persisted timestamps so nothing raises offset-naive-vs-aware.
+- **`!cost` no longer under-reports storage.** Was a one-shot creation-time estimate (one 6h TTL,
+  frozen) — a cache alive for days still showed ~$2.71. Now metered by REAL lifetime: `cache_created_at`
+  per handle; live caches accrue on the fly in `get_cost_summary` (created→now, capped at expiry) and
+  settle into `total_cache_storage_cost_est` at teardown (`_settle_gemini_storage`, idempotent, no
+  double-count). `_gemini_storage_cost` is the shared helper.
+- **`!uncache` no longer lies.** `_delete_gemini_cache` now returns success ONLY when actually gone
+  (200/204/404, or a 403 whose body says "not found"); a bare billing/permission 403 → failure.
+  `_drop_gemini_cache` deletes BEFORE clearing the handle and KEEPS it on failure (returns
+  `(attempted, deleted)`), so a still-billing cache stays targetable instead of being orphaned.
+  `!uncache` reports the real count and warns when a delete couldn't be confirmed.
+- ⚠️ **Owes one live smoke test:** confirm Gemini implicit caching actually discounts a 452k prefix on
+  `gemini-3.1-pro` (once the balance is topped up) — inline's whole premise. Worst case (no implicit
+  hit) is ~$1.81/turn full input but still **no storage bleed**. Also verify `!explicitcache on` still
+  creates/refreshes/deletes cleanly end-to-end.
+
+### ✅ `!research` judge now verifies instead of dismissing post-cutoff facts (2026-07-08)
+The Claude judge (`_judge`) was called with `claude_tools=[]` (web search **off** — "synthesise from
+answers given") and a prompt telling it to "flag claims that look unsupported", with no cutoff
+awareness. Result: real products released after its training cutoff (e.g. a June-2026 model) looked
+"unsupported" → it declared them fabricated ("confirmed vapor") with false confidence. Fix:
+- **Judge keeps web search** — dropped the `claude_tools=[]` (now defaults to the `web_search` tool),
+  so it can VERIFY decision-critical / post-cutoff claims before ruling (selectively, not re-research).
+- **Rewrote the judge system prompt** with an EPISTEMICS block: states today's date; "absence from
+  memory is NOT evidence something is fake"; search to verify named products/versions/prices/dates/
+  events that could postdate the cutoff; calibrated verdicts (CONFIRMED / CONTRADICTED / UNVERIFIED);
+  NEVER say "fabricated/vapor" unless search *actively* contradicts it.
+- **Judge now runs with `thinking=True`** (threaded through `_panel_complete`) — adjudicating conflicts
+  + deciding what to verify is real reasoning, not a formatting pass. Other `_panel_complete` callers
+  keep `thinking=False`.
+- **Panel-member prompt** hardened against citation fabrication: URLs/quotes/dates/hashes may be cited
+  ONLY from an actual `web_search` result in-conversation, never invented/reconstructed from memory; if
+  it didn't search, attach no citations and flag the claim as from-memory. (DeepSeek *is* offered the
+  Tavily `web_search` tool in the panel but chose not to call it, then fabricated URLs+hashes to satisfy
+  "cite sources" — this is the source-side fix; the searching judge is the downstream catch.)
+- **Empty-completion robustness** in `_generate_openai_compatible_response`: an empty `content` used to
+  surface as a silent `''` → a dropped panel member with no retry (why a first `!research` could lose
+  DeepSeek while the next worked). Now it logs `finish_reason` + `pending_tool_calls` and retries once
+  (forcing `tool_choice="none"` if the 3-round tool cap was hit) — self-heals a transient blank and
+  makes a persistent one diagnosable.
+- Syntax/import gates pass. ⚠️ Owes a live smoke test (the exact failure query, once credits are up).
+
 ### ✅ Built (validated offline, needs live-key smoke tests)
 - **Phase 7 — simulator mode, rung 1 (2026-06-27).** The **Dummy Plug** (`!dummy`/`!sim`): a base
   model continues the channel as an IRC/script transcript via `/completions` instead of chatting.
