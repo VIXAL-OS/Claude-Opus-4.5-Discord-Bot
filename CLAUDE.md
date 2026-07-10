@@ -72,6 +72,47 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-06-27
 
+### ✅ `!research` panel: Gemini `thought_signature` 400 + DeepSeek tool-call dump (2026-07-10)
+Two failures, both in the **shared tool loop** of `_generate_openai_compatible_response` — which
+Gemini uses more than you'd think: `_panel_complete` routes everything non-Claude through the shim,
+and `_generate_response` only picks the native Gemini path when reading material is loaded or
+`backend="vertex"`. **Plain `!gemini` chat goes through the shim too.**
+- **Gemini 400 "Function call is missing a thought_signature" (fixed).** Gemini 3 thinking models
+  attach an encrypted per-call signature and reject the FOLLOW-UP request unless it's echoed back
+  verbatim. Over the OpenAI shim it rides at `tool_calls[i].extra_content.google.thought_signature`;
+  the loop rebuilt the assistant turn keeping only `{id,type,function}` and dropped it. So *any*
+  Gemini turn that tool-called died on the second request — every `!research`, and every `!gemini`
+  chat that decided to search. Bookclub was immune (native path). Now `_tool_call_extra_content()`
+  reads it (typed attr → `model_dump()` → nested pydantic) and the rebuild echoes it back per call,
+  never synthesizing one for a call that had none. ⚠️ Lowering `thinking_level`/`reasoning_effort`
+  does NOT lift the requirement — don't "fix" it that way. Fallback if the shim ever returns no
+  `extra_content`: stop attaching `web_search` to Gemini (it has native `google_search` grounding
+  via `_search_for`). The outer `except` now prints that hint when it sees the string.
+- **DeepSeek "no actual content (only unexecuted tool calls)" (fixed).** Live DeepSeek V4-Pro server
+  bug (`deepseek-ai/DeepSeek-V3` issue #1244, open, ~2/19 completions): it serializes the call into
+  `content` (`finish_reason="stop"`, `tool_calls=null`). Non-empty ⇒ sailed past
+  `_is_provider_error`, counted as a surviving panelist, and reached the judge as an "answer". New
+  `_looks_like_tool_call_dump()` catches the chat-template tokens (`<|tool▁…|>`, U+2581) / a tool
+  name welded onto a JSON object / a whole-message tool-call object, deliberately high-precision so
+  prose *about* `web_search` or JSON doesn't trip it. On detection (or on an empty completion) it
+  retries once and, if still degraded, returns a real `Deepseek Error:` sentinel so the panel DROPS
+  the member. The forced-text retry now **drops the `tools` array** instead of setting
+  `tool_choice="none"` — a model that already decided to call a tool verbalizes the call when merely
+  forbidden from emitting it. A blank with *no* tool intent keeps its tools (that retry is a re-roll).
+- **Latent tool-loop bug also fixed:** only `web_search` calls got a `tool` reply, so any other tool
+  name left a dangling `tool_call` id → malformed follow-up → 400. Every id now gets exactly one reply.
+- **Panel/judge hardening:** `_run_panel` returns `(survivors, failures)` and logs the **full** error
+  (the old `text[:120]` truncation is what hid this outage); the footer **names** failed members
+  instead of `1 member(s) failed`; the judge's own output is now checked with `_is_provider_error`
+  and a judge failure falls back to posting the raw panel answers instead of publishing
+  `Claude Error 529: overloaded` as the synthesis; `_panel_complete` finally forwards `thinking=` on
+  the openai path; the cost multiplier counts members *attempted*, not survivors.
+- Offline-validated: `scratchpad/test_panel_fixes.py` (31/31 — true positives, false-positive guards,
+  signature round-trip incl. `_strip_internal_keys` + JSON serialization); syntax + import gates pass.
+  ⚠️ **Owes two live smoke tests:** (1) `!research` → Gemini survives a `web_search` round-trip;
+  (2) grep the 7/9 logs for `⚠️ Deepseek returned empty content` — if that line is ABSENT, #1244 (not
+  our own retry) was the cause, which is what the evidence says.
+
 ### ✅ Gemini bookclub cache — inline by default + real cost accounting (2026-07-08)
 Root-caused a recurring Gemini prepay depletion (a persistent 452k-token bookclub cache). Fixes,
 all offline-validated (`scratchpad/test_cache_fixes.py`, 20/20; import/syntax gates pass):
