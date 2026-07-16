@@ -72,6 +72,19 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-06-27
 
+### ✅ `!load_text` accepts PDFs (2026-07-16)
+Bookclub `!load_text` now takes `.pdf` attachments alongside `.txt`/`.html`/`.md`. `pypdf` is a new
+optional dep (import-guarded like bs4 — missing ⇒ a pip-install hint, everything else unaffected; in
+requirements.txt). Module-level `_extract_pdf_text(data) -> (text, page_count)` right after the
+guard: opens owner-password-only "encrypted" PDFs with the empty user password, raises user-facing
+`ValueError`s for truly locked PDFs and for scanned/image-only PDFs (no extractable text — OCR is
+deliberately out of scope). Binary fetch via new manager `_fetch_file_bytes`; extraction runs in
+`asyncio.to_thread` (CPU-bound). Thin-extraction heuristic (<100 chars/page avg) appends a ⚠️ to the
+load summary instead of failing. Same `ReadingMaterial` path afterward, so chapter detection /
+`!scope` / caching all apply. Offline-validated: `scratchpad/test_pdf_load.py` (16/16 — real
+matplotlib-generated PDFs, both encryption shapes, blank pages, garbage bytes) + import gate with
+pypdf blocked (`_HAS_PYPDF=False`, bot imports fine).
+
 ### ✅ `!research` panel: Gemini `thought_signature` 400 + DeepSeek tool-call dump (2026-07-10)
 Two failures, both in the **shared tool loop** of `_generate_openai_compatible_response` — which
 Gemini uses more than you'd think: `_panel_complete` routes everything non-Claude through the shim,

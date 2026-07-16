@@ -126,7 +126,7 @@ Both need `AZURE_TTS_KEY` / `AZURE_TTS_REGION` (Azure's free tier covers ~0.5M c
 | Command | Description |
 |---------|-------------|
 | `!load <ao3-url>` | Fetch an AO3 work and pin it to this channel |
-| `!load_text [title]` | (with `.txt`/`.html`/`.md` attachment) load from a local file — works when AO3 is shields-up |
+| `!load_text [title]` | (with `.txt`/`.html`/`.md`/`.pdf` attachment) load from a local file — works when AO3 is shields-up |
 | `!unload` | Drop the loaded work |
 | `!reading` | Show what's currently loaded |
 | `!chapters` | Show chapter TOC with per-chapter token counts |
@@ -207,7 +207,7 @@ AO3 sheds anonymous traffic under load with HTTP 403 "Shields are up!" — affec
 
 1. **Wait** — usually resolves in hours
 2. **Set `AO3_COOKIE`** in `.env` with your logged-in `_otwarchive_session` cookie value — bypasses shields-up AND unlocks registered-only works
-3. **Use `!load_text`** with a manually-downloaded `.txt`/`.html` of the work (AO3's "Download" button on the work page gives you HTML/EPUB/PDF/MOBI)
+3. **Use `!load_text`** with a manually-downloaded `.txt`/`.html`/`.pdf` of the work (AO3's "Download" button on the work page gives you HTML/EPUB/PDF/MOBI — HTML extracts cleanest, PDF works too; scanned/image-only PDFs won't, they need OCR first)
 
 ## Setup
 
