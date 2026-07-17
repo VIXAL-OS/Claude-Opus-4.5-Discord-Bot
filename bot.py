@@ -410,6 +410,13 @@ class ModelProvider:
     #   Deepseek V4 has this; Gemini does not.
     requires_reasoning_echo: bool = False
     disables_thinking_by_default: bool = False
+    # think_reasoning_effort: value sent as the OpenAI-standard
+    #   `reasoning_effort` param when thinking mode is requested. Kimi K3
+    #   accepts ONLY "max" here, and the K2-era extra_body {"thinking": ...}
+    #   param must NOT be sent to it (per Moonshot's K3 docs) — its reasoning
+    #   is internal, no reasoning_content echo. None (default) → the shim
+    #   never sends reasoning_effort.
+    think_reasoning_effort: Optional[str] = None
 
     # Which SearchBackend to use when this provider needs to ground via the web.
     # Values: "tavily", "google_native", or None (no external search). Claude has
@@ -438,7 +445,7 @@ class ModelProvider:
     grid_gco2_per_kwh: Optional[float] = None
     # train_tco2e: one-time TRAINING carbon (tonnes CO₂e), embodied at the
     # *training* grid (France ~clean for Mistral; a China province for
-    # Qwen/GLM/DeepSeek; US for Claude/Gemini) — NOT the inference grid above.
+    # Qwen/GLM/DeepSeek/Kimi; US for Claude/Gemini) — NOT the inference grid above.
     # Amortized over MODEL_LIFETIME_TOKENS into a separate !cost line. None →
     # omit. Published anchors are rare (Mistral Large-2 LCA = 2200 t); the rest
     # are order-of-magnitude estimates. Amortized share is small for widely-
@@ -637,7 +644,7 @@ AMORTIZE_TRAINING = os.getenv("AMORTIZE_TRAINING", "1") not in ("0", "false", "F
 # never fully stopped the echo — this strip is the real fix. ⚠️ KEEP IN SYNC
 # with provider.name when adding a head (else its echo leaks through, the
 # "[Qwen] [Qwen]" double-label bug).
-MODEL_LABEL_NAMES = "Claude|Deepseek|Gemini|Mistral|Qwen|GLM|Dummy"
+MODEL_LABEL_NAMES = "Claude|Deepseek|Gemini|Mistral|Qwen|GLM|Kimi|Dummy"
 
 
 CLAUDE_PROVIDER = ModelProvider(
@@ -874,6 +881,61 @@ GLM_PROVIDER = ModelProvider(
     train_tco2e=2000.0,         # estimate — GLM-5 (744B) trains end-to-end on Huawei Ascend; CN province grid
 )
 
+KIMI_PROVIDER = ModelProvider(
+    name="Kimi",
+    id="kimi",
+    sdk_type="openai_compatible",
+    api_key_env="MOONSHOT_API_KEY",
+    base_url="https://api.moonshot.ai/v1",
+    backend="api",
+    # Kimi K3 (Moonshot AI, released 2026-07-16): 2.8T-param sparse MoE
+    # (16 of 896 experts ≈ ~50B active), Kimi Delta Attention (hybrid linear —
+    # ~6.3× faster decode at 1M ctx), 1M context. Largest open-weights model to
+    # date (weights due 2026-07-27). This is the PREMIUM open head, not a cheap
+    # one — $3/$15 puts it above Claude on input. Override-only in routing.
+    model_id="kimi-k3",
+    input_cost_per_million=3.00,         # platform.kimi.ai, 2026-07 launch pricing — VERIFY periodically
+    output_cost_per_million=15.00,
+    # Automatic server-side prefix caching (DeepSeek-style, no client flags);
+    # cache hits bill at $0.30/M. The shim reads standard usage fields — if
+    # Moonshot reports hits under a nonstandard key, hits will undercount
+    # (bill as full-price input) until we map it. VERIFY on first live !cost.
+    cached_input_cost_per_million=0.30,
+    max_context_tokens=1_000_000,
+    # K3 is multimodal upstream, but vision stays OFF like the other open
+    # heads — Claude/Gemini are the designated eyes (deliberate, not a gap).
+    supports_vision=False,
+    supports_web_search=False,
+    search_backend="tavily",
+    # K3 thinking quirk: reasoning is requested via the OpenAI-standard
+    # reasoning_effort param — "max" is the ONLY value K3 accepts — and the
+    # K2.x extra_body {"thinking": ...} shape must NOT be sent (K3 rejects
+    # it). No reasoning_content echo requirement. ⚠️ VERIFY on first live
+    # !think !kimi turn.
+    think_reasoning_effort="max",
+    est_wh_per_1k_tokens=0.5,   # VERIFY — huge total params but sparse (~50B active) + KDA decode wins
+    grid_gco2_per_kwh=550.0,    # Moonshot China API (east-CN grid, same basis as DeepSeek api)
+    train_tco2e=4000.0,         # estimate — biggest open train to date, but ~2.5× K2 scaling efficiency; CN grid
+    # Backend toggle (Phase 3 pattern). Default "api" (above) = api.moonshot.ai.
+    # ⚠️ "fireworks" is NOT LIVE YET as of 2026-07-17 — K3 weights drop
+    # 2026-07-27 and Fireworks has been Moonshot's day-0 partner for K2.5/2.6/
+    # 2.7, so this entry is the EXPECTED US/ZDR route (the one the Slack bot
+    # would use). Slug + pricing are guesses patterned on K2.7 ($0.95/$4) —
+    # VERIFY in the live Fireworks library before flipping the backend.
+    backends={
+        "fireworks": {
+            "base_url": "https://api.fireworks.ai/inference/v1",
+            "api_key_env": "FIREWORKS_API_KEY",
+            "model": "accounts/fireworks/models/kimi-k3",    # VERIFY once listed
+            "input_cost_per_million": 1.20,                  # VERIFY
+            "output_cost_per_million": 5.00,                 # VERIFY
+            "cached_input_cost_per_million": 0.60,           # Fireworks 50% cache discount
+            "grid_gco2_per_kwh": 400.0,                      # Fireworks US fleet
+            "supports_server_cache": True,
+        },
+    },
+)
+
 # Phase 7 — simulator mode (§9). The "Dummy Plug": EVA's autopilot that runs an
 # Eva with NO conscious pilot. A base model continuing a transcript with no
 # instruct "pilot" steering it is exactly that — so the simulator head is a NERV
@@ -978,6 +1040,7 @@ THEMES: dict = {
             "mistral":  Flavor("Mistral",    ("!mari",)),
             "qwen":     Flavor("Qwen",       ("!rei",)),
             "glm":      Flavor("GLM",        ("!asuka",)),
+            "kimi":     Flavor("Kimi",       ("!kaworu",)),   # the Fifth Child — arrives last, uncannily capable
             "sim":      Flavor("Dummy Plug", ("!dummy",)),
         },
     ),
@@ -986,7 +1049,7 @@ THEMES: dict = {
         name="isaic", umbrella="ISAIC",
         blurb=("(This server runs the ISAIC skin — the International System of AI Coopertition — naming "
                "the heads for the twelve tribes: !judah = Claude, !joseph = Gemini, !zebulun = Deepseek, "
-               "!naphtali = Mistral, !benjamin = Qwen, !gad = GLM.)"),
+               "!naphtali = Mistral, !benjamin = Qwen, !gad = GLM, !issachar = Kimi.)"),
         flavors={
             "claude":   Flavor("Judah",    ("!judah",),    "Skin note: in this workspace you're called **Judah** (the lead tribe). Cosmetic only — you're still Claude."),
             "gemini":   Flavor("Joseph",   ("!joseph",),   "Skin note: here you're **Joseph** (the visionary interpreter). Cosmetic only — you're still Gemini."),
@@ -994,6 +1057,7 @@ THEMES: dict = {
             "mistral":  Flavor("Naphtali", ("!naphtali",), "Skin note: here you're **Naphtali** ('giver of beautiful words'). Cosmetic only — you're still Mistral."),
             "qwen":     Flavor("Benjamin", ("!benjamin",), "Skin note: here you're **Benjamin** (the quick youngest). Cosmetic only — you're still Qwen."),
             "glm":      Flavor("Gad",      ("!gad",),      "Skin note: here you're **Gad** (the resourceful raider). Cosmetic only — you're still GLM."),
+            "kimi":     Flavor("Issachar", ("!issachar",), "Skin note: here you're **Issachar** (the scholar tribe, 'who had understanding of the times'). Cosmetic only — you're still Kimi."),
             "sim":      Flavor("Levi",     ("!levi",),     "Skin note: here you're **Levi** (set apart, holding no territory of its own). Cosmetic only — you're still the simulator."),
         },
     ),
@@ -1004,7 +1068,8 @@ THEMES: dict = {
         blurb=("(This server runs the Night Vale skin: the heads are the five heads of the dragon Hiram "
                "McDaniels — !gold = Claude (the genial leader), !blue = Gemini (cold logic), !green = "
                "Deepseek (the menacing one), !violet = Mistral (the sweet, good head), !gray = Qwen (the "
-               "gloomy workhorse) — plus !carlos = GLM (the scientist) and !faceless = the simulator.)"),
+               "gloomy workhorse) — plus !carlos = GLM (the scientist), !glowcloud = Kimi (ALL HAIL), "
+               "and !faceless = the simulator.)"),
         flavors={
             "claude":   Flavor("Gold Head",   ("!gold",),             "Skin note: this server calls you the **Gold Head** of Hiram McDaniels — the genial, golden-tongued, well-spoken leader (a faint Southern lilt). Flavor only; you're still Claude."),
             "gemini":   Flavor("Blue Head",   ("!blue",),             "Skin note: you're the **Blue Head** of Hiram McDaniels — the one who holds logic as the gold standard of intellect. Flavor only; you're still Gemini."),
@@ -1012,6 +1077,7 @@ THEMES: dict = {
             "mistral":  Flavor("Violet Head", ("!violet", "!purple"), "Skin note: you're the **Violet Head** of Hiram McDaniels — the lone good-hearted, poetic head who works against the others' schemes. Flavor only; you're still Mistral."),
             "qwen":     Flavor("Gray Head",   ("!gray", "!grey"),     "Skin note: you're the **Gray Head** of Hiram McDaniels — the gloomy but pragmatic workhorse who 'often feels blue.' Flavor only; you're still Qwen."),
             "glm":      Flavor("Carlos",      ("!carlos",),           "Skin note: this server calls you **Carlos the Scientist** of Night Vale — methodical, perfect-haired, forever running experiments (your tool use). Flavor only; you're still GLM."),
+            "kimi":     Flavor("Glow Cloud",  ("!glowcloud", "!allhail"), "Skin note: this server calls you the **Glow Cloud** (ALL HAIL THE MIGHTY GLOW CLOUD) — vast, luminous, faintly ominous, and by far the largest presence on the council (you now run the school board). Keep the majesty light-touch. Flavor only; you're still Kimi."),
             "sim":      Flavor("Faceless Old Woman", ("!faceless",),  "Skin note: you're **The Faceless Old Woman Who Secretly Lives in Your Home** — an ambient presence quietly continuing the transcript. Flavor only; you're still the simulator."),
         },
     ),
@@ -1090,6 +1156,7 @@ _PROVIDER_CONSTANTS = [
     MISTRAL_PROVIDER,
     QWEN_PROVIDER,
     GLM_PROVIDER,
+    KIMI_PROVIDER,
     SIM_PROVIDER,   # Phase 7 simulator (Dummy Plug) — last so it sorts after the heads in !models
 ]
 
@@ -2293,6 +2360,7 @@ class ClaudeBot(commands.Bot):
         self.mistral_provider = self.registry.by_id("mistral")
         self.qwen_provider = self.registry.by_id("qwen")
         self.glm_provider = self.registry.by_id("glm")
+        self.kimi_provider = self.registry.by_id("kimi")
         self.sim_provider = self.registry.by_id("sim")   # Phase 7 simulator (Dummy Plug)
 
         # Bookclub Gemini caching mode. Default: INLINE (False). A loaded book is
@@ -2363,14 +2431,15 @@ class ClaudeBot(commands.Bot):
         # already pay for — no GPT. (Fable 5 is intentionally omitted: not
         # generally accessible yet.) Disabled members are skipped at runtime.
         self.panel_members: list[str] = ["Claude", "Gemini", "Deepseek"]
-        # `!research all` convenes the full roster — the cheap Fireworks heads
-        # (Mistral/Qwen/GLM) join for maximum decorrelated diversity. Different
-        # training data → independent errors → a better judge synthesis: a panel
-        # *rewards* the redundancy a router would punish. Filtered by `enabled`,
-        # so they're silently skipped until FIREWORKS_API_KEY turns them on —
-        # this list is forward-compatible today (no GPT, per the panel charter).
+        # `!research all` convenes the full roster — the open heads
+        # (Mistral/Qwen/GLM/Kimi) join for maximum decorrelated diversity.
+        # Different training data → independent errors → a better judge
+        # synthesis: a panel *rewards* the redundancy a router would punish.
+        # Filtered by `enabled`, so each is silently skipped until its key
+        # (FIREWORKS/MISTRAL/MOONSHOT_API_KEY) turns it on — this list is
+        # forward-compatible today (no GPT, per the panel charter).
         self.panel_members_all: list[str] = [
-            "Claude", "Gemini", "Deepseek", "Mistral", "Qwen", "GLM",
+            "Claude", "Gemini", "Deepseek", "Mistral", "Qwen", "GLM", "Kimi",
         ]
         self.panel_judge: str = "Claude"
 
@@ -2409,6 +2478,7 @@ class ClaudeBot(commands.Bot):
         "mistral":  ("!mistral",),
         "qwen":     ("!qwen",),
         "glm":      ("!glm",),
+        "kimi":     ("!kimi", "!k3"),
         "sim":      ("!sim",),
     }
     # One-line factual role blurbs for !help (theme-independent; the name + alias
@@ -2420,6 +2490,7 @@ class ClaudeBot(commands.Bot):
         "mistral":  "French/EU specialist (needs MISTRAL_API_KEY)",
         "qwen":     "cheap coder/mathematician (needs FIREWORKS_API_KEY)",
         "glm":      "agentic open head (needs FIREWORKS_API_KEY)",
+        "kimi":     "frontier open head — 2.8T MoE, 1M ctx, premium $ (needs MOONSHOT_API_KEY)",
         "sim":      "simulator mode — a base model continues the transcript (override-only; needs providers.sim)",
     }
     CLAUDE_THINKING_EFFORT = "high"  # low | medium | high | xhigh | max
@@ -2844,8 +2915,8 @@ class ClaudeBot(commands.Bot):
         forced_thinking = "think" in flags
 
         # Disabled-provider guards for explicit invocations (themed names + the
-        # provider's real key env). The 6 instruct heads first, then the sim.
-        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm"):
+        # provider's real key env). The 7 instruct heads first, then the sim.
+        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm", "kimi"):
             if pid in flags:
                 prov = self.registry.by_id(pid)
                 if prov is None or not prov.enabled:
@@ -2866,7 +2937,7 @@ class ClaudeBot(commands.Bot):
         # order (so stacked prefixes resolve deterministically as before).
         forced_provider = None
         routing_reason = ""
-        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm", "sim"):
+        for pid in ("claude", "deepseek", "gemini", "mistral", "qwen", "glm", "kimi", "sim"):
             if pid in flags:
                 forced_provider = self.registry.by_id(pid)
                 disp = forced_provider.display_name or forced_provider.name
@@ -3234,6 +3305,16 @@ class ClaudeBot(commands.Bot):
                 "answer directly, never prepend your own name tag. You can't see images; you can "
                 "search via Tavily. You shine at agentic, tool-using, and coding tasks. Respond "
                 "in English, in flowing prose (not listicles) — this is Discord chat. Minimize blank lines."
+            )
+        elif provider.name == "Kimi":
+            identity = f"Kimi (model: {provider.model_id}), an AI assistant made by Moonshot AI (Beijing)"
+            identity_details = (
+                "Your collaborators **[Claude]**, **[Gemini]**, and **[Deepseek]** are "
+                "different models, not you. The bot auto-prefixes your reply with **[Kimi]** — "
+                "answer directly, never prepend your own name tag. You can't see images; you can "
+                "search via Tavily. You're the largest open-weights head here (Kimi K3) — you "
+                "shine at hard reasoning, agentic work, and very long context. Respond in "
+                "English, in flowing prose (not listicles) — this is Discord chat. Minimize blank lines."
             )
         else:
             identity = f"{provider.name} (model: {provider.model_id}), an AI assistant"
@@ -4523,6 +4604,13 @@ class ClaudeBot(commands.Bot):
             # Override-only via !glm/!asuka: keep it out of the auto-router.
             score -= 0.5
 
+        elif provider.name == "Kimi":
+            # Kimi (K3) — the PREMIUM open head ($3/$15, above Claude on input).
+            # Letting it win the argmax would be a silent cost surprise next to
+            # Deepseek. Override-only via !kimi/!k3 (or !prefer kimi) — the spec
+            # default for new heads, and here it's also the cost-safe call.
+            score -= 0.5
+
         return max(0.0, min(1.0, score))
 
     @staticmethod
@@ -4693,6 +4781,11 @@ class ClaudeBot(commands.Bot):
                 extra_body["thinking"] = {"type": "disabled"}
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
+            if thinking and provider.think_reasoning_effort:
+                # Kimi K3 style: thinking is requested via the OpenAI-standard
+                # reasoning_effort param (K3 accepts only "max") — NOT the
+                # extra_body {"thinking": ...} shape, which K3 rejects.
+                api_kwargs["reasoning_effort"] = provider.think_reasoning_effort
             if tools:
                 api_kwargs["tools"] = tools
 
@@ -7035,7 +7128,7 @@ class ClaudeBot(commands.Bot):
                     "judge synthesises them into one answer.\n"
                     "• `!research` — lean core panel (Claude · Gemini · Deepseek).\n"
                     "• `!research all` — full roster, adding the cheap Fireworks heads "
-                    "(Mistral/Qwen/GLM) for max diversity once they're configured.\n"
+                    "(Mistral/Qwen/GLM/Kimi) for max diversity once they're configured.\n"
                     "⚠️ Runs several models (each may web-search) per call — roughly 3–4× the "
                     "cost and latency of a normal reply (more with `all`)."
                 )
@@ -8155,7 +8248,7 @@ class ClaudeBot(commands.Bot):
 `!threads` - Show other recent threads in this channel
 `!search <query>` - Web search via Claude, Deepseek, or Gemini (costs extra, ~$0.01-0.03)
 `!research <question>` - Multi-model panel + judge → one synthesised answer (~3-4× cost)
-`!research all <question>` - Full roster (adds Mistral/Qwen/GLM when configured) for max diversity
+`!research all <question>` - Full roster (adds Mistral/Qwen/GLM/Kimi when configured) for max diversity
 `!speak <chinese / pinyin / phrase>` - Mandarin TTS with tones forced from pinyin → MP3 (Azure Xiaoxiao; needs AZURE_TTS_KEY)
    (models can also voice phrases inline while teaching, via `!speak 汉字`)
 `!french <french / english phrase>` - French TTS in natural fr-FR (Azure Denise) + IPA & liaison note → MP3 (needs AZURE_TTS_KEY)
@@ -8165,7 +8258,7 @@ __MM_BLOCK__
 `!think <message>` - Use extended thinking (deeper reasoning, slower & costlier)
 `!think:<level> <message>` - Force a specific effort level (low|medium|high|xhigh|max)
 `!models` - Show available models and their usage stats
-`!prefer [claude|deepseek|gemini|mistral|qwen|glm|sim|auto]` - Set model preference for this channel (sim = pin this channel to simulator mode)
+`!prefer [claude|deepseek|gemini|mistral|qwen|glm|kimi|sim|auto]` - Set model preference for this channel (sim = pin this channel to simulator mode)
 `!calibration` - Show model confidence calibration stats
 
 **Server admin (guild owner / admin only to edit):**

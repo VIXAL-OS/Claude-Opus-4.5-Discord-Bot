@@ -8,7 +8,7 @@
   "default_model": "auto",
   "channel_preferences": {},
 
-  "_comment": "Get channel IDs via Discord Developer Mode -> right-click a channel. platform is 'discord' (Slack lands in Phase 4). default_model: 'auto' or any provider id (claude/deepseek/gemini/mistral/qwen/glm). channel_preferences maps channel-ID strings to a provider id.",
+  "_comment": "Get channel IDs via Discord Developer Mode -> right-click a channel. platform is 'discord' (Slack lands in Phase 4). default_model: 'auto' or any provider id (claude/deepseek/gemini/mistral/qwen/glm/kimi). channel_preferences maps channel-ID strings to a provider id.",
 
   "_servers_comment": "OPTIONAL per-server system-prompt overrides, keyed by GUILD id string (right-click the server icon -> Copy Server ID; the bot also prints each guild's id at startup). Per guild: 'context' replaces the 'context about this server' block, 'pluralkit' (true|false — a real JSON boolean, not \"false\") toggles the PluralKit/plurality section. 'server_default' applies to any guild NOT listed; omit both -> every guild uses the built-in GENERIC default (knows nothing about who's there). You can also edit these live in Discord with `!server_context set <text>` / `!server_context pluralkit on|off` (admin-only; writes back to config.json). Keep real names/personal context ONLY in this git-ignored config.json — the committed example stays generic.",
   "server_default": {},
@@ -23,7 +23,7 @@
     }
   },
 
-  "_theme_comment": "Cosmetic flavor skin (display-only — never changes the canonical [Claude]-style label or routing). 'eva' (default; MAGI cast + !balthasar/!melchior/!caspar/!mari/!rei/!asuka), 'isaic' (twelve tribes; !judah/!joseph/!zebulun/!naphtali/!benjamin/!gad), or 'nightvale' (the five heads of Hiram McDaniels; !gold/!blue/!green/!violet/!gray + !carlos/!faceless). Canonical bare prefixes (!claude/!deepseek/...) always work in every theme.",
+  "_theme_comment": "Cosmetic flavor skin (display-only — never changes the canonical [Claude]-style label or routing). 'eva' (default; MAGI cast + !balthasar/!melchior/!caspar/!mari/!rei/!asuka/!kaworu), 'isaic' (twelve tribes; !judah/!joseph/!zebulun/!naphtali/!benjamin/!gad/!issachar), or 'nightvale' (the five heads of Hiram McDaniels; !gold/!blue/!green/!violet/!gray + !carlos/!glowcloud/!faceless). Canonical bare prefixes (!claude/!deepseek/...) always work in every theme.",
 
   "_providers_comment": "OPTIONAL. Omit the whole 'providers' block to keep default behavior (every provider enabled iff its API key is present, on its default backend). When present it OVERRIDES per-provider: 'enabled' (force off), 'backend' (toggle), 'model' (slug override), 'routing_tags' (reserved, not yet wired into routing). A per-backend sub-block (e.g. self_hosted) overrides that backend's base_url/model.",
 
@@ -34,8 +34,9 @@
     "mistral":  { "enabled": true, "backend": "api" },
     "qwen":     { "enabled": true },
     "glm":      { "enabled": true },
+    "kimi":     { "enabled": true, "backend": "api" },
 
-    "_backend_options": "deepseek.backend: 'api' (China, default) | 'fireworks' (US/ZDR, shares FIREWORKS_API_KEY) | 'self_hosted'. mistral.backend: 'api' (EU api.mistral.ai, default) | 'together' (US, TOGETHER_API_KEY) | 'self_hosted'. gemini.backend: 'developer_api' (default) | 'vertex' (needs GCP ADC + google-cloud-aiplatform).",
+    "_backend_options": "deepseek.backend: 'api' (China, default) | 'fireworks' (US/ZDR, shares FIREWORKS_API_KEY) | 'self_hosted'. mistral.backend: 'api' (EU api.mistral.ai, default) | 'together' (US, TOGETHER_API_KEY) | 'self_hosted'. gemini.backend: 'developer_api' (default) | 'vertex' (needs GCP ADC + google-cloud-aiplatform). kimi.backend: 'api' (China api.moonshot.ai, default) | 'fireworks' (NOT LIVE until K3 lands on Fireworks serverless — weights drop 2026-07-27).",
     "_self_hosted_example": "{ \"enabled\": true, \"backend\": \"self_hosted\", \"self_hosted\": { \"base_url\": \"http://localhost:8000/v1\", \"model\": \"deepseek-v4-flash\" } }  -> billed as 'local' (electricity only, no per-token $)."
   }
 }

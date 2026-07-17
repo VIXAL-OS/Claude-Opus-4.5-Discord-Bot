@@ -2,7 +2,8 @@
 
 Single-file (`bot.py`) multi-model Discord bot. EVA/MAGI-themed heuristic router over
 **Claude (Balthasar) · DeepSeek (Melchior) · Gemini (Caspar)** plus open-weight heads
-**Qwen (Rei) · GLM (Asuka)** on Fireworks and **Mistral (Mari)** on its own EU API. Two-tier memory,
+**Qwen (Rei) · GLM (Asuka)** on Fireworks, **Mistral (Mari)** on its own EU API, and
+**Kimi K3 (Kaworu)** on Moonshot's own API (`MOONSHOT_API_KEY`, override-only). Two-tier memory,
 prompt caching, bookclub mode, Mandarin (`!speak`) + French (`!french`) TTS,
 research panel (`!research`), simulator mode (`!dummy` — base-model transcript completion),
 and cost + carbon tracking.
@@ -71,6 +72,28 @@ byte-for-byte the old behavior):
 ---
 
 ## Status — 2026-06-27
+
+### ✅ Kimi K3 added as the 7th head (2026-07-17)
+`KIMI_PROVIDER` (`id="kimi"`, name `Kimi` — canonical, never rename): Moonshot's **Kimi K3**
+(released 2026-07-16 — 2.8T sparse MoE, 16-of-896 experts ≈ ~50B active, Kimi Delta Attention, 1M
+ctx, largest open-weights model; weights themselves drop 2026-07-27). OpenAI-compatible on
+`https://api.moonshot.ai/v1`, gated by **`MOONSHOT_API_KEY`** (graceful degradation — absent ⇒ only
+Kimi disabled). Pricing $3/$15 per Mtok, automatic server-side cache hits at $0.30/M
+(DeepSeek-style; ⚠️ VERIFY the usage-field name for hits on first live `!cost`). **Override-only in
+routing** (`!kimi`/`!k3`, `!prefer kimi`) — it's the PREMIUM open head, above Claude on input, so
+the argmax penalty is cost-safety, not just spec default. **Thinking quirk:** K3 takes only
+`reasoning_effort="max"` and REJECTS the K2-era `extra_body {"thinking": ...}` — new provider field
+`think_reasoning_effort` + a shim branch sends it when `!think` is on (⚠️ VERIFY on first live
+`!think !kimi`). Themes: eva `!kaworu` (Fifth Child), isaic `!issachar` (the scholar tribe),
+nightvale `!glowcloud`/`!allhail` (the Glow Cloud, ALL HAIL). In `panel_members_all` (`!research
+all` is now up to 7 members when all keys are set). `backends` carries a **`fireworks` stub that is
+NOT LIVE** — Fireworks is Moonshot's day-0 partner and K3 weights drop 7/27, so the US/ZDR route
+(what the Slack bot would need) is expected soon; slug+pricing in the stub are guesses flagged
+VERIFY. **Deliberately NOT ported to isaic-slack-bot yet** (Sarah's call: China-resident API stays
+off the lab bot; revisit when K3 lands on Fireworks serverless). Offline-validated:
+`scratchpad/test_kimi_provider.py` (28/28 — constant shape, order, label strip, cost math, themes,
+registry key-gating both ways, reasoning_effort shim branch). ⚠️ Owes live smoke tests: `!kimi`
+round-trip, `!think !kimi`, cache-hit accounting in `!cost`, and a `!research all` with 7 members.
 
 ### ✅ `!load_text` accepts PDFs (2026-07-16)
 Bookclub `!load_text` now takes `.pdf` attachments alongside `.txt`/`.html`/`.md`. `pypdf` is a new
