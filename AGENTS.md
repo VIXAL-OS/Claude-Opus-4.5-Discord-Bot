@@ -1,15 +1,14 @@
-# CLAUDE.md — Hydra (Opus-Deipseek)
+# AGENTS.md — Hydra (Opus-Deipseek)
 
 Single-file (`bot.py`) multi-model Discord bot. EVA/MAGI-themed heuristic router over
-**Claude (Balthasar) · DeepSeek (Melchior) · Gemini (Caspar)** plus open-weight heads
-**Qwen (Rei) · GLM (Asuka)** on Fireworks, **Mistral (Mari)** on its own EU API, and
-**Kimi K3 (Kaworu)** on Moonshot's own API (`MOONSHOT_API_KEY`, override-only). Two-tier memory,
+**Codex (Balthasar) · DeepSeek (Melchior) · Gemini (Caspar)** plus open-weight heads
+**Qwen (Rei) · GLM (Asuka)** on Fireworks and **Mistral (Mari)** on its own EU API. Two-tier memory,
 prompt caching, bookclub mode, Mandarin (`!speak`) + French (`!french`) TTS,
 research panel (`!research`), simulator mode (`!dummy` — base-model transcript completion),
 and cost + carbon tracking.
 
 This file is the working status + remaining-work tracker for the "Hydra Restructure"
-spec. The full spec lives outside the repo (Sarah's Claude.ai artifact); this file is
+spec. The full spec lives outside the repo (Sarah's Codex.ai artifact); this file is
 self-contained — you don't need it to pick up the remaining work below.
 
 ## Run / verify
@@ -37,7 +36,7 @@ self-contained — you don't need it to pick up the remaining work below.
   lowercase config key — is separate; it keys `config.json` + `self.clients`.) Display names and
   command aliases are a separate theme layer on top (see naming below).
 - **Dispatch** routes on `provider.sdk_type` (`anthropic` | `openai_compatible` | `gemini`), set by
-  the registry. Claude → anthropic SDK; Gemini bookclub → native `cachedContents` (or Vertex
+  the registry. Codex → anthropic SDK; Gemini bookclub → native `cachedContents` (or Vertex
   `CachedContent` when `backend="vertex"`); everything else → the OpenAI-compatible shim
   (`_generate_openai_compatible_response`) via `self.clients[provider.id]`. Per-provider wiring lives
   in the registry, not `__init__`.
@@ -55,17 +54,17 @@ Themes are a **display-only skin**: `Flavor`/`Theme`/`THEMES` (just after `SIM_P
 `provider.id` → themed display name + command aliases + a persona note. Read in
 `ProviderRegistry.from_config` (mirrors the `platform` toggle), applied onto `provider.display_name`
 and the `self.alias_to_flag` map built in `__init__`. **The canonical `provider.name`, the
-`**[Claude]**` label, and `MODEL_LABEL_NAMES` never change** — a Judah/Gold-Head turn is still
-labeled `[Claude]` on the wire. Canonical bare prefixes (`!claude`/`!deepseek`/…) + `!think` work in
+`**[Codex]**` label, and `MODEL_LABEL_NAMES` never change** — a Judah/Gold-Head turn is still
+labeled `[Codex]` on the wire. Canonical bare prefixes (`!Codex`/`!deepseek`/…) + `!think` work in
 every theme; the theme only *adds* its flavor aliases. Three sets ship (default **`eva`** ⇒
 byte-for-byte the old behavior):
 - **`eva` — EVA/MAGI** (default). Trinity Balthasar/Melchior/Caspar; pilots Mistral=Mari (`!mari`),
   Qwen=Rei (`!rei`), GLM=Asuka (`!asuka`); sim=Dummy Plug (`!dummy`).
-- **`isaic` — ISAIC** ("International System of AI Coopertition"), the twelve tribes: Judah=Claude
+- **`isaic` — ISAIC** ("International System of AI Coopertition"), the twelve tribes: Judah=Codex
   (`!judah`), Joseph=Gemini (`!joseph`), Zebulun=DeepSeek (`!zebulun`), Naphtali=Mistral
   (`!naphtali`), Benjamin=Qwen (`!benjamin`), Gad=GLM (`!gad`), Levi=sim (`!levi`). **Now in code**
   (was docs-only); it's also the Slack bot's default skin (Phase 4).
-- **`nightvale` — the five heads of Hiram McDaniels** (+ residents): Gold=Claude (`!gold`),
+- **`nightvale` — the five heads of Hiram McDaniels** (+ residents): Gold=Codex (`!gold`),
   Blue=Gemini (`!blue`), Green=DeepSeek (`!green`), Violet=Mistral (`!violet`/`!purple`), Gray=Qwen
   (`!gray`/`!grey`); plus Carlos=GLM (`!carlos`) and the Faceless Old Woman=sim (`!faceless`).
 
@@ -73,44 +72,9 @@ byte-for-byte the old behavior):
 
 ## Status — 2026-06-27
 
-### ✅ Kimi K3 added as the 7th head (2026-07-17)
-`KIMI_PROVIDER` (`id="kimi"`, name `Kimi` — canonical, never rename): Moonshot's **Kimi K3**
-(released 2026-07-16 — 2.8T sparse MoE, 16-of-896 experts ≈ ~50B active, Kimi Delta Attention, 1M
-ctx, largest open-weights model; weights themselves drop 2026-07-27). OpenAI-compatible on
-`https://api.moonshot.ai/v1`, gated by **`MOONSHOT_API_KEY`** (graceful degradation — absent ⇒ only
-Kimi disabled). Pricing $3/$15 per Mtok, automatic server-side cache hits at $0.30/M
-(DeepSeek-style; ⚠️ VERIFY the usage-field name for hits on first live `!cost`). **Override-only in
-routing** (`!kimi`/`!k3`, `!prefer kimi`) — it's the PREMIUM open head, above Claude on input, so
-the argmax penalty is cost-safety, not just spec default. **Thinking quirk:** K3 takes only
-`reasoning_effort="max"` and REJECTS the K2-era `extra_body {"thinking": ...}` — new provider field
-`think_reasoning_effort` + a shim branch sends it when `!think` is on (⚠️ VERIFY on first live
-`!think !kimi`). Themes: eva `!kaworu` (Fifth Child), isaic `!issachar` (the scholar tribe),
-nightvale `!glowcloud`/`!allhail` (the Glow Cloud, ALL HAIL). In `panel_members_all` (`!research
-all` is now up to 7 members when all keys are set). `backends` carries a **`fireworks` stub that is
-NOT LIVE** — Fireworks is Moonshot's day-0 partner and K3 weights drop 7/27, so the US/ZDR route
-(what the Slack bot would need) is expected soon; slug+pricing in the stub are guesses flagged
-VERIFY. **Deliberately NOT ported to isaic-slack-bot yet** (Sarah's call: China-resident API stays
-off the lab bot; revisit when K3 lands on Fireworks serverless). Offline-validated:
-`scratchpad/test_kimi_provider.py` (28/28 — constant shape, order, label strip, cost math, themes,
-registry key-gating both ways, reasoning_effort shim branch). ⚠️ Owes live smoke tests: `!kimi`
-round-trip, `!think !kimi`, cache-hit accounting in `!cost`, and a `!research all` with 7 members.
-
-### ✅ `!load_text` accepts PDFs (2026-07-16)
-Bookclub `!load_text` now takes `.pdf` attachments alongside `.txt`/`.html`/`.md`. `pypdf` is a new
-optional dep (import-guarded like bs4 — missing ⇒ a pip-install hint, everything else unaffected; in
-requirements.txt). Module-level `_extract_pdf_text(data) -> (text, page_count)` right after the
-guard: opens owner-password-only "encrypted" PDFs with the empty user password, raises user-facing
-`ValueError`s for truly locked PDFs and for scanned/image-only PDFs (no extractable text — OCR is
-deliberately out of scope). Binary fetch via new manager `_fetch_file_bytes`; extraction runs in
-`asyncio.to_thread` (CPU-bound). Thin-extraction heuristic (<100 chars/page avg) appends a ⚠️ to the
-load summary instead of failing. Same `ReadingMaterial` path afterward, so chapter detection /
-`!scope` / caching all apply. Offline-validated: `scratchpad/test_pdf_load.py` (16/16 — real
-matplotlib-generated PDFs, both encryption shapes, blank pages, garbage bytes) + import gate with
-pypdf blocked (`_HAS_PYPDF=False`, bot imports fine).
-
 ### ✅ `!research` panel: Gemini `thought_signature` 400 + DeepSeek tool-call dump (2026-07-10)
 Two failures, both in the **shared tool loop** of `_generate_openai_compatible_response` — which
-Gemini uses more than you'd think: `_panel_complete` routes everything non-Claude through the shim,
+Gemini uses more than you'd think: `_panel_complete` routes everything non-Codex through the shim,
 and `_generate_response` only picks the native Gemini path when reading material is loaded or
 `backend="vertex"`. **Plain `!gemini` chat goes through the shim too.**
 - **Gemini 400 "Function call is missing a thought_signature" (fixed).** Gemini 3 thinking models
@@ -141,7 +105,7 @@ and `_generate_response` only picks the native Gemini path when reading material
   (the old `text[:120]` truncation is what hid this outage); the footer **names** failed members
   instead of `1 member(s) failed`; the judge's own output is now checked with `_is_provider_error`
   and a judge failure falls back to posting the raw panel answers instead of publishing
-  `Claude Error 529: overloaded` as the synthesis; `_panel_complete` finally forwards `thinking=` on
+  `Codex Error 529: overloaded` as the synthesis; `_panel_complete` finally forwards `thinking=` on
   the openai path; the cost multiplier counts members *attempted*, not survivors.
 - Offline-validated: `scratchpad/test_panel_fixes.py` (31/31 — true positives, false-positive guards,
   signature round-trip incl. `_strip_internal_keys` + JSON serialization); syntax + import gates pass.
@@ -182,7 +146,7 @@ all offline-validated (`scratchpad/test_cache_fixes.py`, 20/20; import/syntax ga
   creates/refreshes/deletes cleanly end-to-end.
 
 ### ✅ `!research` judge now verifies instead of dismissing post-cutoff facts (2026-07-08)
-The Claude judge (`_judge`) was called with `claude_tools=[]` (web search **off** — "synthesise from
+The Codex judge (`_judge`) was called with `claude_tools=[]` (web search **off** — "synthesise from
 answers given") and a prompt telling it to "flag claims that look unsupported", with no cutoff
 awareness. Result: real products released after its training cutoff (e.g. a June-2026 model) looked
 "unsupported" → it declared them fabricated ("confirmed vapor") with false confidence. Fix:
@@ -250,7 +214,7 @@ awareness. Result: real products released after its training cutoff (e.g. a June
 - **Routing — intentional deviation from the spec.** The spec said new heads "override-only."
   Per Sarah's call that cheap models should earn routing: **Qwen is in the auto-router as the
   cheap coder/mathematician** (wins routine code/math, hands complex/careful work back to
-  Claude), **Mistral gets a narrow French-intent nudge**, **GLM stays override-only**.
+  Codex), **Mistral gets a narrow French-intent nudge**, **GLM stays override-only**.
   ⚠️ Do NOT "fix" this back to all-override-only — it's deliberate.
 - **Beyond the spec (Sarah's additions):**
   - `!research all` — opt-in 6-model panel (plain `!research` stays the lean core trio).
@@ -284,7 +248,7 @@ awareness. Result: real products released after its training cutoff (e.g. a June
   - **Working-note extraction hardened.** All 5 generators + both web-search paths now call one
     `_extract_notes(text, guild_id)` helper (compiled `_NOTE_RE`, **case-insensitive** so
     `[Note:]`/`[NOTE:]` are caught, idempotent so it doubles as a safety net). Fixes a real leak:
-    `_web_search` (Claude native) and the grounded-Gemini `!search` branch returned model text
+    `_web_search` (Codex native) and the grounded-Gemini `!search` branch returned model text
     straight to Discord WITHOUT stripping `[note:]`, so a note tacked onto a `!search` answer leaked
     into the message.
 
@@ -362,7 +326,7 @@ Introduce a `ChatPlatform` protocol; make `ClaudeBot`/`ConversationManager` depe
 of `discord.py` directly. Extract `DiscordAdapter` (wrap existing logic, don't rewrite behavior);
 build `SlackAdapter` on `slack_bolt` in **Socket Mode** (no public URL). Specifics:
 - Threads → `thread_ts`; 👍/👎 calibration → `reaction_added`/`reaction_removed`; files →
-  `files_upload_v2`; `!claude`-style commands → slash commands or `app_mention` parse.
+  `files_upload_v2`; `!Codex`-style commands → slash commands or `app_mention` parse.
 - **Re-key persistence** `memories.json` on `(platform, team/guild, channel)` + a migration that
   namespaces existing Discord keys under `discord:<guild>` (else Discord/Slack clobber each other).
 - **Formatting:** Slack is mrkdwn + Block Kit, not Markdown — audit every emit (code fences, bold,

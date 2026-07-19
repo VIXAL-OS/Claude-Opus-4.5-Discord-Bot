@@ -331,14 +331,34 @@ With `completions_mode=true` on any completions endpoint (a small self-hosted ba
 
 [Hermes Agent](https://hermes-agent.org/) is Nous Research's open-source (MIT), model-agnostic agent harness — not a coding CLI but a long-running personal-assistant/automation harness with a built-in self-improving skill loop. It is adopted **alongside** Hydra, never merged into it.
 
+> **2026-07 update — two upstream releases since this section was written:**
+> - **v0.18.0 "Judgement" (2026-07-01).** Vertex is now a first-class Hermes provider (short-lived
+>   OAuth2 minted from service-account JSON / ADC, no static key; rides Vertex's OpenAI-compatible
+>   endpoint) — so all three hardened endpoints below are natively supported, and it shares the
+>   exact GCP prerequisites as Hydra's own Phase 2 `vertex` backend (one service account covers
+>   both). Mixture-of-Agents ships as a selectable **virtual model** (N reference models → an
+>   aggregator synthesizes; any mix of providers) — Hermes's native analogue of the `!research`
+>   panel+judge. `/learn` distills reusable skills from directories, URLs, or a just-finished
+>   workflow; `/journey` shows (and lets you edit/delete) accumulated memories + skills. Cron jobs
+>   are continuable, deliver natively to Slack (Block Kit) and Discord, and **cron `base_url`
+>   overrides are now blocked** (directly serves §10.3's egress discipline). A one-shot LLM helper
+>   + `llm.oneshot` gateway RPC give the delegation bridge a concrete programmatic surface, and
+>   the gateway scales to zero when idle — good fit for a co-located instance.
+> - **Hermes Cloud (2026-07-08, preview).** Nous-hosted agents provisioned from Nous Portal (pick
+>   model + server size; org-wide provisioning, access controls, unified billing; Telegram/
+>   Discord/Slack/Email/CLI surfaces). **Ruled out for the lab variant:** the agent runtime —
+>   memory, trajectories, prompts — lives on Nous infrastructure, the exact opposite of §10.3.
+>   Fine for a personal, non-sensitive Hermes; the lab self-hosts and hand-sets providers.
+
 ### 10.1 Why Hermes for the lab (capability → need)
 | Hermes capability | Lab need it serves |
 |---|---|
-| Local-first + model-agnostic (any OpenAI-compatible endpoint) | Point it at the **same hardened endpoints** from the Hydra registry — Fireworks (US/ZDR), self-hosted DeepSeek, or Vertex — so sensitive prompts stay on no-train/no-egress infra |
-| Self-improving skills, auto-created from successful trajectories (agentskills.io-portable) | Recurring workflows (lit extraction, analysis pipelines) crystallize into shareable team skills — less repeated prompting |
+| Local-first + model-agnostic (any OpenAI-compatible endpoint; Vertex first-class since v0.18.0) | Point it at the **same hardened endpoints** from the Hydra registry — Fireworks (US/ZDR), self-hosted DeepSeek, or Vertex — so sensitive prompts stay on no-train/no-egress infra |
+| Self-improving skills, auto-created from successful trajectories (agentskills.io-portable) + `/learn` (v0.18.0) distilling skills on demand from directories/URLs/finished workflows | Recurring workflows (lit extraction, analysis pipelines) crystallize into shareable team skills — less repeated prompting. `/learn` can ingest lab protocol docs directly — but whatever it reads transits the configured endpoint, so sensitive docs only against hardened/self-hosted |
+| `/journey` — editable timeline of accumulated memories + skills (v0.18.0) | Audit surface: inspect and prune what the agent crystallized from lab data before it propagates into shared skills |
 | Persistent cross-session memory | Project/domain context (BandR conventions, datasets, target endpoints) persists across sessions |
-| Scheduled automations (cron) with delivery to any platform | Nightly literature scans, periodic data QA, scheduled report posts into the lab channel |
-| Subagent delegation + parallel workstreams | Native version of the `!research` fan-out: lit-search ∥ analysis ∥ drafting |
+| Scheduled automations (cron) with delivery to any platform (v0.18.0: continuable jobs, native Slack Block Kit + Discord delivery, `base_url` overrides blocked) | Nightly literature scans, periodic data QA, scheduled report posts into the lab channel |
+| Subagent delegation + parallel workstreams; MoA virtual models (v0.18.0: reference models → aggregator) | Native version of the `!research` fan-out: lit-search ∥ analysis ∥ drafting. MoA is the closest analogue of panel+judge — mind the per-turn token multiplier |
 | Programmatic tool calling (`execute_code` collapses pipelines into single inference calls) | Fewer round-trips = fewer tokens = lower spend (matters on a strapped budget) |
 | MCP support | Connect lab data sources / tools |
 | Trajectory export + RL-data generation | Optional bridge if the lab ever fine-tunes a domain model (e.g., a neuro-literature model) |
@@ -347,18 +367,25 @@ With `completions_mode=true` on any completions endpoint (a small self-hosted ba
 **Pattern: Hydra stays the chat front-end + provider router (§§1–8); Hermes is a co-located agentic engine; a thin bridge delegates heavy/long-horizon/scheduled tasks to Hermes and surfaces results back in the channel.** Do **not** merge the codebases.
 
 Three seams (adopt per need):
-1. **Delegation hand-off (primary).** Add a command tier — route the existing `!research`, or add `/task` / `/deep` — that hands the prompt to the local Hermes agent (via its CLI / socket / local API), streams the trajectory and final result back to the channel through Hydra's existing `send_text` / `send_file` path. Hermes runs model-agnostic against the **same registry endpoints** (Fireworks US/ZDR for Qwen/Mistral/GLM/DeepSeek, self-hosted DeepSeek, or Vertex). Hydra stays the I/O surface; Hermes does the multi-step work.
-2. **Scheduled delivery (cron).** Use Hermes's built-in cron + platform delivery to run scheduled lab jobs and post results directly into the lab channel. Register Hydra's channel as the delivery target (or relay through it).
+1. **Delegation hand-off (primary).** Add a command tier — route the existing `!research`, or add `/task` / `/deep` — that hands the prompt to the local Hermes agent (via its CLI or gateway RPC — v0.18.0's one-shot helper / `llm.oneshot` RPC is the natural fit for single-task hand-offs), streams the trajectory and final result back to the channel through Hydra's existing `send_text` / `send_file` path. Hermes runs model-agnostic against the **same registry endpoints** (Fireworks US/ZDR for Qwen/Mistral/GLM/DeepSeek, self-hosted DeepSeek, or Vertex). Hydra stays the I/O surface; Hermes does the multi-step work.
+2. **Scheduled delivery (cron).** Use Hermes's built-in cron + platform delivery to run scheduled lab jobs and post results directly into the lab channel. Register Hydra's channel as the delivery target (or relay through it). As of v0.18.0 delivery to Slack (Block Kit) and Discord is native and jobs are continuable, so this seam is mostly configuration — no relay code needed unless the lab wants Hydra's formatting/cost-tracking on the way through.
 3. **Shared skills/memory (optional).** Adopt the agentskills.io skill format so skills are portable between Hermes and any Hydra-side tooling; key Hermes memory per project so BandR context persists.
 
 ### 10.3 Boundaries & constraints
 - **Two systems, one bridge.** Hydra = front-end/router (the §§1–8 work). Hermes = separate co-located service. The integration is a thin delegation/delivery bridge, not a fork or a rewrite of either.
-- **Provider-egress discipline (critical for sensitive work).** Hermes defaults can route to Nous Portal / OpenRouter. For the lab variant, **force Hermes onto the same hardened endpoints as the Hydra registry** — Fireworks (US, ZDR), self-hosted DeepSeek (no egress), or Vertex (residency) — and gate any genuinely patentable prompt to **self-hosted only**, since that's the one tier where nothing leaves the building. Treat Hermes's endpoint config as part of the data-security surface, not a convenience setting. Note: Fireworks US/ZDR is the right default for *most* lab work (no hardware, US, no-retention); reserve self-hosted for the prompts you can't let touch any third party at all.
-- **Cost containment.** The self-improvement loop and parallel subagents can burn tokens. Cap subagent parallelism, keep the cheap-model tier (Fireworks DeepSeek V4-Flash, Qwen Plus) for routine sub-tasks, lean on `execute_code` pipeline-collapsing to cut round-trips, and remember Fireworks prepaid auto-reload is your hard spend cap.
+- **Provider-egress discipline (critical for sensitive work).** Hermes defaults can route to Nous Portal / OpenRouter, and since 2026-07 the default onboarding actively funnels to Portal (one command: Portal OAuth → Nous inference provider → Portal Tool Gateway for search/TTS/browser) and to **Hermes Cloud** (Nous-hosted runtime). All of these move prompts — and with Cloud, the whole memory/trajectory store — onto Nous infrastructure: **ruled out for the lab.** For the lab variant, **force Hermes onto the same hardened endpoints as the Hydra registry** — Fireworks (US, ZDR), self-hosted DeepSeek (no egress), or Vertex (residency) — and gate any genuinely patentable prompt to **self-hosted only**, since that's the one tier where nothing leaves the building. Treat Hermes's endpoint config as part of the data-security surface, not a convenience setting. Note: Fireworks US/ZDR is the right default for *most* lab work (no hardware, US, no-retention); reserve self-hosted for the prompts you can't let touch any third party at all.
+- **Cost containment.** The self-improvement loop and parallel subagents can burn tokens. Cap subagent parallelism, keep the cheap-model tier (Fireworks DeepSeek V4-Flash, Qwen Plus) for routine sub-tasks, lean on `execute_code` pipeline-collapsing to cut round-trips, and remember Fireworks prepaid auto-reload is your hard spend cap. MoA (v0.18.0) multiplies every turn by the reference-model count plus an aggregator pass — keep presets small (or off) for routine work, same as `!research all` vs plain `!research`.
 - **Optional and isolated.** None of this touches the default (chat-only) Hydra. It is the research-variant add-on; the bot must run fully with Hermes absent.
 
 ### 10.4 Phase 5 acceptance (see also §6)
 A `/research`-class command runs a multi-step Hermes task against hardened endpoints (Fireworks US/ZDR or self-hosted), streams progress, and posts the result in-channel; **patentable prompts egress to no third party** (self-hosted tier); a scheduled Hermes job can post into the lab channel; the default Hydra deployment still runs with Hermes absent.
+
+### 10.5 Adjacent, not a replacement — Anima Labs' Connectome (principles to borrow)
+[Connectome](https://animalabs.ai/connectome) ([github.com/anima-research](https://github.com/anima-research); MIT, TypeScript/Node, research-grade — single-digit stars, daily commits as of 2026-07) is persistence infrastructure for agents that *exist* rather than execute tasks: **Chronicle** (append-only, git-like record store — branching, content-addressed blobs, causation-linked records), **Membrane** (participant-first LLM abstraction — multi-party conversations keep real speaker names through to the model instead of collapsing into user/assistant), **Context-Manager** (immutable message log split from editable working context; hierarchical *autobiographical* compression — the agent summarizes its own history in first person while the recent tail stays verbatim), an event-loop **agent-framework** (pluggable modules, turn checkpoints, ephemeral subagents), and **MCPL** ("MCP Live" — a backward-compatible MCP extension where servers push events, hook inference, and can request inference themselves; `discord-mcpl`, `slack-mcpl`, and `heartbeat-mcpl` servers exist). Too young to take as a dependency, and it solves a different problem than Hermes (continuity vs task automation) — but four principles map cleanly onto Hydra's roadmap:
+- **Participant-first messages (Membrane) → Phase 4.** When extracting `ChatPlatform`, keep speaker identity a first-class field on the message object rather than pre-baking it into content strings. Hydra's transcript formatter (§9.3) already wants exactly this, and it's what lets one abstraction serve chat mode, sim mode, and Slack.
+- **Degrade resolution, don't erase (Context-Manager) → two-tier memory.** Write the long-term summaries in the model's own first-person voice and keep the raw log append-only. Cheap change, better continuity across sessions, and the full history stays auditable instead of being overwritten in place.
+- **Heartbeat/wake-timer proactivity (MCPL) → §9.4 rung 2.** Ambient turn-taking is exactly a rate-limited periodic self-wake + next-speaker predictor. If rung 2 is ever built, copy the *heartbeat* shape (`heartbeat-mcpl`) rather than a message-triggered loop that can self-excite.
+- **Branching with causation (Chronicle) → "the loom".** An event-sourced, forkable timeline with causation links is the load-bearing idea behind §9.4 rungs 2–3. If simulator mode ever grows conversation forking, an append-only record with branch points beats mutating `memories.json`.
 
 ---
 
