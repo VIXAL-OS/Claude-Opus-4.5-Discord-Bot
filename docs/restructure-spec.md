@@ -331,7 +331,7 @@ With `completions_mode=true` on any completions endpoint (a small self-hosted ba
 
 [Hermes Agent](https://hermes-agent.org/) is Nous Research's open-source (MIT), model-agnostic agent harness — not a coding CLI but a long-running personal-assistant/automation harness with a built-in self-improving skill loop. It is adopted **alongside** Hydra, never merged into it.
 
-> **2026-07 update — two upstream releases since this section was written:**
+> **2026-07 updates — upstream releases since this section was written:**
 > - **v0.18.0 "Judgement" (2026-07-01).** Vertex is now a first-class Hermes provider (short-lived
 >   OAuth2 minted from service-account JSON / ADC, no static key; rides Vertex's OpenAI-compatible
 >   endpoint) — so all three hardened endpoints below are natively supported, and it shares the
@@ -349,6 +349,27 @@ With `completions_mode=true` on any completions endpoint (a small self-hosted ba
 >   Discord/Slack/Email/CLI surfaces). **Ruled out for the lab variant:** the agent runtime —
 >   memory, trajectories, prompts — lives on Nous infrastructure, the exact opposite of §10.3.
 >   Fine for a personal, non-sensitive Hermes; the lab self-hosts and hand-sets providers.
+> - **v0.19.0 "Quicksilver" (2026-07-20).** Strengthens the lab route on several fronts.
+>   **Fireworks is now a first-class provider** (cost estimation, promoted in the pickers) — the
+>   US/ZDR default no longer rides the generic OpenAI-compatible path. Providers can be
+>   **hard-disabled in config** (`enabled: false` per provider + `excluded_providers`) — concrete
+>   enforcement for §10.3's hardened-endpoint rule: switch Portal/OpenRouter off outright instead
+>   of just not selecting them. Cron gained a durable execution audit history and a **durable
+>   delivery-obligation ledger** for final responses (survives a gateway crash; Discord delivery
+>   recovers messages missed during reconnect) — seam 2's "mostly configuration" is now
+>   conservative. Delegation gained live subagent transcripts, durable background completions, and
+>   unified concurrency caps (`max_async_children` deprecated). MoA got native cost controls
+>   (`reference_max_tokens` caps advisor output; per-preset fanout cadence — `user_turn` runs
+>   advisors once per user turn, not every step). Sessions export to Markdown/Quarto/HTML/HF-ready
+>   traces with `--redact` (serves §10.1's trajectory-export row). Profile-based Discord message
+>   routing (one bot, multiple profiles per guild/channel) eases Hermes+Hydra coexisting in one
+>   server. ⚠️ New caveat: exact API bytes now persist in an `api_content` sidecar next to the
+>   session DB — sensitive prompts sit verbatim on local disk, so disk encryption/retention joins
+>   the §10.3 security surface. Meanwhile the Portal/Cloud funnel deepened (desktop Hermes Cloud
+>   connection mode, in-terminal `/subscription`/`/topup` billing, Portal usage tags on every
+>   auxiliary/MoA/delegate call) — confirming, not changing, the Cloud ruling. Post-release:
+>   `hermes sessions optimize-storage` (2026-07-22) shrinks session DBs ~60–78% (auto for <1GB);
+>   v0.19.1 (2026-07-30) is a bug-fix/salvage wave, nothing roadmap-relevant.
 
 ### 10.1 Why Hermes for the lab (capability → need)
 | Hermes capability | Lab need it serves |
@@ -357,11 +378,11 @@ With `completions_mode=true` on any completions endpoint (a small self-hosted ba
 | Self-improving skills, auto-created from successful trajectories (agentskills.io-portable) + `/learn` (v0.18.0) distilling skills on demand from directories/URLs/finished workflows | Recurring workflows (lit extraction, analysis pipelines) crystallize into shareable team skills — less repeated prompting. `/learn` can ingest lab protocol docs directly — but whatever it reads transits the configured endpoint, so sensitive docs only against hardened/self-hosted |
 | `/journey` — editable timeline of accumulated memories + skills (v0.18.0) | Audit surface: inspect and prune what the agent crystallized from lab data before it propagates into shared skills |
 | Persistent cross-session memory | Project/domain context (BandR conventions, datasets, target endpoints) persists across sessions |
-| Scheduled automations (cron) with delivery to any platform (v0.18.0: continuable jobs, native Slack Block Kit + Discord delivery, `base_url` overrides blocked) | Nightly literature scans, periodic data QA, scheduled report posts into the lab channel |
-| Subagent delegation + parallel workstreams; MoA virtual models (v0.18.0: reference models → aggregator) | Native version of the `!research` fan-out: lit-search ∥ analysis ∥ drafting. MoA is the closest analogue of panel+judge — mind the per-turn token multiplier |
+| Scheduled automations (cron) with delivery to any platform (v0.18.0: continuable jobs, native Slack Block Kit + Discord delivery, `base_url` overrides blocked; v0.19.0: durable delivery-obligation ledger + execution audit history) | Nightly literature scans, periodic data QA, scheduled report posts into the lab channel |
+| Subagent delegation + parallel workstreams; MoA virtual models (v0.18.0: reference models → aggregator) | Native version of the `!research` fan-out: lit-search ∥ analysis ∥ drafting. MoA is the closest analogue of panel+judge — mind the per-turn token multiplier (v0.19.0 adds native caps: `reference_max_tokens`, per-preset fanout cadence) |
 | Programmatic tool calling (`execute_code` collapses pipelines into single inference calls) | Fewer round-trips = fewer tokens = lower spend (matters on a strapped budget) |
 | MCP support | Connect lab data sources / tools |
-| Trajectory export + RL-data generation | Optional bridge if the lab ever fine-tunes a domain model (e.g., a neuro-literature model) |
+| Trajectory export + RL-data generation (v0.19.0: native session export — Markdown/Quarto/HTML/HF-ready traces — with `--redact`) | Optional bridge if the lab ever fine-tunes a domain model (e.g., a neuro-literature model) |
 
 ### 10.2 Integration architecture
 **Pattern: Hydra stays the chat front-end + provider router (§§1–8); Hermes is a co-located agentic engine; a thin bridge delegates heavy/long-horizon/scheduled tasks to Hermes and surfaces results back in the channel.** Do **not** merge the codebases.
@@ -373,8 +394,8 @@ Three seams (adopt per need):
 
 ### 10.3 Boundaries & constraints
 - **Two systems, one bridge.** Hydra = front-end/router (the §§1–8 work). Hermes = separate co-located service. The integration is a thin delegation/delivery bridge, not a fork or a rewrite of either.
-- **Provider-egress discipline (critical for sensitive work).** Hermes defaults can route to Nous Portal / OpenRouter, and since 2026-07 the default onboarding actively funnels to Portal (one command: Portal OAuth → Nous inference provider → Portal Tool Gateway for search/TTS/browser) and to **Hermes Cloud** (Nous-hosted runtime). All of these move prompts — and with Cloud, the whole memory/trajectory store — onto Nous infrastructure: **ruled out for the lab.** For the lab variant, **force Hermes onto the same hardened endpoints as the Hydra registry** — Fireworks (US, ZDR), self-hosted DeepSeek (no egress), or Vertex (residency) — and gate any genuinely patentable prompt to **self-hosted only**, since that's the one tier where nothing leaves the building. Treat Hermes's endpoint config as part of the data-security surface, not a convenience setting. Note: Fireworks US/ZDR is the right default for *most* lab work (no hardware, US, no-retention); reserve self-hosted for the prompts you can't let touch any third party at all.
-- **Cost containment.** The self-improvement loop and parallel subagents can burn tokens. Cap subagent parallelism, keep the cheap-model tier (Fireworks DeepSeek V4-Flash, Qwen Plus) for routine sub-tasks, lean on `execute_code` pipeline-collapsing to cut round-trips, and remember Fireworks prepaid auto-reload is your hard spend cap. MoA (v0.18.0) multiplies every turn by the reference-model count plus an aggregator pass — keep presets small (or off) for routine work, same as `!research all` vs plain `!research`.
+- **Provider-egress discipline (critical for sensitive work).** Hermes defaults can route to Nous Portal / OpenRouter, and since 2026-07 the default onboarding actively funnels to Portal (one command: Portal OAuth → Nous inference provider → Portal Tool Gateway for search/TTS/browser) and to **Hermes Cloud** (Nous-hosted runtime). All of these move prompts — and with Cloud, the whole memory/trajectory store — onto Nous infrastructure: **ruled out for the lab.** For the lab variant, **force Hermes onto the same hardened endpoints as the Hydra registry** — Fireworks (US, ZDR), self-hosted DeepSeek (no egress), or Vertex (residency) — and gate any genuinely patentable prompt to **self-hosted only**, since that's the one tier where nothing leaves the building. Treat Hermes's endpoint config as part of the data-security surface, not a convenience setting. Note: Fireworks US/ZDR is the right default for *most* lab work (no hardware, US, no-retention); reserve self-hosted for the prompts you can't let touch any third party at all. v0.19.0 gives the discipline teeth — `enabled: false` per provider + `excluded_providers` disable Portal/OpenRouter outright — and adds one obligation: the `api_content` sidecar persists exact API bytes on local disk, so disk encryption/retention on the Hermes host is part of this same surface.
+- **Cost containment.** The self-improvement loop and parallel subagents can burn tokens. Cap subagent parallelism, keep the cheap-model tier (Fireworks DeepSeek V4-Flash, Qwen Plus) for routine sub-tasks, lean on `execute_code` pipeline-collapsing to cut round-trips, and remember Fireworks prepaid auto-reload is your hard spend cap. MoA (v0.18.0) multiplies every turn by the reference-model count plus an aggregator pass — keep presets small (or off) for routine work, same as `!research all` vs plain `!research`; v0.19.0's `reference_max_tokens` + `user_turn` fanout cadence are the native caps, and subagent parallelism is now bounded by the unified delegation concurrency caps (`max_async_children` is deprecated — don't reference it in configs).
 - **Optional and isolated.** None of this touches the default (chat-only) Hydra. It is the research-variant add-on; the bot must run fully with Hermes absent.
 
 ### 10.4 Phase 5 acceptance (see also §6)

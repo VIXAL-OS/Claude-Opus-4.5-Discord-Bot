@@ -354,7 +354,17 @@ native Slack (Block Kit) + Discord delivery (seam 2 is now mostly configuration)
 `base_url` overrides; the `llm.oneshot` gateway RPC is a concrete seam-1 hand-off surface. MoA
 virtual models (panel→aggregator ≈ `!research`+judge) and `/learn` (skills from directories/URLs)
 are useful but token-hungry / egress-sensitive — the hardened-endpoint rule extends to whatever
-they read. Spec §10.5 (new) collects principles borrowed from Anima Labs' Connectome for Phases
+they read. **v0.19.0 "Quicksilver"** (2026-07-20; full entry in spec §10) strengthens the bridge
+further: Fireworks is now a first-class Hermes provider (the US/ZDR default no longer rides the
+generic OpenAI-compatible path); providers can be hard-disabled (`enabled: false` /
+`excluded_providers` — turn Portal/OpenRouter off outright); cron delivery is durable
+(delivery-obligation ledger survives gateway crashes); delegation gained unified concurrency caps
+(`max_async_children` deprecated); MoA got cost caps (`reference_max_tokens`, per-turn fanout
+cadence). ⚠️ New caveat: an `api_content` sidecar persists exact API bytes on local disk — disk
+encryption/retention on the Hermes host joins the egress surface. The Portal/Cloud funnel
+meanwhile deepened (desktop Cloud connection mode, in-terminal billing, Portal usage tags on
+aux/MoA/delegate calls), confirming the self-host ruling; v0.19.1 (2026-07-30) is a bug-fix wave.
+Spec §10.5 (new) collects principles borrowed from Anima Labs' Connectome for Phases
 4/7 + memory; Connectome itself is research-grade, not a dependency.
 
 #### Phase 7 — Simulator mode (§9, rung 1) — *✅ code-complete, ⚠️ unverified (2026-06-27)*
