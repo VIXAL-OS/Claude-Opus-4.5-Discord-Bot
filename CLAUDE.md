@@ -3,7 +3,9 @@
 Single-file (`bot.py`) multi-model Discord bot. EVA/MAGI-themed heuristic router over
 **Claude (Balthasar) · DeepSeek (Melchior) · Gemini (Caspar)** plus open-weight heads
 **Qwen (Rei) · GLM (Asuka)** on Fireworks, **Mistral (Mari)** on its own EU API, and
-**Kimi K3 (Kaworu)** on Moonshot's own API (`MOONSHOT_API_KEY`, override-only). Two-tier memory,
+**Kimi K3 (Kaworu)** — Moonshot API by code default, but the live config.json overrides it onto
+Fireworks serverless (`providers.kimi.backend="fireworks"`, rides `FIREWORKS_API_KEY`; override-only
+in routing). Two-tier memory,
 prompt caching, bookclub mode, Mandarin (`!speak`) + French (`!french`) TTS,
 research panel (`!research`), simulator mode (`!dummy` — base-model transcript completion),
 and cost + carbon tracking.
@@ -41,10 +43,13 @@ self-contained — you don't need it to pick up the remaining work below.
   `CachedContent` when `backend="vertex"`); everything else → the OpenAI-compatible shim
   (`_generate_openai_compatible_response`) via `self.clients[provider.id]`. Per-provider wiring lives
   in the registry, not `__init__`.
-- **Model slugs drift** — verify in the live libraries. Fireworks (verified 2026-06):
-  `qwen3p7-plus`, `glm-5p2`, `deepseek-v4-pro` (under `accounts/fireworks/models/`). Mistral on
-  its own API uses `mistral-large-latest` (→ Mistral Large 3, released 2025-12, 675B/41B MoE,
-  Apache-2.0; priced $0.50/$1.50 per Mtok as of 2026-06 — a ~4× drop from Large 2). ⚠️ Large 3 is
+- **Model slugs drift** — verify in the live libraries. All heads re-verified 2026-08-02: Claude
+  `claude-opus-5`, DeepSeek `deepseek-v4-pro`, Gemini `gemini-3.1-pro-preview` (still no stable
+  3.1-pro), Fireworks `qwen3p7-plus` + `glm-5p2` (under `accounts/fireworks/models/`), Moonshot
+  `kimi-k3`. Mistral on its own API uses `mistral-large-latest` (→ Mistral Large 3, released
+  2025-12, 675B/41B MoE, Apache-2.0; $0.50/$1.50 per Mtok reconfirmed 2026-08 — note Mistral's
+  *frontier* is now Medium 3.5 / `mistral-medium-latest` at $1.50/$7.50, which the Large alias
+  will never pick up; Large stays the deliberate cheap+green pick). ⚠️ Large 3 is
   on Fireworks only as **on-demand/dedicated** (`mistral-large-3-fp8`), NOT serverless — so the
   own-API route stays correct AND is now the cheap one, not just the green one.
 - New-provider **pricing + energy constants are estimates** flagged `VERIFY` in comments —
@@ -71,7 +76,42 @@ byte-for-byte the old behavior):
 
 ---
 
-## Status — 2026-06-27
+## Status — 2026-08-02
+
+### ✅ Model refresh: Claude → Opus 5; every other head re-verified latest (2026-08-02)
+`claude-opus-4-8` → **`claude-opus-5`** (same $5/$25 + cache rates — drop-in, `!cost` math
+unchanged). ⚠️ The one behavior trap: **Opus 5 runs ADAPTIVE thinking when the `thinking` param is
+omitted** (on ≤4.8 omitted meant off), and thinking tokens share `max_tokens`. Handling (Sarah's
+call, same day): **plain turns run adaptive at a new LOW-effort tier** — `CLAUDE_PLAIN_EFFORT="low"`
++ `CLAUDE_PLAIN_MAX_TOKENS=8192` (headroom over the old 4096 cap, which thinking now shares) sent
+explicitly by the `_generate_claude_response` else-branch and both `_web_search` creates. The
+tiering keeps `!think` meaningful: plain chat / `!search` / bookclub recaps / G2P run adaptive-low;
+`!think` + the auto-effort heuristic escalate to adaptive high|xhigh|max (16K/64K caps, unchanged).
+**`!research` exception (Sarah's call):** Claude-as-panelist runs FULL thinking — adaptive-high +
+its default web_search, the same profile as the judge — so the premium head digs rather than skims
+(`_run_panel` passes `thinking=(provider is claude)`); non-Claude panelists keep thinking=False,
+and the judge keeps its 2026-07-08 adaptive-high + web_search setting. The ONE call still
+hard-disabled is
+`!summarize` (200-token cap — adaptive there would blow the cap AND crash `content[0].text` on a
+leading thinking block). Adaptive-on also removes the thinking-disabled tool-verbalization failure
+mode, so no prompt mitigation was needed.
+Non-Claude heads all re-verified CURRENT against official docs (see the slugs-drift bullet above):
+DeepSeek V4-Pro (Flash was silently refreshed to build 0731 behind the same slug), Gemini
+3.1-pro-preview (no stable 3.1-pro exists; no 3.2), Mistral Large 3 via `-latest`, Qwen 3.7 Plus,
+GLM 5.2, Kimi K3. Fireworks pricing constants corrected (old VERIFY flags resolved — Qwen
+$0.40/$1.60 cached $0.08, GLM cached $0.14) and the Kimi `fireworks` backend stub is now LIVE +
+verified (see the Kimi entry). Watch: GLM-5.5 (Zhipu targets Aug 2026) and Qwen3.8-Max (WAIC
+preview) are imminent but unreleased; DeepSeek peak-hour 2× surcharge announced, start TBA.
+Mirrored to **isaic-slack-bot** (core.py + theme.py + config.example.json + README — same Opus 5
+swap, adaptive-low plain tier, pricing fixes, **plus the full Kimi K3 port**; see the Kimi entry)
+and **discord-companion-bot**
+(`model_support` → `claude-opus-5` with `max_tokens_support` 4096→8192 for thinking headroom;
+`model_default` already Sonnet 5, classifier already Haiku 4.5; fixed a latent `content[0].text`
+crash in its `!summarize` — Sonnet 5 already defaults to adaptive thinking). The stale copy at
+`E:\Documents\Stuff\isaic-slack-bot` (2026-06-28) was left untouched. Syntax + import gates pass.
+⚠️ Owes live smokes: one plain `!claude`, one `!think !claude`, one `!search`, one `!summarize`,
+plus the first live `!kimi` and `!think !kimi` on the Fireworks backend (verify the Fireworks shim
+accepts `reasoning_effort` for kimi-k3 and reports cache hits in standard usage fields).
 
 ### ✅ Kimi K3 added as the 7th head (2026-07-17)
 `KIMI_PROVIDER` (`id="kimi"`, name `Kimi` — canonical, never rename): Moonshot's **Kimi K3**
@@ -86,11 +126,18 @@ the argmax penalty is cost-safety, not just spec default. **Thinking quirk:** K3
 `think_reasoning_effort` + a shim branch sends it when `!think` is on (⚠️ VERIFY on first live
 `!think !kimi`). Themes: eva `!kaworu` (Fifth Child), isaic `!issachar` (the scholar tribe),
 nightvale `!glowcloud`/`!allhail` (the Glow Cloud, ALL HAIL). In `panel_members_all` (`!research
-all` is now up to 7 members when all keys are set). `backends` carries a **`fireworks` stub that is
-NOT LIVE** — Fireworks is Moonshot's day-0 partner and K3 weights drop 7/27, so the US/ZDR route
-(what the Slack bot would need) is expected soon; slug+pricing in the stub are guesses flagged
-VERIFY. **Deliberately NOT ported to isaic-slack-bot yet** (Sarah's call: China-resident API stays
-off the lab bot; revisit when K3 lands on Fireworks serverless). Offline-validated:
+all` is now up to 7 members when all keys are set). `backends` carries a **`fireworks` route that
+went LIVE with the 2026-07-27 weights drop** — slug+pricing verified 2026-08-02
+(`accounts/fireworks/models/kimi-k3` at $3/$15/$0.30-cached, matching Moonshot's own rates;
+`routers/kimi-k3-us` is +10% for US-only/ZDR); the backend itself still owes a live smoke test.
+**Ported to isaic-slack-bot 2026-08-02** with the lab-bot delta inverted: there the DEFAULT backend
+is Fireworks serverless (rides FIREWORKS_API_KEY alongside Qwen/GLM; `moonshot` exists only as the
+non-default parity toggle — China-resident API stays off the lab bot). The Discord bot ALSO now
+runs Kimi via Fireworks, by operator override (`providers.kimi.backend="fireworks"` in the live
+git-ignored config.json) — same $3/$15/$0.30 rates, US grid, one bill; MOONSHOT_API_KEY is no
+longer required (delete the override to return to Moonshot). isaic port offline-validated:
+`isaic-slack-bot/scratchpad/test_kimi_provider.py` (32/32 — adds a moonshot backend-toggle
+round-trip scenario on top of the upstream 28). Upstream offline-validated:
 `scratchpad/test_kimi_provider.py` (28/28 — constant shape, order, label strip, cost math, themes,
 registry key-gating both ways, reasoning_effort shim branch). ⚠️ Owes live smoke tests: `!kimi`
 round-trip, `!think !kimi`, cache-hit accounting in `!cost`, and a `!research all` with 7 members.
@@ -243,7 +290,8 @@ awareness. Result: real products released after its training cutoff (e.g. a June
   models (vs `!unload`, which removes the shared `ReadingMaterial` for everyone). Idle caches also
   self-expire, so day-to-day neither is needed.
 - **Phase 1 — Qwen/GLM on Fireworks, Mistral on `api.mistral.ai`.** Qwen+GLM share one
-  Fireworks key (cached input = 0.5×input); Mistral is on its own EU API (`MISTRAL_API_KEY`)
+  Fireworks key (cached input: 0.2× for Qwen, 0.1× for GLM — the old 0.5× assumption was wrong,
+  corrected 2026-08-02); Mistral is on its own EU API (`MISTRAL_API_KEY`)
   because Mistral Large 3 isn't on Fireworks serverless — a happy accident: EU-resident + France
   ~nuclear grid (grid≈20 in `!cost`). Graceful degradation, EVA aliases, per-provider personas,
   in `!cost` and the `!research all` panel.
@@ -430,9 +478,12 @@ Rungs 2–3 (ambient turn-taking, webhook personas) and any Phase 4 / lab-adjace
 intentionally out of scope.
 
 ### Cross-cutting follow-ups
-- Verify **pricing**: Fireworks for `qwen3p7-plus` / `glm-5p2` (confirmed live 2026-06), and
-  `console.mistral.ai` for `mistral-large-latest` (updated 2026-06 to Large 3 = $0.50/$1.50; reconfirm
-  against the console). The **energy** constants (`est_wh_per_1k_tokens`, `train_tco2e`) are
+- ~~Verify **pricing**~~ — done 2026-08-02: Fireworks `qwen3p7-plus` ($0.40/$1.60, cached $0.08) /
+  `glm-5p2` ($1.40/$4.40, cached $0.14) / `kimi-k3` ($3/$15, cached $0.30) and Mistral
+  `mistral-large-latest` ($0.50/$1.50) all confirmed against official pages; constants updated.
+  ⚠️ New watch item: DeepSeek has ANNOUNCED (not yet live, start date TBA) peak-hour 2× pricing on
+  all billing items during Beijing 9:00–12:00 / 14:00–18:00 — would break the flat cost constants
+  when it lands. The **energy** constants (`est_wh_per_1k_tokens`, `train_tco2e`) are
   order-of-magnitude (Mistral `train_tco2e` is still the Large-2 LCA — Large-3's isn't published).
 - Live smoke tests still owed: `!mari`/`!rei`/`!asuka` round-trips, `!french bonjour` (Azure
   fr-FR synth) and `!french how do you say …` (Mistral G2P), inline `[[french:..]]`. **Plus the

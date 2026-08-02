@@ -1,6 +1,6 @@
 # Hydra Discord Bot (Opus-Deipseek)
 
-A multi-model Discord bot powered by **Claude Opus 4.8**, **DeepSeek V4-Pro**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts). Four open-weight heads join too: **Qwen 3.7** and **GLM 5.2** via a single Fireworks AI endpoint (US, zero-data-retention) when `FIREWORKS_API_KEY` is set, **Mistral Large 3** via its own EU API (`api.mistral.ai`, France's ~nuclear grid) when `MISTRAL_API_KEY` is set, and **Kimi K3** (Moonshot's 2.8T-param flagship, 1M context) via `api.moonshot.ai` when `MOONSHOT_API_KEY` is set.
+A multi-model Discord bot powered by **Claude Opus 5**, **DeepSeek V4-Pro**, and **Gemini 3.1 Pro** — three frontier models sharing one bot with smart routing, shared memory, native web search/grounding, and bookclub mode for discussing long texts (fics, papers, contracts). Four open-weight heads join too: **Qwen 3.7** and **GLM 5.2** via a single Fireworks AI endpoint (US, zero-data-retention) when `FIREWORKS_API_KEY` is set, **Mistral Large 3** via its own EU API (`api.mistral.ai`, France's ~nuclear grid) when `MISTRAL_API_KEY` is set, and **Kimi K3** (Moonshot's 2.8T-param flagship, 1M context) via `api.moonshot.ai` when `MOONSHOT_API_KEY` is set.
 
 Affectionately maps to the EVA *MAGI* trinity, with the open-weight heads as the pilots you deploy:
 - **Claude / Balthasar** — careful, thorough, vision, native Anthropic web search, multi-tool orchestration
@@ -300,12 +300,12 @@ The bot gracefully degrades — runs with any subset of {Claude, DeepSeek, Gemin
 
 | Model | Input | Cached input | Output | Typical chat | Bookclub (320k cached) |
 |-------|-------|--------------|--------|--------------|------------------------|
-| Claude Opus 4.8 | $5/M | $0.50/M (10%) | $25/M | ~$0.02-0.05 | ~$0.16/turn after cache |
+| Claude Opus 5 | $5/M | $0.50/M (10%) | $25/M | ~$0.02-0.05 | ~$0.16/turn after cache |
 | Gemini 3.1 Pro | $2-4/M (tiered ≤/>200k) | $0.50-1.00/M (25%) | $12-18/M | ~$0.01-0.02 | ~$0.40/turn after cache |
 | DeepSeek V4 Pro | $0.435/M | $0.003625/M (~99%) | $0.87/M | ~$0.0005-0.002 | ~$0.005/turn after cache |
 | Mistral Large 3 (own API) | $0.50/M | — | $1.50/M | ~$0.001-0.004 | — |
-| Qwen 3.7 Plus (Fireworks) | $0.50/M | $0.25/M (50%) | $3.00/M | ~$0.002-0.005 | — |
-| GLM 5.2 (Fireworks) | $1.40/M | $0.70/M (50%) | $4.40/M | ~$0.003-0.008 | — |
+| Qwen 3.7 Plus (Fireworks) | $0.40/M | $0.08/M (20%) | $1.60/M | ~$0.001-0.003 | — |
+| GLM 5.2 (Fireworks) | $1.40/M | $0.14/M (10%) | $4.40/M | ~$0.003-0.008 | — |
 | Kimi K3 (Moonshot API) | $3.00/M | $0.30/M (auto, 90%) | $15.00/M | ~$0.02-0.06 | ~$0.11/turn after cache |
 
 These open-head rows are estimates — verify on the [Fireworks pricing page](https://fireworks.ai/pricing) (Qwen/GLM), [console.mistral.ai](https://console.mistral.ai/) (Mistral), and [platform.kimi.ai](https://platform.kimi.ai/) (Kimi — 2026-07 launch pricing). Fireworks serverless can run ~2-4× a model-maker's own API (the US-residency + ZDR premium) and discounts cached input by 50%. Note Kimi K3 is the *premium* open head — above Claude on input — which is why it's override-only.

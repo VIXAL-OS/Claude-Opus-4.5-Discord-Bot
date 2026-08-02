@@ -28,7 +28,7 @@ Setup:
 3. Create config.json with allowed_channels list
 4. python bot.py
 
-Cost estimate: ~$0.02-0.05 per message with Opus 4.8 (Claude); cheaper on Deepseek;
+Cost estimate: ~$0.02-0.05 per message with Opus 5 (Claude); cheaper on Deepseek;
 Gemini sits in between depending on context size.
 """
 
@@ -652,7 +652,7 @@ CLAUDE_PROVIDER = ModelProvider(
     id="claude",
     sdk_type="anthropic",
     api_key_env="ANTHROPIC_API_KEY",
-    model_id="claude-opus-4-8",
+    model_id="claude-opus-5",
     input_cost_per_million=5.0,
     output_cost_per_million=25.0,
     # cache_read_input_tokens bill at 10% of standard input rate. (Cache
@@ -850,9 +850,9 @@ QWEN_PROVIDER = ModelProvider(
     api_key_env="FIREWORKS_API_KEY",
     base_url="https://api.fireworks.ai/inference/v1",
     model_id="accounts/fireworks/models/qwen3p7-plus",
-    input_cost_per_million=0.50,         # VERIFY on Fireworks pricing page
-    output_cost_per_million=3.00,
-    cached_input_cost_per_million=0.25,
+    input_cost_per_million=0.40,         # verified fireworks.ai/models 2026-08-02
+    output_cost_per_million=1.60,
+    cached_input_cost_per_million=0.08,  # Fireworks cached input is 0.2× here (not the assumed 0.5×)
     max_context_tokens=256_000,
     supports_vision=False,
     supports_web_search=False,
@@ -869,9 +869,9 @@ GLM_PROVIDER = ModelProvider(
     api_key_env="FIREWORKS_API_KEY",
     base_url="https://api.fireworks.ai/inference/v1",
     model_id="accounts/fireworks/models/glm-5p2",
-    input_cost_per_million=1.40,         # VERIFY on Fireworks pricing page
+    input_cost_per_million=1.40,         # verified fireworks.ai/models 2026-08-02
     output_cost_per_million=4.40,
-    cached_input_cost_per_million=0.70,
+    cached_input_cost_per_million=0.14,  # Fireworks cached input is 0.1× here (not the assumed 0.5×)
     max_context_tokens=200_000,
     supports_vision=False,
     supports_web_search=False,
@@ -894,7 +894,7 @@ KIMI_PROVIDER = ModelProvider(
     # date (weights due 2026-07-27). This is the PREMIUM open head, not a cheap
     # one — $3/$15 puts it above Claude on input. Override-only in routing.
     model_id="kimi-k3",
-    input_cost_per_million=3.00,         # platform.kimi.ai, 2026-07 launch pricing — VERIFY periodically
+    input_cost_per_million=3.00,         # platform.kimi.ai — reconfirmed 2026-08-02
     output_cost_per_million=15.00,
     # Automatic server-side prefix caching (DeepSeek-style, no client flags);
     # cache hits bill at $0.30/M. The shim reads standard usage fields — if
@@ -917,19 +917,21 @@ KIMI_PROVIDER = ModelProvider(
     grid_gco2_per_kwh=550.0,    # Moonshot China API (east-CN grid, same basis as DeepSeek api)
     train_tco2e=4000.0,         # estimate — biggest open train to date, but ~2.5× K2 scaling efficiency; CN grid
     # Backend toggle (Phase 3 pattern). Default "api" (above) = api.moonshot.ai.
-    # ⚠️ "fireworks" is NOT LIVE YET as of 2026-07-17 — K3 weights drop
-    # 2026-07-27 and Fireworks has been Moonshot's day-0 partner for K2.5/2.6/
-    # 2.7, so this entry is the EXPECTED US/ZDR route (the one the Slack bot
-    # would use). Slug + pricing are guesses patterned on K2.7 ($0.95/$4) —
-    # VERIFY in the live Fireworks library before flipping the backend.
+    # "fireworks" went LIVE on serverless with the 2026-07-27 weights drop.
+    # Slug + pricing verified 2026-08-02 (fireworks.ai/models/fireworks/kimi-k3):
+    # $3/$15 with $0.30 cached — identical to Moonshot's own rates. Premium
+    # router variants also exist under accounts/fireworks/routers/: kimi-k3
+    # (priority, +25%), kimi-k3-fast (+50%), kimi-k3-us (+10%, US-only — the
+    # ZDR route the Slack bot would use). Backend still ⚠️ owes a live smoke
+    # test before relying on it.
     backends={
         "fireworks": {
             "base_url": "https://api.fireworks.ai/inference/v1",
             "api_key_env": "FIREWORKS_API_KEY",
-            "model": "accounts/fireworks/models/kimi-k3",    # VERIFY once listed
-            "input_cost_per_million": 1.20,                  # VERIFY
-            "output_cost_per_million": 5.00,                 # VERIFY
-            "cached_input_cost_per_million": 0.60,           # Fireworks 50% cache discount
+            "model": "accounts/fireworks/models/kimi-k3",    # verified live 2026-08-02
+            "input_cost_per_million": 3.00,
+            "output_cost_per_million": 15.00,
+            "cached_input_cost_per_million": 0.30,           # 0.1× — Fireworks matches Moonshot's cache rate
             "grid_gco2_per_kwh": 400.0,                      # Fireworks US fleet
             "supports_server_cache": True,
         },
@@ -2495,6 +2497,15 @@ class ClaudeBot(commands.Bot):
     }
     CLAUDE_THINKING_EFFORT = "high"  # low | medium | high | xhigh | max
     CLAUDE_THINKING_MAX_TOKENS = 16000
+    # Plain (non-!think) Claude turns on Opus 5 run ADAPTIVE thinking at this
+    # effort (Sarah's call 2026-08-02, replacing the brief post-migration
+    # disabled-thinking shim). "low" keeps casual chat snappy and cheap —
+    # Opus 5 at low effort still beats prior-gen high — while !think and the
+    # auto-effort heuristic stay the escalation to high|xhigh|max. Applies to
+    # every thinking=False Claude call: plain chat, !search, panel members,
+    # bookclub recaps. (!summarize keeps thinking hard-disabled — 200-token cap.)
+    CLAUDE_PLAIN_EFFORT = "low"
+    CLAUDE_PLAIN_MAX_TOKENS = 8192  # thinking + reply share max_tokens on Opus 5 → headroom over the old 4096
 
     def _store_reasoning(self, msg_id: int, content: str) -> None:
         """Cache reasoning_content under a Discord message id (FIFO eviction)."""
@@ -2555,7 +2566,7 @@ class ClaudeBot(commands.Bot):
 
     @staticmethod
     def _pick_effort(text: str, prev_used_thinking: bool = False) -> Optional[str]:
-        """Classify a prompt into an Opus 4.8 thinking-effort level.
+        """Classify a prompt into an Opus 5 thinking-effort level.
 
         Returns None | "high" | "xhigh" | "max". None means thinking off
         (cheap chat path). Casual register and first-person emotional
@@ -5816,7 +5827,7 @@ class ClaudeBot(commands.Bot):
             if tools:
                 claude_kwargs["tools"] = tools
             if thinking:
-                # Adaptive thinking on Opus 4.8: model decides depth; effort
+                # Adaptive thinking on Opus 5: model decides depth; effort
                 # controls overall thinking/acting budget. effort=None falls
                 # back to the class default ("high"). xhigh/max need ≥64K
                 # max_tokens or they truncate mid-thought.
@@ -5830,6 +5841,15 @@ class ClaudeBot(commands.Bot):
                 )
                 claude_kwargs["thinking"] = {"type": "adaptive"}
                 claude_kwargs["extra_body"] = {"output_config": {"effort": chosen_effort}}
+            else:
+                # Plain turns: adaptive at LOW effort (CLAUDE_PLAIN_* above).
+                # The model skips or briefly uses thinking as it judges useful.
+                # The pipeline already drops thinking blocks from the visible
+                # reply and echoes them back unchanged through the tool loop
+                # (required when continuing on the same Opus 5 turn).
+                claude_kwargs["max_tokens"] = self.CLAUDE_PLAIN_MAX_TOKENS
+                claude_kwargs["thinking"] = {"type": "adaptive"}
+                claude_kwargs["extra_body"] = {"output_config": {"effort": self.CLAUDE_PLAIN_EFFORT}}
 
             api_messages = self._strip_internal_keys(messages)
             response = await asyncio.to_thread(
@@ -5988,7 +6008,17 @@ class ClaudeBot(commands.Bot):
         systematic Gemini outage behind an unreadable stub."""
         async def run_one(provider: ModelProvider):
             try:
-                text = await self._panel_complete(provider, guild_id, list(messages), system)
+                # Claude-as-panelist runs FULL thinking (adaptive @ high effort,
+                # 16K cap) with its default web_search — Sarah's call 2026-08-02:
+                # the premium head should dig, not skim at the plain adaptive-low
+                # tier. Non-Claude members keep thinking=False (unchanged panel
+                # cost/behavior); the judge separately passes thinking=True in
+                # _judge. Recaps/G2P hit _panel_complete directly, so they stay
+                # on the default (adaptive-low for Claude).
+                text = await self._panel_complete(
+                    provider, guild_id, list(messages), system,
+                    thinking=(provider is self.claude_provider),
+                )
             except Exception as e:
                 print(f"⚠️  Panel member {provider.name} raised: {e}")
                 return provider, None, f"{type(e).__name__}: {e}"
@@ -6095,7 +6125,9 @@ class ClaudeBot(commands.Bot):
             response = await asyncio.to_thread(
                 self.claude_client.messages.create,
                 model=self.claude_provider.model_id,
-                max_tokens=self.claude_provider.max_tokens,
+                max_tokens=self.CLAUDE_PLAIN_MAX_TOKENS,
+                thinking={"type": "adaptive"},
+                extra_body={"output_config": {"effort": self.CLAUDE_PLAIN_EFFORT}},
                 system=system,
                 messages=messages,
                 tools=[{
@@ -6135,7 +6167,9 @@ class ClaudeBot(commands.Bot):
                 response = await asyncio.to_thread(
                     self.claude_client.messages.create,
                     model=self.claude_provider.model_id,
-                    max_tokens=self.claude_provider.max_tokens,
+                    max_tokens=self.CLAUDE_PLAIN_MAX_TOKENS,
+                    thinking={"type": "adaptive"},
+                    extra_body={"output_config": {"effort": self.CLAUDE_PLAIN_EFFORT}},
                     system=system,
                     messages=messages,
                     tools=[{
@@ -7365,6 +7399,10 @@ class ClaudeBot(commands.Bot):
                             self.claude_client.messages.create,
                             model=self.claude_provider.model_id,
                             max_tokens=200,
+                            # Must stay disabled on Opus 5: default-on adaptive
+                            # thinking would both blow the 200-token cap and put
+                            # a thinking block at content[0] (crashing .text).
+                            thinking={"type": "disabled"},
                             system="Summarize this conversation in 1-2 sentences. Focus on the key topic and any decisions/outcomes. Be concise.",
                             messages=[{"role": "user", "content": f"Conversation to summarize:\n\n{conversation_text}"}]
                         )
