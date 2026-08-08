@@ -1817,6 +1817,217 @@ class ReadingMaterial:
 
 
 # =============================================================================
+# PARTICIPATION ROUTER STATE
+# =============================================================================
+
+@dataclass
+class ParticipationState:
+    """Recent human-speaker activity for one parent Discord channel.
+
+    `speaker_last_seen` is intentionally a last-seen map rather than a transcript:
+    the social gate only needs recent identities plus the ambient-hold clock. A
+    second speaker inside the short activation window starts ambient mode; later
+    speaker switches renew the longer solo-reset hold. Normal Discord users key by
+    account id; webhook proxies key by webhook id + display name so distinct
+    PluralKit members count as distinct conversational speakers.
+    """
+
+    speaker_last_seen: dict[str, datetime] = field(default_factory=dict)
+    speaker_labels: dict[str, str] = field(default_factory=dict)
+    ambient_until: Optional[datetime] = None
+    last_multi_speaker_at: Optional[datetime] = None
+    last_speaker_key: Optional[str] = None
+    last_speaker_at: Optional[datetime] = None
+    last_unsolicited_reply_at: Optional[datetime] = None
+    latest_human_message_id: Optional[int] = None
+    latest_human_message_at: Optional[datetime] = None
+
+    def prune(self, now: datetime, solo_reset_hours: float) -> None:
+        cutoff = now - timedelta(hours=solo_reset_hours)
+        stale = [
+            key for key, seen in self.speaker_last_seen.items()
+            if _as_utc(seen) <= cutoff
+        ]
+        for key in stale:
+            self.speaker_last_seen.pop(key, None)
+            self.speaker_labels.pop(key, None)
+
+    def observe(
+        self,
+        speaker_key: str,
+        speaker_label: str,
+        when: datetime,
+        message_id: Optional[int],
+        solo_reset_hours: float,
+        activation_minutes: float = 15.0,
+        reply_target: Optional[tuple[str, str]] = None,
+    ) -> None:
+        """Record one human turn and optional human reply target.
+
+        A reply to another human is direct evidence of a multi-speaker exchange,
+        even if the referenced message is older than the rolling window. Treat the
+        target as active "now" so the bot stays ambient for the full reset period.
+        """
+        when = _as_utc(when) or _utcnow()
+        self.prune(when, solo_reset_hours)
+        reply_crosses_speakers = bool(
+            reply_target and reply_target[0] != speaker_key
+        )
+        activation_cutoff = when - timedelta(minutes=activation_minutes)
+        recent_other_speaker = any(
+            key != speaker_key
+            and activation_cutoff <= (_as_utc(seen) or when) <= when
+            for key, seen in self.speaker_last_seen.items()
+        )
+        ambient_is_live = bool(
+            self.ambient_until and when < (_as_utc(self.ambient_until) or when)
+        )
+        speaker_switch_during_ambient = bool(
+            ambient_is_live
+            and self.last_speaker_key
+            and self.last_speaker_key != speaker_key
+            and self.last_speaker_at
+            and (_as_utc(self.last_speaker_at) or when) <= when
+        )
+        multi_speaker_evidence = (
+            reply_crosses_speakers
+            or recent_other_speaker
+            or speaker_switch_during_ambient
+        )
+        if multi_speaker_evidence:
+            new_until = when + timedelta(hours=solo_reset_hours)
+            if self.ambient_until is None or (_as_utc(self.ambient_until) or when) < new_until:
+                self.ambient_until = new_until
+            if (
+                self.last_multi_speaker_at is None
+                or (_as_utc(self.last_multi_speaker_at) or when) < when
+            ):
+                self.last_multi_speaker_at = when
+
+        if reply_crosses_speakers:
+            target_key, target_label = reply_target
+            self.speaker_last_seen[target_key] = when
+            self.speaker_labels[target_key] = target_label
+        previous = self.speaker_last_seen.get(speaker_key)
+        if previous is None or _as_utc(previous) <= when:
+            self.speaker_last_seen[speaker_key] = when
+            self.speaker_labels[speaker_key] = speaker_label
+        if (
+            self.latest_human_message_at is None
+            or _as_utc(self.latest_human_message_at) < when
+            or (
+                _as_utc(self.latest_human_message_at) == when
+                and (self.latest_human_message_id or 0) < (message_id or 0)
+            )
+        ):
+            self.latest_human_message_at = when
+            self.latest_human_message_id = message_id
+            self.last_speaker_key = speaker_key
+            self.last_speaker_at = when
+
+    def auto_mode(self, now: datetime, solo_reset_hours: float) -> str:
+        now = _as_utc(now) or _utcnow()
+        self.prune(now, solo_reset_hours)
+        return (
+            "ambient"
+            if self.ambient_until and now < (_as_utc(self.ambient_until) or now)
+            else "session"
+        )
+
+    def session_resumes_at(
+        self, now: datetime, solo_reset_hours: float
+    ) -> Optional[datetime]:
+        """When the ambient hold expires, absent new multi-speaker evidence."""
+        now = _as_utc(now) or _utcnow()
+        self.prune(now, solo_reset_hours)
+        if self.ambient_until is None:
+            return None
+        until = _as_utc(self.ambient_until) or now
+        return until if now < until else None
+
+    def to_dict(self) -> dict:
+        return {
+            "speaker_last_seen": {
+                key: (_as_utc(seen) or _utcnow()).isoformat()
+                for key, seen in self.speaker_last_seen.items()
+            },
+            "speaker_labels": dict(self.speaker_labels),
+            "ambient_until": (
+                _as_utc(self.ambient_until).isoformat()
+                if self.ambient_until else None
+            ),
+            "last_multi_speaker_at": (
+                _as_utc(self.last_multi_speaker_at).isoformat()
+                if self.last_multi_speaker_at else None
+            ),
+            "last_speaker_key": self.last_speaker_key,
+            "last_speaker_at": (
+                _as_utc(self.last_speaker_at).isoformat()
+                if self.last_speaker_at else None
+            ),
+            "last_unsolicited_reply_at": (
+                _as_utc(self.last_unsolicited_reply_at).isoformat()
+                if self.last_unsolicited_reply_at else None
+            ),
+            "latest_human_message_id": self.latest_human_message_id,
+            "latest_human_message_at": (
+                _as_utc(self.latest_human_message_at).isoformat()
+                if self.latest_human_message_at else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> "ParticipationState":
+        if not isinstance(data, dict):
+            return cls()
+
+        def parse(value: object) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                return _as_utc(datetime.fromisoformat(str(value)))
+            except (TypeError, ValueError):
+                return None
+
+        raw_last_seen = data.get("speaker_last_seen", {}) or {}
+        if not isinstance(raw_last_seen, dict):
+            raw_last_seen = {}
+        raw_labels = data.get("speaker_labels", {}) or {}
+        if not isinstance(raw_labels, dict):
+            raw_labels = {}
+        last_seen = {}
+        for key, value in raw_last_seen.items():
+            parsed = parse(value)
+            if parsed is not None:
+                last_seen[str(key)] = parsed
+        return cls(
+            speaker_last_seen=last_seen,
+            speaker_labels={
+                str(k): str(v)
+                for k, v in raw_labels.items()
+                if str(k) in last_seen
+            },
+            ambient_until=parse(data.get("ambient_until")),
+            last_multi_speaker_at=parse(data.get("last_multi_speaker_at")),
+            last_speaker_key=(
+                str(data.get("last_speaker_key"))
+                if data.get("last_speaker_key") else None
+            ),
+            last_speaker_at=parse(data.get("last_speaker_at")),
+            last_unsolicited_reply_at=parse(data.get("last_unsolicited_reply_at")),
+            latest_human_message_id=data.get("latest_human_message_id"),
+            latest_human_message_at=parse(data.get("latest_human_message_at")),
+        )
+
+
+@dataclass(frozen=True)
+class ParticipationDecision:
+    should_respond: bool
+    reason: str
+    unsolicited: bool = False
+
+
+# =============================================================================
 # CONVERSATION MANAGER (Uses Discord as message store)
 # =============================================================================
 
@@ -1843,6 +2054,11 @@ class ConversationManager:
         # channel_id -> ReadingMaterial (bookclub mode). Per-channel rather
         # than per-guild because different channels may read different works.
         self.reading_materials: dict[int, ReadingMaterial] = {}
+        # Parent-channel participation state. The bot is deliberately chatty
+        # while one speaker is active, then becomes an ambient observer as soon
+        # as a second speaker participates. Persisting this tiny state prevents
+        # a restart from making the bot forget that humans were mid-conversation.
+        self.participation_states: dict[int, ParticipationState] = {}
     
     async def fetch_thread_index(
         self,
@@ -2254,6 +2470,11 @@ class ConversationManager:
                 str(channel_id): material.to_dict()
                 for channel_id, material in self.reading_materials.items()
             }
+        if self.participation_states:
+            data["_participation_states"] = {
+                str(channel_id): state.to_dict()
+                for channel_id, state in self.participation_states.items()
+            }
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
         self._memories_dirty = False
@@ -2309,8 +2530,24 @@ class ConversationManager:
                     except (KeyError, ValueError) as e:
                         print(f"⚠️  Skipping malformed reading material for channel {ch_id_str}: {e}")
 
+            # The first live turn also merges the last reset-window of Discord
+            # history. Persistence handles graceful restarts; history covers
+            # messages sent while the process was down or before a hard kill.
+            participation_count = 0
+            raw_participation_states = data.get("_participation_states", {}) or {}
+            if not isinstance(raw_participation_states, dict):
+                raw_participation_states = {}
+                print("⚠️  Ignoring malformed `_participation_states` metadata")
+            for ch_id_str, state_data in raw_participation_states.items():
+                try:
+                    self.participation_states[int(ch_id_str)] = ParticipationState.from_dict(state_data)
+                    participation_count += 1
+                except (TypeError, ValueError):
+                    print(f"⚠️  Skipping malformed participation state for channel {ch_id_str}")
+
             print(f"Loaded memories for {guild_count} guilds" +
-                  (f", {material_count} reading material(s)" if material_count else ""))
+                  (f", {material_count} reading material(s)" if material_count else "") +
+                  (f", {participation_count} participation state(s)" if participation_count else ""))
         except FileNotFoundError:
             print("No existing memories file, starting fresh")
 
@@ -2395,6 +2632,106 @@ class ClaudeBot(commands.Bot):
         self.openai_compatible_clients = self.registry.openai_compatible_clients
         self.claude_client = self.clients.get("claude")
         self.gemini_client = self.clients.get("gemini")
+
+        # --- Social participation gate ------------------------------------
+        # Auto mode is intentionally session-first: one active speaker gets the
+        # old chatty behavior. The moment a second distinct speaker appears in
+        # the parent channel's rolling window, uninvited turns go through a
+        # cheap Haiku classifier and the bot usually stays silent. Mentions,
+        # replies to the bot, commands, and explicit model prefixes always pass.
+        raw_participation = self._raw_config.get("participation", {}) or {}
+        if not isinstance(raw_participation, dict):
+            print("⚠️  config `participation` must be an object; using defaults.")
+            raw_participation = {}
+
+        def _part_float(key: str, default: float, minimum: float) -> float:
+            try:
+                return max(minimum, float(raw_participation.get(key, default)))
+            except (TypeError, ValueError):
+                print(f"⚠️  participation.{key} must be numeric; using {default}.")
+                return default
+
+        def _part_int(key: str, default: int, minimum: int, maximum: int) -> int:
+            try:
+                value = int(raw_participation.get(key, default))
+                return max(minimum, min(maximum, value))
+            except (TypeError, ValueError):
+                print(f"⚠️  participation.{key} must be an integer; using {default}.")
+                return default
+
+        self.participation_enabled = bool(raw_participation.get("enabled", True))
+        self.participation_solo_reset_hours = _part_float("solo_reset_hours", 6.0, 0.25)
+        self.participation_activation_minutes = _part_float("activation_minutes", 15.0, 1.0)
+        self.participation_cooldown_minutes = _part_float("cooldown_minutes", 15.0, 0.0)
+        self.participation_classifier_threshold = min(
+            1.0, _part_float("classifier_threshold", 0.90, 0.0)
+        )
+        self.participation_context_messages = _part_int("context_messages", 12, 4, 30)
+        self.participation_history_limit = _part_int("history_limit", 500, 50, 2000)
+        self.participation_classifier_model = str(
+            raw_participation.get("classifier_model", "claude-haiku-4-5")
+        ).strip() or "claude-haiku-4-5"
+        self.participation_classifier_enabled = bool(
+            raw_participation.get("classifier_enabled", True)
+        )
+        raw_modes = raw_participation.get("channel_modes", {}) or {}
+        self.participation_channel_modes: dict[int, str] = {}
+        if not isinstance(raw_modes, dict):
+            print("⚠️  participation.channel_modes must be an object; ignoring it.")
+        else:
+            for channel_id, mode in raw_modes.items():
+                try:
+                    cid = int(channel_id)
+                except (TypeError, ValueError):
+                    print(f"⚠️  Ignoring non-integer participation channel id: {channel_id!r}")
+                    continue
+                normalized = str(mode).strip().lower()
+                if normalized not in ("auto", "session", "ambient", "tags"):
+                    print(f"⚠️  Ignoring invalid participation mode {mode!r} for channel {cid}")
+                    continue
+                if normalized != "auto":
+                    self.participation_channel_modes[cid] = normalized
+
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        self.participation_client = self.claude_client
+        if self.participation_client is None and anthropic_key:
+            self.participation_client = anthropic.Anthropic(
+                api_key=anthropic_key, max_retries=2
+            )
+        classifier_available = bool(
+            self.participation_classifier_enabled and self.participation_client
+        )
+        # A non-routing pseudo-provider gives !cost and memories.json honest,
+        # separately-priced Haiku usage without letting the gate enter the
+        # model-selection pool. Haiku 4.5 list price: $1/$5 per MTok.
+        self.participation_usage = ModelProvider(
+            name="Haiku participation gate",
+            id="participation_gate",
+            sdk_type="anthropic",
+            api_key_env="ANTHROPIC_API_KEY",
+            model_id=self.participation_classifier_model,
+            input_cost_per_million=_part_float("classifier_input_cost_per_million", 1.0, 0.0),
+            output_cost_per_million=_part_float("classifier_output_cost_per_million", 5.0, 0.0),
+            enabled=classifier_available,
+            supports_vision=False,
+            supports_web_search=False,
+            est_wh_per_1k_tokens=0.2,
+            grid_gco2_per_kwh=250.0,
+        )
+        self.usage_providers = self.providers + [self.participation_usage]
+        self._participation_seeded_channels: set[int] = set()
+        self._participation_seed_locks: dict[int, asyncio.Lock] = {}
+        self._participation_classifier_locks: dict[int, asyncio.Lock] = {}
+        print(
+            f"🫧 Participation: auto session→ambient after 2 speakers; "
+            f"co-presence={self.participation_activation_minutes:g}m; "
+            f"solo reset={self.participation_solo_reset_hours:g}h; "
+            + (
+                f"classifier={self.participation_classifier_model}"
+                if classifier_available
+                else "classifier unavailable (ambient becomes tag/reply-only)"
+            )
+        )
 
         # Tavily search client (optional - enables web search for Deepseek).
         # Gemini uses Google's native grounding (no Tavily needed); see
@@ -2843,7 +3180,7 @@ class ClaudeBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Called when bot is ready."""
-        self.manager.load_memories(providers=self.providers)
+        self.manager.load_memories(providers=self.usage_providers)
         # Belt-and-suspenders: sweep orphaned Gemini caches before we start
         # handling messages (race-free here — nothing is creating caches yet).
         await self._reconcile_gemini_caches()
@@ -2856,7 +3193,7 @@ class ClaudeBot(commands.Bot):
         while not self.is_closed():
             try:
                 if self.manager.needs_save:
-                    await self.manager.save_memories_async(providers=self.providers)
+                    await self.manager.save_memories_async(providers=self.usage_providers)
                     print("💾 Memories saved (background)")
             except Exception as e:
                 print(f"⚠️  Error saving memories: {e}")
@@ -2866,7 +3203,7 @@ class ClaudeBot(commands.Bot):
         """Clean shutdown - save memories before closing."""
         if self.manager.needs_save:
             print("💾 Saving memories before shutdown...")
-            await self.manager.save_memories_async(providers=self.providers)
+            await self.manager.save_memories_async(providers=self.usage_providers)
         await super().close()
 
     async def on_ready(self) -> None:
@@ -2882,10 +3219,358 @@ class ClaudeBot(commands.Bot):
                 print(f"   • {g.name} (id: {g.id}){mark}")
         models = [p.name for p in self.providers if p.enabled]
         print(f"🧠 Models: {', '.join(models)} (selection: {CONFIG.default_model})")
+
+    def _participation_scope(self, message: discord.Message):
+        """Parent channel is the social scope; child threads share its mode."""
+        if isinstance(message.channel, discord.Thread):
+            parent = message.channel.parent
+            if parent is None and message.channel.parent_id is not None:
+                parent = self.get_channel(message.channel.parent_id)
+            if parent is not None:
+                return parent
+        return message.channel
+
+    @staticmethod
+    def _speaker_identity(message: discord.Message) -> Optional[tuple[str, str]]:
+        """Stable-enough conversational identity for users and webhook proxies."""
+        if _is_real_bot(message):
+            return None
+        label = str(getattr(message.author, "display_name", None) or message.author)
+        if message.webhook_id is not None:
+            # PluralKit commonly reuses one channel webhook while changing the
+            # visible member name/avatar. Include the normalized display name so
+            # two proxied members count as two speakers, as humans experience it.
+            normalized = re.sub(r"\s+", " ", label.strip()).casefold()
+            return f"proxy:{message.webhook_id}:{normalized}", label
+        return f"user:{message.author.id}", label
+
+    async def _resolve_reply_target(self, message: discord.Message):
+        reference = message.reference
+        if reference is None or reference.message_id is None:
+            return None
+        resolved = reference.resolved
+        if resolved is not None and hasattr(resolved, "author"):
+            return resolved
+        try:
+            return await message.channel.fetch_message(reference.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException, AttributeError):
+            return None
+
+    def _message_mentions_bot(self, message: discord.Message) -> bool:
+        if self.user is None:
+            return False
+        return any(user.id == self.user.id for user in message.mentions)
+
+    async def _seed_participation_history(
+        self, message: discord.Message, state: ParticipationState
+    ) -> None:
+        """Merge the previous solo-reset window from Discord once per channel.
+
+        memories.json handles graceful restarts. This lazy history merge also
+        catches conversation while the bot was offline and hard-kill gaps. The
+        parent plus recent active/archived threads are sampled, newest first.
+        """
+        scope = self._participation_scope(message)
+        scope_id = scope.id
+        if scope_id in self._participation_seeded_channels:
+            return
+        lock = self._participation_seed_locks.setdefault(scope_id, asyncio.Lock())
+        async with lock:
+            if scope_id in self._participation_seeded_channels:
+                return
+            now = _utcnow()
+            cutoff = now - timedelta(hours=self.participation_solo_reset_hours)
+            sources = [scope]
+            source_ids = {scope.id}
+
+            # The current thread matters even if it has just archived/disappeared
+            # from parent.threads between the event and this reconstruction.
+            if isinstance(message.channel, discord.Thread):
+                sources.append(message.channel)
+                source_ids.add(message.channel.id)
+            for thread in getattr(scope, "threads", ()):
+                if thread.id not in source_ids:
+                    sources.append(thread)
+                    source_ids.add(thread.id)
+            try:
+                async for thread in scope.archived_threads(limit=25):
+                    if thread.id not in source_ids:
+                        sources.append(thread)
+                        source_ids.add(thread.id)
+            except (discord.Forbidden, discord.HTTPException, AttributeError):
+                pass
+
+            thread_limit = max(
+                20, self.participation_history_limit // max(1, len(sources))
+            )
+            history = []
+            try:
+                for source in sources:
+                    async for old in source.history(
+                        # Preserve the configured budget for the load-bearing
+                        # parent conversation; divide a second budget among
+                        # child threads so many old threads cannot starve it.
+                        limit=(
+                            self.participation_history_limit
+                            if source.id == scope.id else thread_limit
+                        ),
+                        after=cutoff,
+                        oldest_first=False,
+                    ):
+                        identity = self._speaker_identity(old)
+                        if identity is not None:
+                            history.append(old)
+            except (discord.Forbidden, discord.HTTPException, AttributeError) as exc:
+                print(f"⚠️  Participation history reconstruction was partial: {exc}")
+
+            history.sort(key=lambda old: (old.created_at, old.id))
+            for old in history:
+                identity = self._speaker_identity(old)
+                if identity is None:
+                    continue
+                state.observe(
+                    identity[0], identity[1], old.created_at, old.id,
+                    self.participation_solo_reset_hours,
+                    self.participation_activation_minutes,
+                )
+            state.prune(now, self.participation_solo_reset_hours)
+            self._participation_seeded_channels.add(scope_id)
+            if history:
+                print(
+                    f"🫧 Participation history: merged {len(history)} human turns "
+                    f"for channel {scope_id}"
+                )
+
+    async def _observe_participation(
+        self, message: discord.Message
+    ) -> tuple[int, ParticipationState, object]:
+        scope = self._participation_scope(message)
+        scope_id = scope.id
+        state = self.manager.participation_states.setdefault(scope_id, ParticipationState())
+        await self._seed_participation_history(message, state)
+        reply_target = await self._resolve_reply_target(message)
+        identity = self._speaker_identity(message)
+        reply_identity = (
+            self._speaker_identity(reply_target)
+            if reply_target is not None else None
+        )
+        if identity is not None:
+            state.observe(
+                identity[0], identity[1], message.created_at, message.id,
+                self.participation_solo_reset_hours,
+                self.participation_activation_minutes,
+                reply_target=reply_identity,
+            )
+            self.manager.mark_dirty()
+        return scope_id, state, reply_target
+
+    def _effective_participation_mode(
+        self, scope_id: int, state: ParticipationState, now: Optional[datetime] = None
+    ) -> str:
+        if not self.participation_enabled:
+            return "session"
+        override = self.participation_channel_modes.get(scope_id)
+        if override:
+            return override
+        return state.auto_mode(now or _utcnow(), self.participation_solo_reset_hours)
+
+    _BACKCHANNEL_RE = re.compile(
+        r"^(?:yes|yeah|yep|yup|sure|certainly|ok(?:ay)?|kk|right|exactly|"
+        r"agreed|fair|same|mood|real|true|indeed|noted|understood|got it|"
+        r"makes sense|sounds good|cool|nice|thanks|thank you|ty|lol+|lmao+|"
+        r"lmfao+|ha(?:ha)+|rip|oof|welp|brb|afk|good ?night|night|bye|later)"
+        r"[\s.!…~\-]*$",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_obvious_backchannel(cls, text: str, has_attachments: bool = False) -> bool:
+        if has_attachments:
+            return False
+        cleaned = re.sub(r"<a?:\w+:\d+>", "", (text or "")).strip()
+        if not cleaned:
+            # Emoji-only acknowledgements are social turns, not invitations for
+            # a paragraph. Truly empty messages were already gated upstream.
+            return bool(text and text.strip())
+        if cls._BACKCHANNEL_RE.fullmatch(cleaned):
+            return True
+        # A tiny punctuation/emoji reaction with no alphanumerics.
+        return len(cleaned) <= 12 and not re.search(r"[\w]", cleaned, re.UNICODE)
+
+    async def _ambient_classifier_context(self, message: discord.Message) -> str:
+        turns = []
+        try:
+            async for old in message.channel.history(
+                limit=self.participation_context_messages,
+                oldest_first=False,
+            ):
+                if _is_real_bot(old):
+                    if self.user is None or old.author.id != self.user.id:
+                        continue
+                    speaker = "BOT"
+                else:
+                    speaker = str(getattr(old.author, "display_name", None) or old.author)
+                body = (old.content or "").strip()
+                if old.attachments:
+                    names = ", ".join(a.filename for a in old.attachments[:4])
+                    body = f"{body} [attachments: {names}]".strip()
+                body = re.sub(r"\s+", " ", body)[:700]
+                reply_note = ""
+                ref = getattr(old, "reference", None)
+                target = getattr(ref, "resolved", None) if ref else None
+                if target is not None and hasattr(target, "author"):
+                    if _is_real_bot(target) and self.user and target.author.id == self.user.id:
+                        reply_note = " [replying to BOT]"
+                    elif not _is_real_bot(target):
+                        target_name = str(
+                            getattr(target.author, "display_name", None) or target.author
+                        )
+                        reply_note = f" [replying to {target_name}]"
+                turns.append((old.id, f"{speaker}{reply_note}: {body}"))
+        except (discord.Forbidden, discord.HTTPException, AttributeError):
+            pass
+        turns.reverse()
+        if not any(msg_id == message.id for msg_id, _ in turns):
+            label = str(getattr(message.author, "display_name", None) or message.author)
+            body = (message.content or "").strip()[:700]
+            turns.append((message.id, f"{label}: {body}"))
+        return "\n".join(line for _, line in turns)
+
+    async def _classify_ambient_intervention(
+        self, message: discord.Message
+    ) -> tuple[bool, float, str]:
+        """Ask Haiku whether an uninvited interruption has exceptional value."""
+        if not self.participation_usage.enabled or self.participation_client is None:
+            return False, 0.0, "classifier_unavailable"
+        transcript = await self._ambient_classifier_context(message)
+        system = """You are a social participation gate for a Discord AI bot, not the bot itself.
+Humans are currently talking with each other. Silence is normal and preferred. A false-positive
+interruption is at least five times worse than missing a chance to help. Decide whether the bot
+should volunteer an UNINVITED response to the latest message.
+
+RESPOND only when the intervention has exceptional concrete value: an important factual correction,
+an urgent safety issue, or a clearly unresolved blocker where the bot has unique actionable help.
+SILENT for acknowledgements, jokes, casual conversation, emotional reactions, commentary about the
+bot, questions another human is answering, ordinary technical discussion, or mere topical relevance.
+Do not treat novelty, surprise, or having something interesting to say as permission to interrupt.
+
+Return one JSON object only:
+{"action":"silent"|"respond","intervention_value":0.0-1.0,"reason":"short_snake_case_tag"}
+"""
+        try:
+            response = await asyncio.to_thread(
+                self.participation_client.messages.create,
+                model=self.participation_classifier_model,
+                max_tokens=96,
+                temperature=0,
+                system=system,
+                messages=[{
+                    "role": "user",
+                    "content": "Recent conversation (latest turn is last):\n" + transcript,
+                }],
+            )
+            usage = response.usage
+            self.participation_usage.record_usage(
+                int(getattr(usage, "input_tokens", 0) or 0)
+                + int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+                int(getattr(usage, "output_tokens", 0) or 0),
+                cached_input_tokens=int(
+                    getattr(usage, "cache_read_input_tokens", 0) or 0
+                ),
+            )
+            self.participation_usage.total_requests += 1
+            self.manager.mark_dirty()
+            raw = "".join(
+                str(getattr(block, "text", ""))
+                for block in response.content
+                if getattr(block, "type", None) == "text"
+            ).strip()
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not match:
+                return False, 0.0, "malformed_classifier_output"
+            data = json.loads(match.group(0))
+            action = str(data.get("action", "silent")).strip().lower()
+            try:
+                value = max(0.0, min(1.0, float(data.get("intervention_value", 0.0))))
+            except (TypeError, ValueError):
+                value = 0.0
+            reason = re.sub(
+                r"[^a-z0-9_]+", "_", str(data.get("reason", "unspecified")).lower()
+            ).strip("_")[:60] or "unspecified"
+            should_respond = (
+                action == "respond"
+                and value >= self.participation_classifier_threshold
+            )
+            return should_respond, value, reason
+        except Exception as exc:
+            print(f"⚠️  Ambient participation classifier failed closed: {exc}")
+            return False, 0.0, "classifier_error"
+
+    async def _should_participate(
+        self,
+        message: discord.Message,
+        scope_id: int,
+        state: ParticipationState,
+        reply_target,
+        explicit_prefix: bool,
+    ) -> ParticipationDecision:
+        # Structural invitations beat every quiet/ambient rule.
+        if explicit_prefix:
+            return ParticipationDecision(True, "explicit_model_or_thinking_prefix")
+        if self._message_mentions_bot(message):
+            return ParticipationDecision(True, "bot_mention")
+        if (
+            reply_target is not None
+            and _is_real_bot(reply_target)
+            and self.user is not None
+            and reply_target.author.id == self.user.id
+        ):
+            return ParticipationDecision(True, "reply_to_bot")
+
+        mode = self._effective_participation_mode(scope_id, state, message.created_at)
+        if mode == "session":
+            return ParticipationDecision(True, "single_speaker_session")
+        if mode == "tags":
+            return ParticipationDecision(False, "tag_only_mode")
+
+        # Explicit human→human reply edges are stronger evidence than prose.
+        if reply_target is not None and not _is_real_bot(reply_target):
+            return ParticipationDecision(False, "reply_to_human")
+        if self._is_obvious_backchannel(message.content or "", bool(message.attachments)):
+            return ParticipationDecision(False, "obvious_backchannel")
+
+        now = _as_utc(message.created_at) or _utcnow()
+        if state.last_unsolicited_reply_at is not None:
+            elapsed = now - (_as_utc(state.last_unsolicited_reply_at) or now)
+            if elapsed < timedelta(minutes=self.participation_cooldown_minutes):
+                return ParticipationDecision(False, "unsolicited_reply_cooldown")
+
+        # Only one classifier call per social scope at a time. If conversation
+        # advances while Haiku is deciding, discard the stale intervention.
+        lock = self._participation_classifier_locks.setdefault(scope_id, asyncio.Lock())
+        async with lock:
+            if state.latest_human_message_id != message.id:
+                return ParticipationDecision(False, "conversation_advanced")
+            should_respond, value, reason = await self._classify_ambient_intervention(message)
+            if state.latest_human_message_id != message.id:
+                return ParticipationDecision(False, "conversation_advanced")
+            print(
+                f"🫧 Ambient gate channel={scope_id}: "
+                f"{'reply' if should_respond else 'silent'} value={value:.2f} reason={reason}"
+            )
+            if not should_respond:
+                return ParticipationDecision(False, f"haiku:{reason}")
+            state.last_unsolicited_reply_at = now
+            self.manager.mark_dirty()
+            return ParticipationDecision(True, f"haiku:{reason}", unsolicited=True)
     
     async def on_message(self, message: discord.Message) -> None:
         # Ignore self
         if message.author == self.user:
+            return
+        # Ignore genuine bot accounts. Webhook proxies such as PluralKit have a
+        # webhook_id and deliberately do NOT count as real bots here.
+        if _is_real_bot(message):
             return
         
         # Ignore DMs for now
@@ -2959,6 +3644,13 @@ class ClaudeBot(commands.Bot):
         if flags:
             message.content = peeled_content
 
+        # Update the channel-level social state before commands or generation.
+        # This means the second speaker's very first turn flips auto mode to
+        # ambient before we decide whether that triggering turn deserves a reply.
+        participation_scope_id, participation_state, reply_target = (
+            await self._observe_participation(message)
+        )
+
         # Handle commands (but not if we just consumed a model/thinking prefix)
         if not flags and message.content.startswith('!'):
             await self._handle_command(message)
@@ -2966,6 +3658,20 @@ class ClaudeBot(commands.Bot):
 
         # Ignore empty messages (no text, no attachments)
         if not message.content and not message.attachments:
+            return
+
+        participation = await self._should_participate(
+            message,
+            participation_scope_id,
+            participation_state,
+            reply_target,
+            explicit_prefix=bool(flags),
+        )
+        if not participation.should_respond:
+            print(
+                f"🫧 Stayed silent in channel {participation_scope_id}: "
+                f"{participation.reason}"
+            )
             return
 
         # Get or create thread
@@ -2976,6 +3682,10 @@ class ClaudeBot(commands.Bot):
             provider = forced_provider
         else:
             provider, routing_reason = await self._select_model(message, message.guild.id)
+        if participation.unsolicited:
+            routing_reason = (
+                routing_reason + f" Ambient participation approved ({participation.reason})."
+            ).strip()
 
         # Decide effort level. Priority: manual !think:<level> > auto-classify
         # > class default. Auto-classify only when user explicitly chose Claude
@@ -6924,8 +7634,85 @@ class ClaudeBot(commands.Bot):
             await self._send_response(message.channel, info)
 
         elif cmd == "!cost":
-            summary = self.manager.get_cost_summary(self.providers)
+            summary = self.manager.get_cost_summary(self.usage_providers)
             await self._send_response(message.channel, summary)
+
+        elif cmd == "!presence":
+            scope = self._participation_scope(message)
+            scope_id = scope.id
+            state = self.manager.participation_states.setdefault(
+                scope_id, ParticipationState()
+            )
+            sub = parts[1].strip().lower() if len(parts) >= 2 else "show"
+            valid = ("auto", "session", "ambient", "tags")
+            if sub not in ("show", "status", "view") + valid:
+                await message.channel.send(
+                    "Usage: `!presence` · `!presence auto|session|ambient|tags`"
+                )
+                return
+            if sub in valid:
+                if not self._can_edit_config(message):
+                    await message.channel.send(
+                        "⛔ Changing participation mode is limited to server admins."
+                    )
+                    return
+                if sub == "auto":
+                    self.participation_channel_modes.pop(scope_id, None)
+                else:
+                    self.participation_channel_modes[scope_id] = sub
+                raw = self._raw_config.get("participation")
+                if not isinstance(raw, dict):
+                    raw = {}
+                    self._raw_config["participation"] = raw
+                raw["channel_modes"] = {
+                    str(cid): mode
+                    for cid, mode in sorted(self.participation_channel_modes.items())
+                }
+                self._save_config()
+
+            now = _utcnow()
+            effective = self._effective_participation_mode(scope_id, state, now)
+            override = self.participation_channel_modes.get(scope_id)
+            source = f"manual `{override}` override" if override else "automatic"
+            recent = sorted(
+                state.speaker_last_seen.items(),
+                key=lambda item: _as_utc(item[1]) or now,
+                reverse=True,
+            )
+            speaker_bits = []
+            for key, seen in recent:
+                age_minutes = max(
+                    0, int((now - (_as_utc(seen) or now)).total_seconds() // 60)
+                )
+                age = f"{age_minutes}m" if age_minutes < 60 else f"{age_minutes / 60:.1f}h"
+                speaker_bits.append(f"{state.speaker_labels.get(key, key)} ({age} ago)")
+            speakers = ", ".join(speaker_bits) or "none"
+            resume = state.session_resumes_at(
+                now, self.participation_solo_reset_hours
+            )
+            resume_line = ""
+            if effective == "ambient" and override is None and resume is not None:
+                resume_line = (
+                    "\nIf no second speaker returns, session mode resumes around "
+                    f"<t:{int(resume.timestamp())}:R>."
+                )
+            classifier = (
+                f"`{self.participation_classifier_model}` at threshold "
+                f"{self.participation_classifier_threshold:.2f}"
+                if self.participation_usage.enabled
+                else "unavailable — ambient is mention/reply-only"
+            )
+            await self._send_response(
+                message.channel,
+                f"🫧 **Participation:** `{effective}` ({source})\n"
+                f"Recent speakers ({self.participation_solo_reset_hours:g}h history): {speakers}\n"
+                f"Ambient classifier: {classifier} · unsolicited cooldown "
+                f"{self.participation_cooldown_minutes:g}m · activation window "
+                f"{self.participation_activation_minutes:g}m{resume_line}\n\n"
+                "Modes: `auto` switches session→ambient when a second speaker joins; "
+                "`session` replies to everything; `ambient` uses the gate; "
+                "`tags` answers only mentions, replies, commands, and model prefixes."
+            )
         
         elif cmd == "!memories":
             lines = []
@@ -6971,7 +7758,7 @@ class ClaudeBot(commands.Bot):
                 key = parts[1]
                 value = parts[2]
                 if memory.longterm.add(key, value):
-                    self.manager.save_memories(providers=self.providers)
+                    self.manager.save_memories(providers=self.usage_providers)
                     await message.channel.send(f"✅ Remembered `{key}` (permanent)")
                 else:
                     await message.channel.send(
@@ -6986,10 +7773,10 @@ class ClaudeBot(commands.Bot):
                 key = parts[1]
                 # Try long-term first, then working
                 if memory.longterm.remove(key):
-                    self.manager.save_memories(providers=self.providers)
+                    self.manager.save_memories(providers=self.usage_providers)
                     await message.channel.send(f"✅ Forgot `{key}` from long-term memory")
                 elif memory.working.remove(key):
-                    self.manager.save_memories(providers=self.providers)
+                    self.manager.save_memories(providers=self.usage_providers)
                     await message.channel.send(f"✅ Forgot `{key}` from working notes")
                 else:
                     await message.channel.send(f"❓ No memory with key `{key}`")
@@ -7003,7 +7790,7 @@ class ClaudeBot(commands.Bot):
                 if key not in memory.working.notes:
                     await message.channel.send(f"❓ No working note with key `{key}`")
                 elif memory.promote(key):
-                    self.manager.save_memories(providers=self.providers)
+                    self.manager.save_memories(providers=self.usage_providers)
                     await message.channel.send(f"✅ Promoted `{key}` to long-term memory (permanent)")
                 else:
                     await message.channel.send(
@@ -7370,7 +8157,7 @@ class ClaudeBot(commands.Bot):
                 key = parts[1]
                 summary = parts[2]
                 if memory.longterm.add(f"thread_{key}", summary):
-                    self.manager.save_memories(providers=self.providers)
+                    self.manager.save_memories(providers=self.usage_providers)
                     await message.channel.send(f"✅ Saved thread summary as `thread_{key}`")
                 else:
                     await message.channel.send(
@@ -7415,7 +8202,7 @@ class ClaudeBot(commands.Bot):
                         self._record_claude_usage(summary_response.usage)
                         
                         if memory.longterm.add(f"thread_{key}", summary):
-                            self.manager.save_memories(providers=self.providers)
+                            self.manager.save_memories(providers=self.usage_providers)
                             await message.channel.send(f"✅ Saved: `thread_{key}`: {summary}")
                         else:
                             await message.channel.send(
@@ -7555,7 +8342,7 @@ class ClaudeBot(commands.Bot):
             self.manager.mark_dirty()
             # Force an immediate save so a hard restart in the next 60s
             # doesn't lose the load. Non-blocking — runs in a worker thread.
-            await self.manager.save_memories_async(providers=self.providers)
+            await self.manager.save_memories_async(providers=self.usage_providers)
 
             lines = [
                 f"📚 Loaded **{material.title}**",
@@ -7702,7 +8489,7 @@ class ClaudeBot(commands.Bot):
             self.manager.mark_dirty()
             # Force an immediate save so a hard restart in the next 60s
             # doesn't lose the load. Non-blocking — runs in a worker thread.
-            await self.manager.save_memories_async(providers=self.providers)
+            await self.manager.save_memories_async(providers=self.usage_providers)
 
             lines = [
                 f"📚 Loaded **{material.title}** from `{attachment.filename}`",
@@ -7749,7 +8536,7 @@ class ClaudeBot(commands.Bot):
                 if material is not None:
                     await self._drop_gemini_cache(material)  # stop cache storage billing
                 self.manager.mark_dirty()
-                await self.manager.save_memories_async(providers=self.providers)
+                await self.manager.save_memories_async(providers=self.usage_providers)
                 title = f"**{material.title}**" if material is not None else "the scoped threads"
                 tail = (
                     f" (+{len(scoped)} scoped-thread cache{'s' if len(scoped) != 1 else ''})"
@@ -7789,7 +8576,7 @@ class ClaudeBot(commands.Bot):
                     total_attempted += att
                     total_deleted += dele
                 self.manager.mark_dirty()
-                await self.manager.save_memories_async(providers=self.providers)
+                await self.manager.save_memories_async(providers=self.usage_providers)
                 title = f"**{material.title}**" if material is not None else "the scoped threads"
                 scoped_note = (
                     f" (+{len(scoped)} scoped-thread cache{'s' if len(scoped) != 1 else ''})"
@@ -7853,7 +8640,7 @@ class ClaudeBot(commands.Bot):
                     dropped += d
                 if dropped:
                     self.manager.mark_dirty()
-                    await self.manager.save_memories_async(providers=self.providers)
+                    await self.manager.save_memories_async(providers=self.usage_providers)
                 note = f" Dropped {dropped} live cache(s); storage billing stops now." if dropped else ""
                 await message.channel.send(
                     f"🟢 Gemini bookclub cache → **INLINE** (implicit caching, no storage "
@@ -8003,7 +8790,7 @@ class ClaudeBot(commands.Bot):
 
             await self._set_reading_material(message.channel.id, scoped)
             self.manager.mark_dirty()
-            await self.manager.save_memories_async(providers=self.providers)
+            await self.manager.save_memories_async(providers=self.usage_providers)
 
             range_desc = (
                 f"Chapter {start_ch}" if start_ch == end_ch
@@ -8049,7 +8836,7 @@ class ClaudeBot(commands.Bot):
             else:
                 await self._drop_gemini_cache(scoped)  # stop cache storage billing
                 self.manager.mark_dirty()
-                await self.manager.save_memories_async(providers=self.providers)
+                await self.manager.save_memories_async(providers=self.usage_providers)
                 await message.channel.send(
                     "📖 Unscoped this thread. Models will see the full work loaded in the parent channel."
                 )
@@ -8298,9 +9085,11 @@ __MM_BLOCK__
 `!models` - Show available models and their usage stats
 `!prefer [claude|deepseek|gemini|mistral|qwen|glm|kimi|sim|auto]` - Set model preference for this channel (sim = pin this channel to simulator mode)
 `!calibration` - Show model confidence calibration stats
+`!presence` - Show automatic session/ambient participation state and recent speakers
 
 **Server admin (guild owner / admin only to edit):**
 `!channels` - List allowed channels; `!channels add|remove [#channel|id]` to edit (persists to config)
+`!presence auto|session|ambient|tags` - Override this channel's participation mode (`auto` restores speaker-aware switching)
 `!server_context` - Show this server's system-prompt context + PluralKit setting
 `!server_context set <text>` - Set what the models know about this server
 `!server_context pluralkit on|off` - Toggle the PluralKit/plurality section for this server

@@ -31,6 +31,7 @@ just *adds* its flavor aliases.
 - 🐉 **Multi-model (Hydra)** — Claude + DeepSeek + Gemini (the MAGI trinity), plus optional Qwen + GLM (Fireworks), Mistral (its own EU API), and Kimi K3 (Moonshot API), with automatic routing
 - 📚 **Bookclub mode** — pin long texts to a channel; discuss across all three models with per-thread chapter scoping
 - 🧵 **Thread-based conversations** — keeps channels clean
+- 🫧 **Speaker-aware participation** — chatty one-on-one sessions automatically become quiet ambient mode when a second human/PluralKit speaker joins; Haiku only approves exceptional unsolicited interventions
 - 📷 **Image understanding** — Claude and Gemini both see images
 - 🔗 **URL reading** — paste a link and the bot fetches the page contents (via Tavily extract)
 - 🔍 **Web search** — Claude and Gemini ground natively; DeepSeek uses Tavily; all three return source citations
@@ -50,6 +51,8 @@ The MAGI trinity shares one Discord bot, taking turns "fronting" like a plural s
 
 ```
        User message arrives
+              ↓
+   [Participation gate] ← 1 speaker: session; 2+: ambient/Haiku
               ↓
          [Router] ← heuristic scoring, no LLM call
        /    |    \
@@ -84,6 +87,7 @@ The MAGI trinity shares one Discord bot, taking turns "fronting" like a plural s
 | `!cost` | Per-model usage, cost, and cache hit rate |
 | `!memories` | List all memories (both types) |
 | `!threads` | Show other recent threads |
+| `!presence` | Show session/ambient state, recent speakers, and Haiku gate status |
 | `!search <query>` | Web search with citations |
 
 ### Multi-model
@@ -101,6 +105,7 @@ The MAGI trinity shares one Discord bot, taking turns "fronting" like a plural s
 | `!models` | Show available models and usage stats |
 | `!prefer [claude\|deepseek\|gemini\|mistral\|qwen\|glm\|kimi\|auto]` | Set model preference for this channel |
 | `!calibration` | Show confidence calibration stats |
+| `!presence auto\|session\|ambient\|tags` | Admin: override participation mode for this channel (`auto` restores speaker-aware switching) |
 | `!research <question>` | Multi-model panel + judge → one synthesized answer (~3-4× cost) |
 | `!research all <question>` | Full roster (adds Mistral/Qwen/GLM/Kimi when configured) for max diversity |
 
@@ -264,9 +269,26 @@ AO3_COOKIE=                               # Optional, for bookclub mode
 ```json
 {
   "allowed_channels": [123456789012345678],
-  "default_model": "auto"
+  "default_model": "auto",
+  "participation": {
+    "enabled": true,
+    "solo_reset_hours": 6,
+    "activation_minutes": 15,
+    "cooldown_minutes": 15,
+    "classifier_model": "claude-haiku-4-5",
+    "classifier_threshold": 0.9,
+    "channel_modes": {}
+  }
 }
 ```
+
+In automatic mode, one speaker preserves the original reply-to-everything session behavior. A
+second distinct speaker within 15 minutes (or any direct human-to-human reply) switches the parent
+channel and its threads to ambient mode. Later speaker switches renew the six-hour hold; a lone
+speaker continuing to talk does not. Mentions, replies to the bot, commands, and explicit model
+prefixes always work; obvious human-to-human turns stay silent, and only ambiguous turns call
+Haiku. The state persists across clean restarts and is reconciled from recent Discord history after
+downtime.
 
 **Per-server prompts (optional):** by default the bot uses a **generic** system prompt that knows nothing about who's in a server (and is told not to invent anything). Give a specific server its own context with a `servers` block keyed by **guild id** (the bot prints each joined guild's name + id at startup). Unlisted guilds fall back to `server_default`, then to the generic default.
 ```json

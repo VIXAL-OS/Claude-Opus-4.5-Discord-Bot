@@ -70,7 +70,38 @@ byte-for-byte the old behavior):
 
 ---
 
-## Status — 2026-06-27
+## Status — 2026-08-08
+
+### ✅ Speaker-aware session → ambient participation gate (2026-08-08)
+The bot no longer commissions a model reply for every eligible human message. A channel-level social
+gate now runs **before** `_ensure_thread()` / typing / generation:
+- **Automatic two-clock state:** one speaker keeps the old chatty `session` behavior. A second
+  distinct speaker within 15 minutes — or any explicit human→human Discord reply — switches the
+  parent channel and its threads to `ambient`. Later speaker switches renew a 6h hold; continued
+  turns from the same lone speaker do **not**, so session mode returns after 6h without multi-speaker
+  evidence. Normal users key by Discord id; webhook/PluralKit speakers key by webhook id + normalized
+  display name, so separate proxied members count as separate conversational voices.
+- **Structural invitations always pass:** bot mentions, replies to the bot, commands, and stacked
+  model/`!think` prefixes bypass the quiet gate. Replies to another human and obvious short
+  acknowledgements close deterministically. Genuine bot accounts are ignored; webhook proxies remain
+  human turns.
+- **Haiku only sees ambiguous ambient turns.** `claude-haiku-4-5` gets the latest 12 local turns and
+  returns `{action, intervention_value, reason}`; reply threshold defaults to 0.90, false positives are
+  explicitly costed 5× worse than silence, and API/parse failures fail closed. One unsolicited reply
+  per 15m max; concurrent decisions serialize and are dropped if the conversation advances while
+  Haiku is deciding. No suppressed turn creates a thread or typing indicator.
+- **Reboot-safe + configurable:** state persists under `_participation_states` in `memories.json` and
+  lazily merges the previous hold window from the parent plus recent active/archived thread histories
+  after restart. `config.json`'s optional `participation` block controls activation/hold/cooldown/model/
+  threshold/history, and `!presence auto|session|ambient|tags` provides persisted admin overrides plus
+  live state/status. No config block ⇒ the new automatic defaults.
+- **Honest accounting:** classifier calls use a non-routing `Haiku participation gate` pseudo-provider,
+  separately persisted and shown in `!cost` at Haiku pricing; it can never enter `_select_model`.
+- Offline-validated: `scratchpad/test_participation_gate.py` (**38/38**), existing panel (**31/31**),
+  Kimi/provider (**28/28**), PDF (**16/16**), syntax/import/config gates all pass. A synthetic live
+  `claude-haiku-4-5` round-trip also passed (correct SILENT verdict + real usage counters). ⚠️ Owes one
+  live **Discord** smoke test: second speaker triggers ambient before their first turn, and
+  `!presence`/`!cost` reflect the transition and classifier call.
 
 ### ✅ `!research` panel: Gemini `thought_signature` 400 + DeepSeek tool-call dump (2026-07-10)
 Two failures, both in the **shared tool loop** of `_generate_openai_compatible_response` — which

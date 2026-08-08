@@ -8,6 +8,20 @@
   "default_model": "auto",
   "channel_preferences": {},
 
+  "_participation_comment": "Automatic social gate. With one speaker the bot stays in session mode (old reply-to-everything behavior). A second distinct speaker inside activation_minutes (or any direct human-to-human reply) starts ambient mode: mentions/replies/model prefixes always work, obvious human-to-human turns stay silent, and only ambiguous high-value interventions reach the cheap Haiku classifier. Each later speaker switch renews the ambient hold; one speaker talking alone does not. After solo_reset_hours without multi-speaker evidence, session mode returns. PluralKit/webhook display names count as distinct speakers. Per-channel manual overrides: auto | session | ambient | tags. `!presence` shows/edits this live.",
+  "participation": {
+    "enabled": true,
+    "solo_reset_hours": 6,
+    "activation_minutes": 15,
+    "cooldown_minutes": 15,
+    "classifier_enabled": true,
+    "classifier_model": "claude-haiku-4-5",
+    "classifier_threshold": 0.9,
+    "context_messages": 12,
+    "history_limit": 500,
+    "channel_modes": {}
+  },
+
   "_comment": "Get channel IDs via Discord Developer Mode -> right-click a channel. platform is 'discord' (Slack lands in Phase 4). default_model: 'auto' or any provider id (claude/deepseek/gemini/mistral/qwen/glm/kimi). channel_preferences maps channel-ID strings to a provider id.",
 
   "_servers_comment": "OPTIONAL per-server system-prompt overrides, keyed by GUILD id string (right-click the server icon -> Copy Server ID; the bot also prints each guild's id at startup). Per guild: 'context' replaces the 'context about this server' block, 'pluralkit' (true|false — a real JSON boolean, not \"false\") toggles the PluralKit/plurality section. 'server_default' applies to any guild NOT listed; omit both -> every guild uses the built-in GENERIC default (knows nothing about who's there). You can also edit these live in Discord with `!server_context set <text>` / `!server_context pluralkit on|off` (admin-only; writes back to config.json). Keep real names/personal context ONLY in this git-ignored config.json — the committed example stays generic.",
